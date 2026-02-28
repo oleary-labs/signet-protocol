@@ -7,6 +7,7 @@ import (
 	secp "github.com/decred/dcrd/dcrec/secp256k1/v4"
 	"github.com/libp2p/go-libp2p/core/crypto"
 	"github.com/libp2p/go-libp2p/core/peer"
+	"github.com/luxfi/threshold/pkg/math/curve"
 	"github.com/luxfi/threshold/pkg/party"
 	"golang.org/x/crypto/sha3"
 )
@@ -65,6 +66,25 @@ func EthereumAddress(pub crypto.PubKey) ([20]byte, error) {
 	// Hash the 64-byte body (skip the 0x04 prefix byte).
 	d := sha3.NewLegacyKeccak256()
 	d.Write(uncompressed[1:])
+	h := d.Sum(nil)
+	var addr [20]byte
+	copy(addr[:], h[12:])
+	return addr, nil
+}
+
+// EthereumAddressFromPoint derives the Ethereum address from a secp256k1 curve.Point
+// as returned by the threshold library (e.g. cfg.PublicPoint()).
+func EthereumAddressFromPoint(pt curve.Point) ([20]byte, error) {
+	compressed, err := pt.MarshalBinary()
+	if err != nil {
+		return [20]byte{}, fmt.Errorf("marshal point: %w", err)
+	}
+	uncompressed, err := decompressSecp256k1(compressed)
+	if err != nil {
+		return [20]byte{}, fmt.Errorf("decompress point: %w", err)
+	}
+	d := sha3.NewLegacyKeccak256()
+	d.Write(uncompressed[1:]) // skip 0x04 prefix
 	h := d.Sum(nil)
 	var addr [20]byte
 	copy(addr[:], h[12:])

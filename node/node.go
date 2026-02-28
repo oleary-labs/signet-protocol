@@ -4,10 +4,13 @@ import (
 	"context"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/libp2p/go-libp2p/core/peer"
@@ -15,11 +18,13 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/luxfi/threshold/pkg/party"
+	"github.com/luxfi/threshold/pkg/pool"
+	"github.com/luxfi/threshold/protocols/cmp"
 
 	"signet/network"
 )
 
-// Node owns a libp2p host and an HTTP API server.
+// Node owns a libp2p host, an HTTP API server, and threshold signing state.
 type Node struct {
 	cfg    *Config
 	host   *network.Host
@@ -27,6 +32,10 @@ type Node struct {
 	log    *zap.Logger
 	ctx    context.Context
 	cancel context.CancelFunc
+
+	pool    *pool.Pool
+	mu      sync.RWMutex
+	configs map[string]*cmp.Config // keygen session ID → key config
 }
 
 // NodeInfo is returned by the /v1/info endpoint.
@@ -75,11 +84,22 @@ func New(cfg *Config, log *zap.Logger) (*Node, error) {
 		log.Info("connected to bootstrap peer", zap.String("peer", pi.ID.String()))
 	}
 
-	n := &Node{cfg: cfg, host: h, log: log, ctx: ctx, cancel: cancel}
+	n := &Node{
+		cfg:     cfg,
+		host:    h,
+		log:     log,
+		ctx:     ctx,
+		cancel:  cancel,
+		pool:    pool.NewPool(0),
+		configs: make(map[string]*cmp.Config),
+	}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /v1/health", n.handleHealth)
 	mux.HandleFunc("GET /v1/info", n.handleInfo)
+	mux.HandleFunc("GET /v1/keys", n.handleListKeys)
+	mux.HandleFunc("POST /v1/keygen", n.handleKeygen)
+	mux.HandleFunc("POST /v1/sign", n.handleSign)
 	n.server = &http.Server{Addr: cfg.APIAddr, Handler: mux}
 
 	return n, nil
@@ -96,7 +116,7 @@ func (n *Node) Start() error {
 	return nil
 }
 
-// Stop gracefully shuts down the HTTP server and the libp2p host.
+// Stop gracefully shuts down the HTTP server, the libp2p host, and the worker pool.
 func (n *Node) Stop() error {
 	n.log.Info("stopping node")
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -104,6 +124,7 @@ func (n *Node) Stop() error {
 	if err := n.server.Shutdown(ctx); err != nil {
 		return fmt.Errorf("shutdown HTTP server: %w", err)
 	}
+	n.pool.TearDown()
 	n.host.Close()
 	n.cancel()
 	n.log.Info("node stopped")
@@ -131,6 +152,13 @@ func (n *Node) Info() NodeInfo {
 	}
 }
 
+// keyConfigPath returns the disk path for a stored keygen config.
+func (n *Node) keyConfigPath(sessionID string) string {
+	return filepath.Join(filepath.Dir(n.cfg.KeyFile), sessionID+".config")
+}
+
+// --- HTTP handlers ---
+
 func (n *Node) handleHealth(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.Write([]byte(`{"status":"ok"}`))
@@ -139,4 +167,206 @@ func (n *Node) handleHealth(w http.ResponseWriter, r *http.Request) {
 func (n *Node) handleInfo(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(n.Info())
+}
+
+// handleListKeys returns public metadata for all in-memory keygen configs.
+func (n *Node) handleListKeys(w http.ResponseWriter, r *http.Request) {
+	type keyEntry struct {
+		SessionID       string   `json:"session_id"`
+		EthereumAddress string   `json:"ethereum_address"`
+		Threshold       int      `json:"threshold"`
+		Parties         []string `json:"parties"`
+	}
+
+	n.mu.RLock()
+	entries := make([]keyEntry, 0, len(n.configs))
+	for id, cfg := range n.configs {
+		ethAddr := ""
+		if addr, err := network.EthereumAddressFromPoint(cfg.PublicPoint()); err == nil {
+			ethAddr = "0x" + hex.EncodeToString(addr[:])
+		}
+		ids := cfg.PartyIDs()
+		parties := make([]string, len(ids))
+		for i, p := range ids {
+			parties[i] = string(p)
+		}
+		entries = append(entries, keyEntry{
+			SessionID:       id,
+			EthereumAddress: ethAddr,
+			Threshold:       cfg.Threshold,
+			Parties:         parties,
+		})
+	}
+	n.mu.RUnlock()
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(entries)
+}
+
+// handleKeygen runs a distributed key generation session.
+//
+// POST /v1/keygen
+//
+//	{"session_id":"mykey1","parties":["16Uiu2...","16Uiu2...","16Uiu2..."],"threshold":1}
+//
+// All participating nodes must POST this endpoint concurrently with the same
+// session_id, parties list, and threshold.
+func (n *Node) handleKeygen(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		SessionID string     `json:"session_id"`
+		Parties   []party.ID `json:"parties"`
+		Threshold int        `json:"threshold"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		httpError(w, http.StatusBadRequest, "decode body: "+err.Error())
+		return
+	}
+	if req.SessionID == "" || len(req.Parties) == 0 || req.Threshold <= 0 {
+		httpError(w, http.StatusBadRequest, "session_id, parties (non-empty), and threshold (>0) are required")
+		return
+	}
+
+	n.log.Info("keygen starting",
+		zap.String("session_id", req.SessionID),
+		zap.Int("n", len(req.Parties)),
+		zap.Int("threshold", req.Threshold),
+	)
+
+	// party.NewIDSlice sorts the slice, as required by the CMP protocol.
+	sortedParties := party.NewIDSlice(req.Parties)
+
+	cfg, err := runKeygen(r.Context(), n.host, req.SessionID, sortedParties, req.Threshold, n.pool)
+	if err != nil {
+		n.log.Error("keygen failed", zap.String("session_id", req.SessionID), zap.Error(err))
+		httpError(w, http.StatusInternalServerError, "keygen: "+err.Error())
+		return
+	}
+
+	// Persist to disk (non-fatal).
+	if err := saveConfig(n.keyConfigPath(req.SessionID), cfg); err != nil {
+		n.log.Warn("persist config failed", zap.String("session_id", req.SessionID), zap.Error(err))
+	}
+
+	n.mu.Lock()
+	n.configs[req.SessionID] = cfg
+	n.mu.Unlock()
+
+	pub := cfg.PublicPoint()
+	pubBytes, err := pub.MarshalBinary()
+	if err != nil {
+		httpError(w, http.StatusInternalServerError, "marshal public key: "+err.Error())
+		return
+	}
+	ethAddr, err := network.EthereumAddressFromPoint(pub)
+	if err != nil {
+		httpError(w, http.StatusInternalServerError, "eth addr: "+err.Error())
+		return
+	}
+
+	n.log.Info("keygen complete",
+		zap.String("session_id", req.SessionID),
+		zap.String("eth_addr", "0x"+hex.EncodeToString(ethAddr[:])),
+	)
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{
+		"session_id":       req.SessionID,
+		"public_key":       "0x" + hex.EncodeToString(pubBytes),
+		"ethereum_address": "0x" + hex.EncodeToString(ethAddr[:]),
+	})
+}
+
+// handleSign runs a threshold signing session using a previously generated key.
+//
+// POST /v1/sign
+//
+//	{
+//	  "key_session_id":  "mykey1",
+//	  "sign_session_id": "sign-001",
+//	  "signers":         ["16Uiu2...","16Uiu2..."],
+//	  "message_hash":    "0xdeadbeef..."
+//	}
+//
+// All signing nodes must POST this endpoint concurrently with the same
+// sign_session_id, signers list, and message_hash.
+func (n *Node) handleSign(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		KeySessionID  string     `json:"key_session_id"`
+		SignSessionID string     `json:"sign_session_id"`
+		Signers       []party.ID `json:"signers"`
+		MessageHash   string     `json:"message_hash"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		httpError(w, http.StatusBadRequest, "decode body: "+err.Error())
+		return
+	}
+	if req.KeySessionID == "" || req.SignSessionID == "" || len(req.Signers) == 0 || req.MessageHash == "" {
+		httpError(w, http.StatusBadRequest, "key_session_id, sign_session_id, signers, and message_hash are required")
+		return
+	}
+
+	msgHash, err := hex.DecodeString(strings.TrimPrefix(req.MessageHash, "0x"))
+	if err != nil {
+		httpError(w, http.StatusBadRequest, "invalid message_hash: "+err.Error())
+		return
+	}
+
+	// Load config: memory-first, then disk.
+	n.mu.RLock()
+	cfg, ok := n.configs[req.KeySessionID]
+	n.mu.RUnlock()
+	if !ok {
+		cfg, err = loadConfig(n.keyConfigPath(req.KeySessionID))
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				httpError(w, http.StatusNotFound, "key session not found: "+req.KeySessionID)
+			} else {
+				httpError(w, http.StatusInternalServerError, "load config: "+err.Error())
+			}
+			return
+		}
+		n.mu.Lock()
+		n.configs[req.KeySessionID] = cfg
+		n.mu.Unlock()
+	}
+
+	// Validate signer set (sorted, threshold met, this node included).
+	sortedSigners := party.NewIDSlice(req.Signers)
+	if !cfg.CanSign(sortedSigners) {
+		httpError(w, http.StatusBadRequest, "invalid signer set: threshold not met, unknown party, or this node not included")
+		return
+	}
+
+	n.log.Info("sign starting",
+		zap.String("key_session_id", req.KeySessionID),
+		zap.String("sign_session_id", req.SignSessionID),
+		zap.Int("signers", len(req.Signers)),
+	)
+
+	sig, err := runSign(r.Context(), n.host, req.SignSessionID, cfg, sortedSigners, msgHash, n.pool)
+	if err != nil {
+		n.log.Error("sign failed", zap.String("sign_session_id", req.SignSessionID), zap.Error(err))
+		httpError(w, http.StatusInternalServerError, "sign: "+err.Error())
+		return
+	}
+
+	ethSig, err := sig.SigEthereum()
+	if err != nil {
+		httpError(w, http.StatusInternalServerError, "encode signature: "+err.Error())
+		return
+	}
+
+	n.log.Info("sign complete", zap.String("sign_session_id", req.SignSessionID))
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{
+		"sign_session_id":    req.SignSessionID,
+		"ethereum_signature": "0x" + hex.EncodeToString(ethSig),
+	})
+}
+
+func httpError(w http.ResponseWriter, code int, msg string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(code)
+	json.NewEncoder(w).Encode(map[string]string{"error": msg})
 }

@@ -2,11 +2,10 @@ package node
 
 import (
 	"context"
-	"github.com/fxamacker/cbor/v2"
 	"fmt"
 	"io"
-	"time"
 
+	"github.com/fxamacker/cbor/v2"
 	libp2pnet "github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/protocol"
 	"github.com/luxfi/threshold/pkg/party"
@@ -16,10 +15,6 @@ import (
 )
 
 const coordProtocol = protocol.ID("/signet/coord/1.0.0")
-
-// meshDelay is the pause after all parties ACK, giving the GossipSub mesh time
-// to form before round 1 messages are sent.
-const meshDelay = 500 * time.Millisecond
 
 type coordMsgType uint8
 
@@ -65,7 +60,7 @@ func (n *Node) handleCoordStream(s libp2pnet.Stream) {
 
 	switch msg.Type {
 	case msgKeygen:
-		sn, err := network.NewSessionNetwork(n.ctx, n.host, msg.SessionID)
+		sn, err := network.NewSessionNetwork(n.ctx, n.host, msg.SessionID, msg.Parties)
 		if err != nil {
 			n.log.Error("coord: keygen session network",
 				zap.String("session_id", msg.SessionID), zap.Error(err))
@@ -95,7 +90,7 @@ func (n *Node) handleCoordStream(s libp2pnet.Stream) {
 		}()
 
 	case msgSign:
-		sn, err := network.NewSessionNetwork(n.ctx, n.host, msg.SignSessionID)
+		sn, err := network.NewSessionNetwork(n.ctx, n.host, msg.SignSessionID, msg.Signers)
 		if err != nil {
 			n.log.Error("coord: sign session network",
 				zap.String("sign_session_id", msg.SignSessionID), zap.Error(err))
@@ -171,14 +166,6 @@ func (n *Node) broadcastCoord(ctx context.Context, targets []party.ID, msg coord
 		}
 		s.Close()
 		n.log.Debug("coord: party ready", zap.String("party", string(pid)))
-	}
-
-	// All parties have subscribed to the session topic. Pause briefly for the
-	// GossipSub mesh to form before round 1 messages are sent.
-	select {
-	case <-time.After(meshDelay):
-	case <-ctx.Done():
-		return ctx.Err()
 	}
 
 	return nil

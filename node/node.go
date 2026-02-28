@@ -239,15 +239,14 @@ func (n *Node) handleKeygen(w http.ResponseWriter, r *http.Request) {
 
 	// Subscribe to the session topic before notifying peers, so we're ready to
 	// receive GossipSub messages as soon as the mesh forms.
-	sn, err := network.NewSessionNetwork(r.Context(), n.host, req.SessionID)
+	sn, err := network.NewSessionNetwork(r.Context(), n.host, req.SessionID, sortedParties)
 	if err != nil {
 		httpError(w, http.StatusInternalServerError, "session network: "+err.Error())
 		return
 	}
 	defer sn.Close()
 
-	// Tell every other party to subscribe and start. Waits for ACKs and then
-	// pauses for the GossipSub mesh to form.
+	// Tell every other party to join and start.
 	if err := n.broadcastCoord(r.Context(), sortedParties, coordMsg{
 		Type:      msgKeygen,
 		SessionID: req.SessionID,
@@ -364,7 +363,7 @@ func (n *Node) handleSign(w http.ResponseWriter, r *http.Request) {
 		zap.Int("signers", len(sortedSigners)),
 	)
 
-	sn, err := network.NewSessionNetwork(r.Context(), n.host, req.SignSessionID)
+	sn, err := network.NewSessionNetwork(r.Context(), n.host, req.SignSessionID, sortedSigners)
 	if err != nil {
 		httpError(w, http.StatusInternalServerError, "session network: "+err.Error())
 		return

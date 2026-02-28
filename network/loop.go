@@ -18,7 +18,7 @@ func HandlerLoop(h *protocol.Handler, net *SessionNetwork) {
 			if !ok {
 				return
 			}
-			go net.Send(msg)
+			net.Send(msg)
 
 		case msg, ok := <-net.Next():
 			if !ok || msg == nil {

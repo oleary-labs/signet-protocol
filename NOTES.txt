@@ -1,0 +1,15 @@
+export NODE1=16Uiu2HAmQQk31H5TbWXb75C5GiyyQwEd3jgiBPv5g2YL4j4J8MR2
+export NODE2=16Uiu2HAm3jnkFWQAc4DHaPj1CPawxx2bp61xnCXPjbc7oGnyTQfk
+export NODE3=16Uiu2HAm7i9ASnPTFuJLKS5VkgoEiPz2Jh8Hbo1Aw8mVRXjFnmWC
+
+curl -s -X POST http://127.0.0.1:8080/v1/keygen \
+  -H 'Content-Type: application/json' \
+  -d "$(jq -nc --arg a "$NODE1" --arg b "$NODE2" --arg c "$NODE3" \
+    '{"session_id":"mykey1","parties":[$a,$b,$c],"threshold":1}')"
+
+HASH="0x$(openssl dgst -sha256 -binary <<< 'hello signet' | xxd -p -c 32)"
+
+curl -s -X POST http://127.0.0.1:8080/v1/sign \
+  -H 'Content-Type: application/json' \
+  -d "$(jq -nc --arg a "$NODE1" --arg b "$NODE2" --arg h "$HASH" \
+    '{"key_session_id":"mykey1","sign_session_id":"sign-001","signers":[$a,$b],"message_hash":$h}')"

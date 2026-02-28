@@ -12,8 +12,6 @@ import (
 	"github.com/libp2p/go-libp2p/core/host"
 	libp2pnet "github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
-	"github.com/libp2p/go-libp2p/core/protocol"
-	pubsub "github.com/libp2p/go-libp2p-pubsub"
 	ma "github.com/multiformats/go-multiaddr"
 
 	"github.com/luxfi/threshold/pkg/party"
@@ -21,23 +19,18 @@ import (
 )
 
 const (
-	ProtocolID = protocol.ID("/threshold/1.0.0")
 	// maxMessageSize is the maximum size of a length-prefixed message (10MB).
 	maxMessageSize = 10 * 1024 * 1024
 )
 
 // Host wraps a libp2p host and maintains party.ID <-> peer.ID mappings.
 type Host struct {
-	h      host.Host
-	pubsub *pubsub.PubSub
-	self   party.ID
+	h    host.Host
+	self party.ID
 
 	mu      sync.RWMutex
 	parties map[party.ID]peer.ID // party.ID -> peer.ID
 	peers   map[peer.ID]party.ID // peer.ID -> party.ID
-
-	// incoming is fed by the stream handler; sessions drain it.
-	incoming chan *thresholdProtocol.Message
 }
 
 // NewHost creates a libp2p host listening on the given multiaddr (e.g. "/ip4/127.0.0.1/tcp/0").
@@ -56,26 +49,15 @@ func NewHost(ctx context.Context, privKey crypto.PrivKey, listenAddr string) (*H
 		return nil, fmt.Errorf("libp2p new: %w", err)
 	}
 
-	ps, err := pubsub.NewGossipSub(ctx, h)
-	if err != nil {
-		h.Close()
-		return nil, fmt.Errorf("gossipsub: %w", err)
-	}
-
 	host := &Host{
-		h:        h,
-		pubsub:   ps,
-		self:     self,
-		parties:  make(map[party.ID]peer.ID),
-		peers:    make(map[peer.ID]party.ID),
-		incoming: make(chan *thresholdProtocol.Message, 1000),
+		h:       h,
+		self:    self,
+		parties: make(map[party.ID]peer.ID),
+		peers:   make(map[peer.ID]party.ID),
 	}
 
 	// Register self in the mapping table.
 	host.RegisterPeer(self, h.ID())
-
-	// Register stream handler for directed messages.
-	h.SetStreamHandler(ProtocolID, host.handleStream)
 
 	// Auto-populate party mappings whenever a peer connects.
 	h.Network().Notify(&connectionNotifee{host: host})
@@ -138,34 +120,8 @@ func (h *Host) PeerForParty(id party.ID) (peer.ID, bool) {
 // LibP2PHost returns the underlying libp2p host (for connect/discovery).
 func (h *Host) LibP2PHost() host.Host { return h.h }
 
-// PubSub returns the GossipSub instance.
-func (h *Host) PubSub() *pubsub.PubSub { return h.pubsub }
-
-// Incoming returns the channel of directed messages received via streams.
-func (h *Host) Incoming() <-chan *thresholdProtocol.Message { return h.incoming }
-
 // Close shuts down the host.
 func (h *Host) Close() error { return h.h.Close() }
-
-// handleStream is called for every inbound stream on /threshold/1.0.0.
-func (h *Host) handleStream(s libp2pnet.Stream) {
-	defer s.Close()
-	msg, err := readMessage(s)
-	if err != nil {
-		return
-	}
-	h.incoming <- msg
-}
-
-// SendDirect opens a stream to the target peer and writes a length-prefixed message.
-func (h *Host) SendDirect(ctx context.Context, target peer.ID, msg *thresholdProtocol.Message) error {
-	s, err := h.h.NewStream(ctx, target, ProtocolID)
-	if err != nil {
-		return fmt.Errorf("new stream to %s: %w", target, err)
-	}
-	defer s.Close()
-	return writeMessage(s, msg)
-}
 
 // writeMessage writes a length-prefixed (4-byte big-endian) CBOR payload.
 func writeMessage(w io.Writer, msg *thresholdProtocol.Message) error {

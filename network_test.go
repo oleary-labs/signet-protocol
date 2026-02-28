@@ -29,7 +29,7 @@ func TestLibp2pKeygen(t *testing.T) {
 	hosts := make([]*network.Host, n)
 	parties := make([]party.ID, n)
 	for i := 0; i < n; i++ {
-		priv, _, err := crypto.GenerateKeyPair(crypto.Ed25519, -1)
+		priv, _, err := crypto.GenerateKeyPair(crypto.Secp256k1, -1)
 		require.NoError(t, err)
 		h, err := network.NewHost(ctx, priv, "/ip4/127.0.0.1/tcp/0")
 		require.NoError(t, err)
@@ -128,4 +128,17 @@ func TestLibp2pKeygen(t *testing.T) {
 		assert.NotNil(t, config, "party %s config is nil", pid)
 		t.Logf("party %s: keygen complete", pid)
 	}
+}
+
+func TestEthereumAddress(t *testing.T) {
+	priv, pub, err := crypto.GenerateKeyPair(crypto.Secp256k1, -1)
+	require.NoError(t, err)
+	_ = priv
+
+	addr, err := network.EthereumAddress(pub)
+	require.NoError(t, err)
+
+	var zero [20]byte
+	assert.NotEqual(t, zero, addr, "address should not be zero")
+	t.Logf("ethereum address: 0x%x", addr)
 }

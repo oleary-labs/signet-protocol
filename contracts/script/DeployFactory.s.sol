@@ -63,5 +63,10 @@ contract DeployFactory is Script {
         console2.log("factoryImpl    :", address(factoryImpl));
         console2.log("factory (proxy):", address(proxy));
         console2.log("groupBeacon    :", factory.groupBeacon());
+
+        // Machine-readable lines consumed by devnet/start.sh
+        console2.log(string.concat("DEPLOY:factory=",    vm.toString(address(proxy))));
+        console2.log(string.concat("DEPLOY:groupImpl=",  vm.toString(address(groupImpl))));
+        console2.log(string.concat("DEPLOY:beacon=",     vm.toString(factory.groupBeacon())));
     }
 }

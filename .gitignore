@@ -33,3 +33,9 @@ go.work.sum
 
 # Local settings overrides
 settings.local.json
+
+# Build output
+/build/
+
+# Test data
+/da/

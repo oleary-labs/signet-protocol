@@ -54,7 +54,9 @@ type Node struct {
 	groupsMu sync.RWMutex
 	groups   map[string]*GroupInfo // group contract address → resolved membership
 
-	chain *ChainClient // nil if no eth_rpc configured
+	auth     *GroupAuth    // per-group OAuth trust store
+	sessions *SessionStore // ephemeral session key cache
+	chain    *ChainClient  // nil if no eth_rpc configured
 }
 
 // NodeInfo is returned by the /v1/info endpoint.
@@ -125,8 +127,11 @@ func New(cfg *Config, log *zap.Logger) (*Node, error) {
 		pool:    pool.NewPool(0),
 		store:   store,
 		configs: make(map[shardKey]*lss.Config),
-		groups:  make(map[string]*GroupInfo),
+		groups:   make(map[string]*GroupInfo),
+		auth:     newGroupAuth(ctx, cfg.TestMode, log),
+		sessions: newSessionStore(),
 	}
+	n.sessions.startCleanupLoop(ctx)
 
 	// Wire the chain client when eth_rpc and factory_address are configured.
 	if cfg.EthRPC != "" && cfg.FactoryAddress != "" {
@@ -150,6 +155,7 @@ func New(cfg *Config, log *zap.Logger) (*Node, error) {
 	mux.HandleFunc("GET /v1/health", n.handleHealth)
 	mux.HandleFunc("GET /v1/info", n.handleInfo)
 	mux.HandleFunc("GET /v1/keys", n.handleListKeys)
+	mux.HandleFunc("POST /v1/auth", n.handleAuth)
 	mux.HandleFunc("POST /v1/keygen", n.handleKeygen)
 	mux.HandleFunc("POST /v1/sign", n.handleSign)
 	n.server = &http.Server{Addr: cfg.APIAddr, Handler: mux}
@@ -322,26 +328,104 @@ func (n *Node) handleListKeys(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(entries)
 }
 
+// handleAuth registers an ephemeral session key with verified identity claims.
+//
+// POST /v1/auth
+//
+// Test mode:
+//
+//	{"group_id":"0x...","token":"eyJ...","session_pub":"02abc..."}
+//
+// Production mode:
+//
+//	{"group_id":"0x...","proof":"hex...","header":"eyJ...","payload":"eyJ...",
+//	 "session_pub":"02abc...","sub":"user123","iss":"https://...","exp":1709900000}
+func (n *Node) handleAuth(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		GroupID    string `json:"group_id"`
+		Token      string `json:"token"`       // test mode: raw JWT
+		Proof      string `json:"proof"`        // production mode: ZK proof hex
+		SessionPub string `json:"session_pub"`  // hex, 33-byte compressed secp256k1
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		httpError(w, http.StatusBadRequest, "decode body: "+err.Error())
+		return
+	}
+	if req.GroupID == "" || req.SessionPub == "" {
+		httpError(w, http.StatusBadRequest, "group_id and session_pub are required")
+		return
+	}
+
+	sessionPubBytes, err := hex.DecodeString(strings.TrimPrefix(req.SessionPub, "0x"))
+	if err != nil || len(sessionPubBytes) != 33 {
+		httpError(w, http.StatusBadRequest, "session_pub must be 33 hex-encoded bytes")
+		return
+	}
+
+	if n.cfg.TestMode {
+		// Test mode: validate JWT directly, cache session binding.
+		if req.Token == "" {
+			httpError(w, http.StatusBadRequest, "token is required in test mode")
+			return
+		}
+		claims, err := n.auth.ValidateJWTForSession(r.Context(), req.GroupID, []byte(req.Token))
+		if err != nil {
+			httpError(w, http.StatusUnauthorized, "invalid token: "+err.Error())
+			return
+		}
+		pubHex := sessionPubToHex(sessionPubBytes)
+		n.sessions.Put(pubHex, &SessionInfo{
+			Sub: claims.Sub,
+			Iss: claims.Iss,
+			Exp: claims.Exp,
+		})
+		n.log.Info("auth: session registered (test mode)",
+			zap.String("group_id", req.GroupID),
+			zap.String("sub", claims.Sub),
+			zap.String("session_pub", pubHex))
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{
+			"status":     "ok",
+			"sub":        claims.Sub,
+			"expires_at": claims.Exp.Unix(),
+		})
+	} else {
+		// Production mode: verify ZK proof.
+		// TODO: implement ZK proof verification when noir-jwt circuit is ready.
+		httpError(w, http.StatusNotImplemented, "ZK proof verification not yet implemented")
+	}
+}
+
 // handleKeygen runs a distributed key generation session.
 //
 // POST /v1/keygen
 //
 //	{"group_id":"0xGroupAddr","key_id":"primary"}
 //
+// Session-auth mode (groups with issuers):
+//
+//	{"group_id":"0x...","key_suffix":"primary",
+//	 "session_pub":"02abc...","request_sig":"hex64","nonce":"hex","timestamp":123}
+//
 // The key shard is stored under (group_id, key_id). The group members and
-// threshold are resolved from the node's in-memory group map. Send to any
-// one member of the group; it coordinates with the others automatically.
+// threshold are resolved from the node's in-memory group map.
 func (n *Node) handleKeygen(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		GroupID string `json:"group_id"`
-		KeyID   string `json:"key_id"`
+		GroupID    string `json:"group_id"`
+		KeyID      string `json:"key_id"`
+		KeySuffix  string `json:"key_suffix"`
+		SessionPub string `json:"session_pub"`
+		RequestSig string `json:"request_sig"`
+		Nonce      string `json:"nonce"`
+		Timestamp  uint64 `json:"timestamp"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		httpError(w, http.StatusBadRequest, "decode body: "+err.Error())
 		return
 	}
-	if req.GroupID == "" || req.KeyID == "" {
-		httpError(w, http.StatusBadRequest, "group_id and key_id are required")
+	if req.GroupID == "" {
+		httpError(w, http.StatusBadRequest, "group_id is required")
 		return
 	}
 
@@ -353,13 +437,53 @@ func (n *Node) handleKeygen(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	keyID := req.KeyID
+	var authToken []byte
+	var authProof *AuthProof
+
+	if n.auth.HasIssuers(req.GroupID) {
+		if req.SessionPub != "" {
+			// New path: session-based auth.
+			ap, resolvedKeyID, err := n.validateSessionRequest(
+				req.SessionPub, req.RequestSig,
+				req.GroupID, req.KeyID, req.KeySuffix,
+				req.Nonce, req.Timestamp,
+				nil, // no message_hash for keygen
+			)
+			if err != nil {
+				httpError(w, err.code, err.msg)
+				return
+			}
+			keyID = resolvedKeyID
+			authProof = ap
+		} else if token := extractBearer(r); token != "" {
+			// Legacy path: raw JWT in Authorization header.
+			sub, err := n.auth.ValidateJWT(r.Context(), req.GroupID, []byte(token))
+			if err != nil {
+				httpError(w, http.StatusUnauthorized, "invalid token: "+err.Error())
+				return
+			}
+			keyID = sub
+			if req.KeySuffix != "" {
+				keyID = sub + ":" + req.KeySuffix
+			}
+			authToken = []byte(token)
+		} else {
+			httpError(w, http.StatusUnauthorized, "authorization required")
+			return
+		}
+	} else if keyID == "" {
+		httpError(w, http.StatusBadRequest, "key_id is required")
+		return
+	}
+
 	// party.NewIDSlice sorts the slice, as required by the LSS protocol.
 	sortedParties := party.NewIDSlice(grp.Members)
-	sessID := keygenSessionID(req.GroupID, req.KeyID)
+	sessID := keygenSessionID(req.GroupID, keyID)
 
 	n.log.Info("keygen starting",
 		zap.String("group_id", req.GroupID),
-		zap.String("key_id", req.KeyID),
+		zap.String("key_id", keyID),
 		zap.Int("n", len(sortedParties)),
 		zap.Int("threshold", grp.Threshold),
 	)
@@ -374,9 +498,11 @@ func (n *Node) handleKeygen(w http.ResponseWriter, r *http.Request) {
 	if err := n.broadcastCoord(r.Context(), sortedParties, coordMsg{
 		Type:      msgKeygen,
 		GroupID:   req.GroupID,
-		KeyID:     req.KeyID,
+		KeyID:     keyID,
 		Parties:   sortedParties,
 		Threshold: grp.Threshold,
+		AuthToken: authToken,
+		Auth:      authProof,
 	}); err != nil {
 		httpError(w, http.StatusInternalServerError, "coordinate: "+err.Error())
 		return
@@ -386,20 +512,20 @@ func (n *Node) handleKeygen(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		n.log.Error("keygen failed",
 			zap.String("group_id", req.GroupID),
-			zap.String("key_id", req.KeyID),
+			zap.String("key_id", keyID),
 			zap.Error(err))
 		httpError(w, http.StatusInternalServerError, "keygen: "+err.Error())
 		return
 	}
 
-	if err := n.store.Put(req.GroupID, req.KeyID, cfg); err != nil {
+	if err := n.store.Put(req.GroupID, keyID, cfg); err != nil {
 		n.log.Warn("persist shard failed",
 			zap.String("group_id", req.GroupID),
-			zap.String("key_id", req.KeyID),
+			zap.String("key_id", keyID),
 			zap.Error(err))
 	}
 	n.mu.Lock()
-	n.configs[shardKey{req.GroupID, req.KeyID}] = cfg
+	n.configs[shardKey{req.GroupID, keyID}] = cfg
 	n.mu.Unlock()
 
 	pub, err := cfg.PublicPoint()
@@ -420,14 +546,14 @@ func (n *Node) handleKeygen(w http.ResponseWriter, r *http.Request) {
 
 	n.log.Info("keygen complete",
 		zap.String("group_id", req.GroupID),
-		zap.String("key_id", req.KeyID),
+		zap.String("key_id", keyID),
 		zap.String("eth_addr", "0x"+hex.EncodeToString(ethAddr[:])),
 	)
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]any{
 		"group_id":         req.GroupID,
-		"key_id":           req.KeyID,
+		"key_id":           keyID,
 		"public_key":       "0x" + hex.EncodeToString(pubBytes),
 		"ethereum_address": "0x" + hex.EncodeToString(ethAddr[:]),
 	})
@@ -439,22 +565,27 @@ func (n *Node) handleKeygen(w http.ResponseWriter, r *http.Request) {
 //
 //	{"group_id":"0xGroupAddr","key_id":"primary","message_hash":"0xdeadbeef..."}
 //
-// The signing set is all active members of the group, resolved from the
-// node's in-memory group map. Send to any one member; it coordinates with
-// the others automatically. The sign session is disambiguated internally by a
-// random nonce so concurrent sign requests on the same key do not collide.
+// Session-auth mode (groups with issuers):
+//
+//	{"group_id":"0x...","key_suffix":"primary","message_hash":"0xdeadbeef...",
+//	 "session_pub":"02abc...","request_sig":"hex64","nonce":"hex","timestamp":123}
 func (n *Node) handleSign(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		GroupID     string `json:"group_id"`
 		KeyID       string `json:"key_id"`
+		KeySuffix   string `json:"key_suffix"`
 		MessageHash string `json:"message_hash"`
+		SessionPub  string `json:"session_pub"`
+		RequestSig  string `json:"request_sig"`
+		Nonce       string `json:"nonce"`
+		Timestamp   uint64 `json:"timestamp"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		httpError(w, http.StatusBadRequest, "decode body: "+err.Error())
 		return
 	}
-	if req.GroupID == "" || req.KeyID == "" || req.MessageHash == "" {
-		httpError(w, http.StatusBadRequest, "group_id, key_id, and message_hash are required")
+	if req.GroupID == "" || req.MessageHash == "" {
+		httpError(w, http.StatusBadRequest, "group_id and message_hash are required")
 		return
 	}
 
@@ -476,13 +607,53 @@ func (n *Node) handleSign(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	cfg, err := n.cachedConfig(req.GroupID, req.KeyID)
+	keyID := req.KeyID
+	var authToken []byte
+	var authProof *AuthProof
+
+	if n.auth.HasIssuers(req.GroupID) {
+		if req.SessionPub != "" {
+			// New path: session-based auth.
+			ap, resolvedKeyID, err := n.validateSessionRequest(
+				req.SessionPub, req.RequestSig,
+				req.GroupID, req.KeyID, req.KeySuffix,
+				req.Nonce, req.Timestamp,
+				msgHash,
+			)
+			if err != nil {
+				httpError(w, err.code, err.msg)
+				return
+			}
+			keyID = resolvedKeyID
+			authProof = ap
+		} else if token := extractBearer(r); token != "" {
+			// Legacy path: raw JWT in Authorization header.
+			sub, err := n.auth.ValidateJWT(r.Context(), req.GroupID, []byte(token))
+			if err != nil {
+				httpError(w, http.StatusUnauthorized, "invalid token: "+err.Error())
+				return
+			}
+			keyID = sub
+			if req.KeySuffix != "" {
+				keyID = sub + ":" + req.KeySuffix
+			}
+			authToken = []byte(token)
+		} else {
+			httpError(w, http.StatusUnauthorized, "authorization required")
+			return
+		}
+	} else if keyID == "" {
+		httpError(w, http.StatusBadRequest, "key_id is required")
+		return
+	}
+
+	cfg, err := n.cachedConfig(req.GroupID, keyID)
 	if err != nil {
 		httpError(w, http.StatusInternalServerError, "load config: "+err.Error())
 		return
 	}
 	if cfg == nil {
-		httpError(w, http.StatusNotFound, fmt.Sprintf("key not found: group=%s key=%s", req.GroupID, req.KeyID))
+		httpError(w, http.StatusNotFound, fmt.Sprintf("key not found: group=%s key=%s", req.GroupID, keyID))
 		return
 	}
 
@@ -497,11 +668,11 @@ func (n *Node) handleSign(w http.ResponseWriter, r *http.Request) {
 		httpError(w, http.StatusInternalServerError, "generate nonce: "+err.Error())
 		return
 	}
-	sessID := signSessionID(req.GroupID, req.KeyID, nonce)
+	sessID := signSessionID(req.GroupID, keyID, nonce)
 
 	n.log.Info("sign starting",
 		zap.String("group_id", req.GroupID),
-		zap.String("key_id", req.KeyID),
+		zap.String("key_id", keyID),
 		zap.Int("signers", len(sortedSigners)),
 	)
 
@@ -515,10 +686,12 @@ func (n *Node) handleSign(w http.ResponseWriter, r *http.Request) {
 	if err := n.broadcastCoord(r.Context(), sortedSigners, coordMsg{
 		Type:        msgSign,
 		GroupID:     req.GroupID,
-		KeyID:       req.KeyID,
+		KeyID:       keyID,
 		SignNonce:   nonce,
 		Signers:     sortedSigners,
 		MessageHash: msgHash,
+		AuthToken:   authToken,
+		Auth:        authProof,
 	}); err != nil {
 		httpError(w, http.StatusInternalServerError, "coordinate: "+err.Error())
 		return
@@ -528,7 +701,7 @@ func (n *Node) handleSign(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		n.log.Error("sign failed",
 			zap.String("group_id", req.GroupID),
-			zap.String("key_id", req.KeyID),
+			zap.String("key_id", keyID),
 			zap.Error(err))
 		httpError(w, http.StatusInternalServerError, "sign: "+err.Error())
 		return
@@ -542,19 +715,111 @@ func (n *Node) handleSign(w http.ResponseWriter, r *http.Request) {
 
 	n.log.Info("sign complete",
 		zap.String("group_id", req.GroupID),
-		zap.String("key_id", req.KeyID),
+		zap.String("key_id", keyID),
 	)
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]any{
 		"group_id":           req.GroupID,
-		"key_id":             req.KeyID,
+		"key_id":             keyID,
 		"ethereum_signature": "0x" + hex.EncodeToString(ethSig),
 	})
+}
+
+// httpErr is a typed HTTP error used by validateSessionRequest so both the
+// status code and message can be returned without writing to the response.
+type httpErr struct {
+	code int
+	msg  string
+}
+
+// validateSessionRequest validates a session-based auth request (used by both
+// handleKeygen and handleSign). It returns the AuthProof to include in the
+// coord message and the resolved keyID. On error it returns an httpErr.
+func (n *Node) validateSessionRequest(
+	sessionPubHex, requestSigHex string,
+	groupID, keyID, keySuffix string,
+	nonce string, timestamp uint64,
+	messageHash []byte,
+) (*AuthProof, string, *httpErr) {
+	sessionPubBytes, err := hex.DecodeString(strings.TrimPrefix(sessionPubHex, "0x"))
+	if err != nil || len(sessionPubBytes) != 33 {
+		return nil, "", &httpErr{http.StatusBadRequest, "session_pub must be 33 hex-encoded bytes"}
+	}
+	reqSigBytes, err := hex.DecodeString(strings.TrimPrefix(requestSigHex, "0x"))
+	if err != nil || len(reqSigBytes) != 64 {
+		return nil, "", &httpErr{http.StatusBadRequest, "request_sig must be 64 hex-encoded bytes"}
+	}
+	if nonce == "" {
+		return nil, "", &httpErr{http.StatusBadRequest, "nonce is required"}
+	}
+	if timestamp == 0 {
+		return nil, "", &httpErr{http.StatusBadRequest, "timestamp is required"}
+	}
+
+	// Look up session.
+	pubHex := sessionPubToHex(sessionPubBytes)
+	info, ok := n.sessions.Get(pubHex)
+	if !ok {
+		return nil, "", &httpErr{http.StatusUnauthorized, "session not found; call POST /v1/auth first"}
+	}
+	if time.Now().After(info.Exp) {
+		n.sessions.Delete(pubHex)
+		return nil, "", &httpErr{http.StatusUnauthorized, "session expired; re-authenticate"}
+	}
+
+	// Derive key_id from session sub.
+	resolvedKeyID := info.Sub
+	if keySuffix != "" {
+		resolvedKeyID = info.Sub + ":" + keySuffix
+	}
+
+	// Verify request signature. The signature must cover the resolved keyID
+	// (derived from sub), not a client-supplied keyID.
+	if err := verifyRequestSignature(
+		sessionPubBytes, reqSigBytes,
+		groupID, resolvedKeyID, nonce, timestamp,
+		messageHash,
+	); err != nil {
+		return nil, "", &httpErr{http.StatusUnauthorized, "invalid request signature: " + err.Error()}
+	}
+
+	// Check nonce uniqueness.
+	if err := n.sessions.CheckNonce(nonce); err != nil {
+		return nil, "", &httpErr{http.StatusConflict, "nonce already used"}
+	}
+
+	// Check timestamp freshness.
+	ts := time.Unix(int64(timestamp), 0)
+	if time.Since(ts).Abs() > timestampWindow {
+		return nil, "", &httpErr{http.StatusBadRequest, "timestamp too old or in the future"}
+	}
+
+	ap := &AuthProof{
+		Sub:        info.Sub,
+		Iss:        info.Iss,
+		Exp:        uint64(info.Exp.Unix()),
+		SessionPub: sessionPubBytes,
+		RequestSig: reqSigBytes,
+		Nonce:      nonce,
+		Timestamp:  timestamp,
+		TestMode:   n.cfg.TestMode,
+	}
+	return ap, resolvedKeyID, nil
 }
 
 func httpError(w http.ResponseWriter, code int, msg string) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
 	json.NewEncoder(w).Encode(map[string]string{"error": msg})
+}
+
+// extractBearer returns the token from an "Authorization: Bearer <token>" header,
+// or an empty string if the header is absent or malformed.
+func extractBearer(r *http.Request) string {
+	auth := r.Header.Get("Authorization")
+	if !strings.HasPrefix(auth, "Bearer ") {
+		return ""
+	}
+	return strings.TrimPrefix(auth, "Bearer ")
 }

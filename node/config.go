@@ -16,6 +16,7 @@ type Config struct {
 	NodeType       string   `yaml:"node_type"`
 	EthRPC         string   `yaml:"eth_rpc"`
 	FactoryAddress string   `yaml:"factory_address"`
+	TestMode       bool     `yaml:"test_mode"` // skip JWT signature + expiry checks
 }
 
 // LoadConfig reads a YAML config file and applies defaults for missing fields.

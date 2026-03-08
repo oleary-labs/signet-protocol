@@ -15,8 +15,25 @@ interface ISignetGroup {
         address initiator;
     }
 
+    struct OAuthIssuer {
+        string   issuer;      // iss URL (OpenID discovery base)
+        string[] clientIds;   // allowed azp/client_id values
+    }
+
+    struct PendingIssuerAddition {
+        string   issuer;
+        string[] clientIds;
+        uint256  executeAfter;
+    }
+
+    /// @notice Used only in createGroup/initialize calldata to seed issuers without a delay.
+    struct InitialIssuer {
+        string   issuer;
+        string[] clientIds;
+    }
+
     // -------------------------------------------------------------------------
-    // Events
+    // Events — node membership
     // -------------------------------------------------------------------------
 
     event NodeInvited(address indexed node, address indexed invitedBy);
@@ -28,6 +45,17 @@ interface ISignetGroup {
     event ManagerTransferred(address indexed oldManager, address indexed newManager);
 
     // -------------------------------------------------------------------------
+    // Events — OAuth issuer management
+    // -------------------------------------------------------------------------
+
+    event IssuerAddQueued    (bytes32 indexed h, string issuer, string[] clientIds, uint256 executeAfter);
+    event IssuerAddCancelled (bytes32 indexed h);
+    event IssuerAdded        (bytes32 indexed h, string issuer, string[] clientIds);
+    event IssuerRemovalQueued(bytes32 indexed h, uint256 executeAfter);
+    event IssuerRemovalCancelled(bytes32 indexed h);
+    event IssuerRemoved      (bytes32 indexed h, string issuer);
+
+    // -------------------------------------------------------------------------
     // Initializer
     // -------------------------------------------------------------------------
 
@@ -37,7 +65,10 @@ interface ISignetGroup {
         address[] calldata nodeAddrs,
         uint256 _threshold,
         uint256 _removalDelay,
-        address _factory
+        address _factory,
+        uint256 _issuerAddDelay,
+        uint256 _issuerRemovalDelay,
+        InitialIssuer[] calldata _initialIssuers
     ) external;
 
     // -------------------------------------------------------------------------
@@ -66,7 +97,29 @@ interface ISignetGroup {
     function transferManager(address newManager) external;
 
     // -------------------------------------------------------------------------
-    // Views
+    // OAuth issuer management (manager-only queue/cancel; permissionless execute)
+    // -------------------------------------------------------------------------
+
+    /// @notice Queue an issuer addition. Key = keccak256(abi.encodePacked(issuer)).
+    function queueAddIssuer(string calldata issuer, string[] calldata clientIds) external;
+
+    /// @notice Cancel a queued issuer addition (manager only).
+    function cancelAddIssuer(bytes32 issuerHash) external;
+
+    /// @notice Execute a queued addition after issuerAddDelay has elapsed (permissionless).
+    function executeAddIssuer(bytes32 issuerHash) external;
+
+    /// @notice Queue an issuer removal (manager only).
+    function queueRemoveIssuer(bytes32 issuerHash) external;
+
+    /// @notice Cancel a queued issuer removal (manager only).
+    function cancelRemoveIssuer(bytes32 issuerHash) external;
+
+    /// @notice Execute a queued removal after issuerRemovalDelay has elapsed (permissionless).
+    function executeRemoveIssuer(bytes32 issuerHash) external;
+
+    // -------------------------------------------------------------------------
+    // Views — membership
     // -------------------------------------------------------------------------
 
     function factory() external view returns (address);
@@ -84,4 +137,17 @@ interface ISignetGroup {
 
     /// @notice True when active node count >= quorum().
     function isOperational() external view returns (bool);
+
+    // -------------------------------------------------------------------------
+    // Views — OAuth issuers
+    // -------------------------------------------------------------------------
+
+    function issuerAddDelay() external view returns (uint256);
+    function issuerRemovalDelay() external view returns (uint256);
+
+    /// @notice Returns all currently trusted OAuth issuers for this group.
+    function getIssuers() external view returns (OAuthIssuer[] memory);
+
+    /// @notice True when clientId is in the trusted list for the given issuer.
+    function isClientIdTrusted(bytes32 issuerHash, string calldata clientId) external view returns (bool);
 }

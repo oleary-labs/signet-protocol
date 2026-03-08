@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"math/big"
+	"reflect"
 	"strings"
 	"time"
 
@@ -28,8 +29,11 @@ const (
 	groupABIJSON = `[
 		{"name":"getActiveNodes","type":"function","inputs":[],"outputs":[{"name":"","type":"address[]"}],"stateMutability":"view"},
 		{"name":"threshold","type":"function","inputs":[],"outputs":[{"name":"","type":"uint256"}],"stateMutability":"view"},
+		{"name":"getIssuers","type":"function","inputs":[],"outputs":[{"name":"","type":"tuple[]","components":[{"name":"issuer","type":"string"},{"name":"clientIds","type":"string[]"}]}],"stateMutability":"view"},
 		{"name":"NodeJoined","type":"event","inputs":[{"name":"node","type":"address","indexed":true}],"anonymous":false},
-		{"name":"NodeRemoved","type":"event","inputs":[{"name":"node","type":"address","indexed":true}],"anonymous":false}
+		{"name":"NodeRemoved","type":"event","inputs":[{"name":"node","type":"address","indexed":true}],"anonymous":false},
+		{"name":"IssuerAdded","type":"event","inputs":[{"name":"h","type":"bytes32","indexed":true},{"name":"issuer","type":"string","indexed":false},{"name":"clientIds","type":"string[]","indexed":false}],"anonymous":false},
+		{"name":"IssuerRemoved","type":"event","inputs":[{"name":"h","type":"bytes32","indexed":true},{"name":"issuer","type":"string","indexed":false}],"anonymous":false}
 	]`
 
 	pollInterval = 2 * time.Second
@@ -122,8 +126,8 @@ func (c *ChainClient) loadGroups(ctx context.Context) error {
 	return nil
 }
 
-// buildGroupInfo fetches active nodes and threshold for a group, resolving
-// each member's Ethereum address to a libp2p party.ID.
+// buildGroupInfo fetches active nodes, threshold, and OAuth issuers for a group,
+// resolving each member's Ethereum address to a libp2p party.ID.
 func (c *ChainClient) buildGroupInfo(ctx context.Context, grpAddr common.Address) (*GroupInfo, error) {
 	members, err := c.callGetActiveNodes(ctx, grpAddr)
 	if err != nil {
@@ -143,6 +147,28 @@ func (c *ChainClient) buildGroupInfo(ctx context.Context, grpAddr common.Address
 			continue
 		}
 		ids = append(ids, pid)
+	}
+
+	// Load OAuth issuers and register them with the auth store.
+	rawIssuers, err := c.callGetIssuers(ctx, grpAddr)
+	if err != nil {
+		c.log.Warn("chain: getIssuers", zap.String("group", grpAddr.Hex()), zap.Error(err))
+	} else if len(rawIssuers) > 0 {
+		hexGrp := grpAddr.Hex()
+		infos := make([]IssuerInfo, 0, len(rawIssuers))
+		for _, ri := range rawIssuers {
+			jwksURI, err := discoverJWKSURI(ctx, ri.Issuer)
+			if err != nil {
+				c.log.Warn("chain: OIDC discovery", zap.String("issuer", ri.Issuer), zap.Error(err))
+				jwksURI = ""
+			}
+			infos = append(infos, IssuerInfo{
+				Issuer:    ri.Issuer,
+				ClientIds: ri.ClientIds,
+				JwksURI:   jwksURI,
+			})
+		}
+		c.n.auth.SetIssuers(ctx, hexGrp, infos)
 	}
 
 	return &GroupInfo{
@@ -284,44 +310,85 @@ func (c *ChainClient) pollFactoryEvents(ctx context.Context, from, to uint64) er
 func (c *ChainClient) pollGroupEvents(ctx context.Context, grpAddr common.Address, from, to uint64) error {
 	joinedID := c.grpABI.Events["NodeJoined"].ID
 	removedID := c.grpABI.Events["NodeRemoved"].ID
+	issuerAddedID := c.grpABI.Events["IssuerAdded"].ID
+	issuerRemovedID := c.grpABI.Events["IssuerRemoved"].ID
 
 	query := ethereum.FilterQuery{
 		FromBlock: new(big.Int).SetUint64(from),
 		ToBlock:   new(big.Int).SetUint64(to),
 		Addresses: []common.Address{grpAddr},
-		Topics:    [][]common.Hash{{joinedID, removedID}},
+		Topics:    [][]common.Hash{{joinedID, removedID, issuerAddedID, issuerRemovedID}},
 	}
 	logs, err := c.eth.FilterLogs(ctx, query)
 	if err != nil {
 		return fmt.Errorf("filter group logs: %w", err)
 	}
 
-	for _, lg := range logs {
-		if len(lg.Topics) < 2 {
-			continue
-		}
-		nodeAddr := common.BytesToAddress(lg.Topics[1].Bytes())
-		pid, err := c.resolvePartyID(ctx, nodeAddr)
-		if err != nil {
-			c.log.Warn("chain: resolve party on group event",
-				zap.String("addr", nodeAddr.Hex()), zap.Error(err))
-			continue
-		}
+	hexGrp := grpAddr.Hex()
 
-		hexGrp := grpAddr.Hex()
-		c.n.groupsMu.Lock()
-		grp, ok := c.n.groups[hexGrp]
-		if ok {
-			switch lg.Topics[0] {
-			case joinedID:
-				if !containsParty(grp.Members, pid) {
-					grp.Members = append(grp.Members, pid)
-				}
-			case removedID:
-				grp.Members = removeParty(grp.Members, pid)
-			}
+	for _, lg := range logs {
+		if len(lg.Topics) < 1 {
+			continue
 		}
-		c.n.groupsMu.Unlock()
+		switch lg.Topics[0] {
+		case joinedID, removedID:
+			if len(lg.Topics) < 2 {
+				continue
+			}
+			nodeAddr := common.BytesToAddress(lg.Topics[1].Bytes())
+			pid, err := c.resolvePartyID(ctx, nodeAddr)
+			if err != nil {
+				c.log.Warn("chain: resolve party on group event",
+					zap.String("addr", nodeAddr.Hex()), zap.Error(err))
+				continue
+			}
+			c.n.groupsMu.Lock()
+			grp, ok := c.n.groups[hexGrp]
+			if ok {
+				switch lg.Topics[0] {
+				case joinedID:
+					if !containsParty(grp.Members, pid) {
+						grp.Members = append(grp.Members, pid)
+					}
+				case removedID:
+					grp.Members = removeParty(grp.Members, pid)
+				}
+			}
+			c.n.groupsMu.Unlock()
+
+		case issuerAddedID:
+			if len(lg.Topics) < 2 {
+				continue
+			}
+			// Decode non-indexed data: issuer string + clientIds string[]
+			out := make(map[string]interface{})
+			if err := c.grpABI.UnpackIntoMap(out, "IssuerAdded", lg.Data); err != nil {
+				c.log.Warn("chain: unpack IssuerAdded", zap.Error(err))
+				continue
+			}
+			issuer, _ := out["issuer"].(string)
+			clientIds, _ := out["clientIds"].([]string)
+			jwksURI, err := discoverJWKSURI(ctx, issuer)
+			if err != nil {
+				c.log.Warn("chain: OIDC discovery on IssuerAdded",
+					zap.String("issuer", issuer), zap.Error(err))
+				jwksURI = ""
+			}
+			c.n.auth.AddIssuer(ctx, hexGrp, IssuerInfo{
+				Issuer:    issuer,
+				ClientIds: clientIds,
+				JwksURI:   jwksURI,
+			})
+			c.log.Info("chain: issuer added", zap.String("group", hexGrp), zap.String("issuer", issuer))
+
+		case issuerRemovedID:
+			if len(lg.Topics) < 2 {
+				continue
+			}
+			h := [32]byte(lg.Topics[1])
+			c.n.auth.RemoveIssuer(hexGrp, h)
+			c.log.Info("chain: issuer removed", zap.String("group", hexGrp))
+		}
 	}
 	return nil
 }
@@ -374,6 +441,49 @@ func (c *ChainClient) callGetActiveNodes(ctx context.Context, grpAddr common.Add
 		return nil, err
 	}
 	return results[0].([]common.Address), nil
+}
+
+// rawIssuer is the ABI-decoded representation of an OAuthIssuer tuple.
+type rawIssuer struct {
+	Issuer    string
+	ClientIds []string
+}
+
+// callGetIssuers calls getIssuers() on a group contract and returns the result.
+// go-ethereum represents tuple[] outputs via reflect, so we use reflect to
+// extract fields by name.
+func (c *ChainClient) callGetIssuers(ctx context.Context, grpAddr common.Address) ([]rawIssuer, error) {
+	data, err := c.grpABI.Pack("getIssuers")
+	if err != nil {
+		return nil, err
+	}
+	result, err := c.eth.CallContract(ctx, ethereum.CallMsg{To: &grpAddr, Data: data}, nil)
+	if err != nil {
+		return nil, err
+	}
+	results, err := c.grpABI.Unpack("getIssuers", result)
+	if err != nil {
+		return nil, err
+	}
+	if len(results) == 0 {
+		return nil, nil
+	}
+	v := reflect.ValueOf(results[0])
+	if v.Kind() != reflect.Slice {
+		return nil, fmt.Errorf("unexpected type %T for getIssuers result", results[0])
+	}
+	out := make([]rawIssuer, v.Len())
+	for i := 0; i < v.Len(); i++ {
+		elem := v.Index(i)
+		out[i].Issuer = elem.FieldByName("Issuer").String()
+		cidsVal := elem.FieldByName("ClientIds")
+		cids := make([]string, cidsVal.Len())
+		for j := 0; j < cidsVal.Len(); j++ {
+			cids[j] = cidsVal.Index(j).String()
+		}
+		out[i].ClientIds = cids
+	}
+	return out, nil
 }
 
 func (c *ChainClient) callThreshold(ctx context.Context, grpAddr common.Address) (*big.Int, error) {

@@ -11,7 +11,7 @@ import "./interfaces/ISignetGroup.sol";
 ///         Deployed via BeaconProxy; upgrading the beacon upgrades all groups.
 contract SignetGroup is Initializable, ISignetGroup {
     // -------------------------------------------------------------------------
-    // State
+    // State — membership
     // -------------------------------------------------------------------------
 
     address public factory;
@@ -32,10 +32,24 @@ contract SignetGroup is Initializable, ISignetGroup {
     mapping(address => RemovalRequest) internal _removalRequests;
 
     // -------------------------------------------------------------------------
-    // Upgrade-safe storage gap
+    // State — OAuth issuers
     // -------------------------------------------------------------------------
 
-    uint256[50] private __gap;
+    uint256 public issuerAddDelay;
+    uint256 public issuerRemovalDelay;
+
+    mapping(bytes32 => OAuthIssuer) internal _issuers;
+    bytes32[] internal _issuerHashes;
+    mapping(bytes32 => uint256) internal _issuerHashIndex;   // 1-based
+
+    mapping(bytes32 => PendingIssuerAddition) internal _pendingAdditions;
+    mapping(bytes32 => uint256) internal _pendingRemovals;   // executeAfter timestamp
+
+    // -------------------------------------------------------------------------
+    // Upgrade-safe storage gap  (50 original − 7 new vars = 43)
+    // -------------------------------------------------------------------------
+
+    uint256[43] private __gap;
 
     // -------------------------------------------------------------------------
     // Initializer
@@ -47,12 +61,17 @@ contract SignetGroup is Initializable, ISignetGroup {
         address[] calldata nodeAddrs,
         uint256 _threshold,
         uint256 _removalDelay,
-        address _factory
+        address _factory,
+        uint256 _issuerAddDelay,
+        uint256 _issuerRemovalDelay,
+        InitialIssuer[] calldata _initialIssuers
     ) external initializer {
         manager = _manager;
         threshold = _threshold;
         removalDelay = _removalDelay;
         factory = _factory;
+        issuerAddDelay = _issuerAddDelay;
+        issuerRemovalDelay = _issuerRemovalDelay;
 
         for (uint256 i = 0; i < nodeAddrs.length; i++) {
             address node = nodeAddrs[i];
@@ -67,6 +86,18 @@ contract SignetGroup is Initializable, ISignetGroup {
                 _addToPending(node);
                 emit NodeInvited(node, _manager);
             }
+        }
+
+        // Seed initial issuers immediately — no delay applied.
+        for (uint256 i = 0; i < _initialIssuers.length; i++) {
+            InitialIssuer calldata ini = _initialIssuers[i];
+            bytes32 h = keccak256(abi.encodePacked(ini.issuer));
+            // Copy calldata string[] to memory for _addIssuer
+            string[] memory cids = new string[](ini.clientIds.length);
+            for (uint256 j = 0; j < ini.clientIds.length; j++) {
+                cids[j] = ini.clientIds[j];
+            }
+            _addIssuer(h, ini.issuer, cids);
         }
     }
 
@@ -154,7 +185,98 @@ contract SignetGroup is Initializable, ISignetGroup {
     }
 
     // -------------------------------------------------------------------------
-    // Views
+    // OAuth issuer management
+    // -------------------------------------------------------------------------
+
+    /// @inheritdoc ISignetGroup
+    function queueAddIssuer(string calldata issuer, string[] calldata clientIds) external {
+        require(msg.sender == manager, "not manager");
+        bytes32 h = keccak256(abi.encodePacked(issuer));
+        require(_issuerHashIndex[h] == 0, "issuer already exists");
+        require(_pendingAdditions[h].executeAfter == 0, "addition already queued");
+
+        uint256 executeAfter = block.timestamp + issuerAddDelay;
+
+        // Copy calldata arrays to storage via PendingIssuerAddition
+        PendingIssuerAddition storage p = _pendingAdditions[h];
+        p.issuer = issuer;
+        p.executeAfter = executeAfter;
+        for (uint256 i = 0; i < clientIds.length; i++) {
+            p.clientIds.push(clientIds[i]);
+        }
+
+        emit IssuerAddQueued(h, issuer, clientIds, executeAfter);
+    }
+
+    /// @inheritdoc ISignetGroup
+    function cancelAddIssuer(bytes32 issuerHash) external {
+        require(msg.sender == manager, "not manager");
+        require(_pendingAdditions[issuerHash].executeAfter != 0, "not pending");
+        delete _pendingAdditions[issuerHash];
+        emit IssuerAddCancelled(issuerHash);
+    }
+
+    /// @inheritdoc ISignetGroup
+    function executeAddIssuer(bytes32 issuerHash) external {
+        PendingIssuerAddition storage p = _pendingAdditions[issuerHash];
+        require(p.executeAfter != 0, "not pending");
+        require(block.timestamp >= p.executeAfter, "delay not elapsed");
+        require(_issuerHashIndex[issuerHash] == 0, "issuer already exists");
+
+        string memory iss = p.issuer;
+        string[] memory cids = new string[](p.clientIds.length);
+        for (uint256 i = 0; i < p.clientIds.length; i++) {
+            cids[i] = p.clientIds[i];
+        }
+        delete _pendingAdditions[issuerHash];
+        _addIssuer(issuerHash, iss, cids);
+    }
+
+    /// @inheritdoc ISignetGroup
+    function queueRemoveIssuer(bytes32 issuerHash) external {
+        require(msg.sender == manager, "not manager");
+        require(_issuerHashIndex[issuerHash] != 0, "issuer not found");
+        require(_pendingRemovals[issuerHash] == 0, "removal already queued");
+
+        uint256 executeAfter = block.timestamp + issuerRemovalDelay;
+        _pendingRemovals[issuerHash] = executeAfter;
+        emit IssuerRemovalQueued(issuerHash, executeAfter);
+    }
+
+    /// @inheritdoc ISignetGroup
+    function cancelRemoveIssuer(bytes32 issuerHash) external {
+        require(msg.sender == manager, "not manager");
+        require(_pendingRemovals[issuerHash] != 0, "no queued removal");
+        delete _pendingRemovals[issuerHash];
+        emit IssuerRemovalCancelled(issuerHash);
+    }
+
+    /// @inheritdoc ISignetGroup
+    function executeRemoveIssuer(bytes32 issuerHash) external {
+        uint256 executeAfter = _pendingRemovals[issuerHash];
+        require(executeAfter != 0, "no queued removal");
+        require(block.timestamp >= executeAfter, "delay not elapsed");
+
+        string memory iss = _issuers[issuerHash].issuer;
+        delete _pendingRemovals[issuerHash];
+
+        // Swap-and-pop removal from _issuerHashes
+        uint256 idx = _issuerHashIndex[issuerHash] - 1; // 0-based
+        uint256 last = _issuerHashes.length - 1;
+        if (idx != last) {
+            bytes32 tail = _issuerHashes[last];
+            _issuerHashes[idx] = tail;
+            _issuerHashIndex[tail] = idx + 1; // 1-based
+        }
+        _issuerHashes.pop();
+        delete _issuerHashIndex[issuerHash];
+        delete _issuers[issuerHash];
+
+        emit IssuerRemoved(issuerHash, iss);
+    }
+
+    // -------------------------------------------------------------------------
+    // Views — membership
     // -------------------------------------------------------------------------
 
     /// @inheritdoc ISignetGroup
@@ -199,7 +321,34 @@ contract SignetGroup is Initializable, ISignetGroup {
     }
 
     // -------------------------------------------------------------------------
-    // Internal helpers
+    // Views — OAuth issuers
+    // -------------------------------------------------------------------------
+
+    /// @inheritdoc ISignetGroup
+    function getIssuers() external view returns (OAuthIssuer[] memory) {
+        uint256 len = _issuerHashes.length;
+        OAuthIssuer[] memory result = new OAuthIssuer[](len);
+        for (uint256 i = 0; i < len; i++) {
+            result[i] = _issuers[_issuerHashes[i]];
+        }
+        return result;
+    }
+
+    /// @inheritdoc ISignetGroup
+    function isClientIdTrusted(bytes32 issuerHash, string calldata clientId) external view returns (bool) {
+        if (_issuerHashIndex[issuerHash] == 0) return false;
+        OAuthIssuer storage iss = _issuers[issuerHash];
+        bytes32 cidHash = keccak256(bytes(clientId));
+        for (uint256 i = 0; i < iss.clientIds.length; i++) {
+            if (keccak256(bytes(iss.clientIds[i])) == cidHash) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // -------------------------------------------------------------------------
+    // Internal helpers — membership
     // -------------------------------------------------------------------------
 
     function _addToActive(address node) internal {
@@ -240,5 +389,20 @@ contract SignetGroup is Initializable, ISignetGroup {
         _pendingNodes.pop();
         delete _pendingNodeIndex[node];
         delete nodeStatus[node];
+    }
+
+    // -------------------------------------------------------------------------
+    // Internal helpers — issuers
+    // -------------------------------------------------------------------------
+
+    function _addIssuer(bytes32 h, string memory issuer, string[] memory clientIds) internal {
+        _issuerHashes.push(h);
+        _issuerHashIndex[h] = _issuerHashes.length; // 1-based
+        OAuthIssuer storage stored = _issuers[h];
+        stored.issuer = issuer;
+        for (uint256 i = 0; i < clientIds.length; i++) {
+            stored.clientIds.push(clientIds[i]);
+        }
+        emit IssuerAdded(h, issuer, clientIds);
     }
 }

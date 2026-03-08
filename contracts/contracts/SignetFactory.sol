@@ -99,7 +99,10 @@ contract SignetFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable, IS
     function createGroup(
         address[] calldata nodeAddrs,
         uint256 threshold,
-        uint256 removalDelay
+        uint256 removalDelay,
+        uint256 issuerAddDelay,
+        uint256 issuerRemovalDelay,
+        ISignetGroup.InitialIssuer[] calldata initialIssuers
     ) external returns (address group) {
         require(removalDelay >= MIN_REMOVAL_DELAY, "removal delay too short");
         require(nodeAddrs.length > threshold, "threshold too high for node count");
@@ -111,7 +114,16 @@ contract SignetFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable, IS
         groups.push(group);
         isGroup[group] = true;
 
-        ISignetGroup(group).initialize(msg.sender, nodeAddrs, threshold, removalDelay, address(this));
+        ISignetGroup(group).initialize(
+            msg.sender,
+            nodeAddrs,
+            threshold,
+            removalDelay,
+            address(this),
+            issuerAddDelay,
+            issuerRemovalDelay,
+            initialIssuers
+        );
 
         emit GroupCreated(group, msg.sender, threshold);
     }

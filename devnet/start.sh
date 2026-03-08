@@ -153,8 +153,8 @@ CREATE_RECEIPT=$(cast send \
     --private-key "$DEPLOYER_PK" \
     --rpc-url "$RPC" \
     "$FACTORY" \
-    "createGroup(address[],uint256,uint256)" \
-    "[$ADDR_1,$ADDR_2,$ADDR_3]" 1 86400 \
+    "createGroup(address[],uint256,uint256,uint256,uint256,(string,string[])[])" \
+    "[$ADDR_1,$ADDR_2,$ADDR_3]" 1 86400 86400 86400 "[]" \
     --json)
 
 # topics[1] is the group address zero-padded to 32 bytes; take the last 40 hex chars.

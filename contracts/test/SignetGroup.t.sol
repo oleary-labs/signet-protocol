@@ -57,10 +57,12 @@ contract SignetGroupTest is PubkeyHelpersGroup {
     // Helpers
     // -------------------------------------------------------------------------
 
-    /// @dev Creates a group with the given set; threshold=1, 1-day delay; manager=this.manager.
+    ISignetGroup.InitialIssuer[] internal _noIssuers;
+
+    /// @dev Creates a group with the given set; threshold=1, 1-day delays; manager=this.manager.
     function _createGroup(address[] memory addrs) internal returns (ISignetGroup) {
         vm.prank(manager);
-        address g = factory.createGroup(addrs, 1, 1 days);
+        address g = factory.createGroup(addrs, 1, 1 days, 1 days, 1 days, _noIssuers);
         return ISignetGroup(g);
     }
 
@@ -422,5 +424,288 @@ contract SignetGroupTest is PubkeyHelpersGroup {
         address[] memory groups2 = factory.getNodeGroups(node2);
         assertEq(groups2.length, 1);
         assertEq(groups2[0], address(g));
+    }
+}
+
+// =============================================================================
+// Issuer management tests
+// =============================================================================
+
+contract SignetGroupIssuerTest is PubkeyHelpersGroup {
+    SignetFactory factory;
+    SignetGroup   groupImpl;
+
+    uint256 constant PK1 = 0x1111;
+    uint256 constant PK2 = 0x2222;
+    uint256 constant PK3 = 0x3333;
+
+    address node1; address node2; address node3;
+    bytes   pub1;  bytes   pub2;  bytes   pub3;
+
+    address admin   = address(0xAD);
+    address manager = address(0x1337);
+
+    string constant ISS1 = "https://accounts.google.com";
+    string constant ISS2 = "https://auth.example.com";
+    string constant CLIENT_A = "client-abc";
+    string constant CLIENT_B = "client-xyz";
+
+    bytes32 immutable HASH1 = keccak256(abi.encodePacked(ISS1));
+    bytes32 immutable HASH2 = keccak256(abi.encodePacked(ISS2));
+
+    function setUp() public {
+        node1 = vm.addr(PK1); pub1 = _uncompressedPubkey(PK1);
+        node2 = vm.addr(PK2); pub2 = _uncompressedPubkey(PK2);
+        node3 = vm.addr(PK3); pub3 = _uncompressedPubkey(PK3);
+
+        groupImpl = new SignetGroup();
+        SignetFactory factoryImpl = new SignetFactory();
+        bytes memory initData = abi.encodeCall(
+            SignetFactory.initialize,
+            (admin, address(groupImpl))
+        );
+        factory = SignetFactory(address(new ERC1967Proxy(address(factoryImpl), initData)));
+
+        vm.prank(node1); factory.registerNode(pub1, true);
+        vm.prank(node2); factory.registerNode(pub2, true);
+        vm.prank(node3); factory.registerNode(pub3, true);
+    }
+
+    ISignetGroup.InitialIssuer[] internal _noIssuers;
+
+    function _makeGroup() internal returns (ISignetGroup) {
+        address[] memory addrs = new address[](3);
+        addrs[0] = node1; addrs[1] = node2; addrs[2] = node3;
+        vm.prank(manager);
+        address g = factory.createGroup(addrs, 1, 1 days, 1 days, 1 days, _noIssuers);
+        return ISignetGroup(g);
+    }
+
+    function _makeGroupWithIssuer() internal returns (ISignetGroup) {
+        address[] memory addrs = new address[](3);
+        addrs[0] = node1; addrs[1] = node2; addrs[2] = node3;
+
+        ISignetGroup.InitialIssuer[] memory issuers = new ISignetGroup.InitialIssuer[](1);
+        string[] memory cids = new string[](2);
+        cids[0] = CLIENT_A; cids[1] = CLIENT_B;
+        issuers[0] = ISignetGroup.InitialIssuer({ issuer: ISS1, clientIds: cids });
+
+        vm.prank(manager);
+        address g = factory.createGroup(addrs, 1, 1 days, 1 days, 1 days, issuers);
+        return ISignetGroup(g);
+    }
+
+    // -------------------------------------------------------------------------
+    // Initial issuers at creation (no delay)
+    // -------------------------------------------------------------------------
+
+    function testInitialIssuerAddedAtCreation() public {
+        ISignetGroup g = _makeGroupWithIssuer();
+        ISignetGroup.OAuthIssuer[] memory issuers = g.getIssuers();
+        assertEq(issuers.length, 1);
+        assertEq(issuers[0].issuer, ISS1);
+        assertEq(issuers[0].clientIds.length, 2);
+        assertEq(issuers[0].clientIds[0], CLIENT_A);
+        assertEq(issuers[0].clientIds[1], CLIENT_B);
+    }
+
+    // -------------------------------------------------------------------------
+    // queueAddIssuer / executeAddIssuer
+    // -------------------------------------------------------------------------
+
+    function testQueueAndExecuteAddIssuer() public {
+        ISignetGroup g = _makeGroup();
+        assertEq(g.getIssuers().length, 0);
+
+        string[] memory cids = new string[](1);
+        cids[0] = CLIENT_A;
+
+        vm.prank(manager);
+        uint256 expectedAfter = block.timestamp + 1 days;
+        vm.expectEmit(true, false, false, true);
+        emit ISignetGroup.IssuerAddQueued(HASH1, ISS1, cids, expectedAfter);
+        g.queueAddIssuer(ISS1, cids);
+
+        // Cannot execute before delay
+        vm.expectRevert("delay not elapsed");
+        g.executeAddIssuer(HASH1);
+
+        vm.warp(block.timestamp + 1 days);
+        vm.expectEmit(true, false, false, true);
+        emit ISignetGroup.IssuerAdded(HASH1, ISS1, cids);
+        g.executeAddIssuer(HASH1);
+
+        ISignetGroup.OAuthIssuer[] memory issuers = g.getIssuers();
+        assertEq(issuers.length, 1);
+        assertEq(issuers[0].issuer, ISS1);
+    }
+
+    // -------------------------------------------------------------------------
+    // cancelAddIssuer
+    // -------------------------------------------------------------------------
+
+    function testCancelAddIssuer() public {
+        ISignetGroup g = _makeGroup();
+
+        string[] memory cids = new string[](1);
+        cids[0] = CLIENT_A;
+
+        vm.prank(manager);
+        g.queueAddIssuer(ISS1, cids);
+
+        vm.prank(manager);
+        vm.expectEmit(true, false, false, false);
+        emit ISignetGroup.IssuerAddCancelled(HASH1);
+        g.cancelAddIssuer(HASH1);
+
+        vm.warp(block.timestamp + 1 days);
+        vm.expectRevert("not pending");
+        g.executeAddIssuer(HASH1);
+
+        assertEq(g.getIssuers().length, 0);
+    }
+
+    // -------------------------------------------------------------------------
+    // Duplicate add guard
+    // -------------------------------------------------------------------------
+
+    function testDuplicateAddIssuerReverts() public {
+        ISignetGroup g = _makeGroupWithIssuer();
+
+        // ISS1 is already active; trying to queue it again should revert
+        string[] memory cids = new string[](1);
+        cids[0] = CLIENT_A;
+        vm.prank(manager);
+        vm.expectRevert("issuer already exists");
+        g.queueAddIssuer(ISS1, cids);
+    }
+
+    // -------------------------------------------------------------------------
+    // queueRemoveIssuer / executeRemoveIssuer
+    // -------------------------------------------------------------------------
+
+    function testQueueAndExecuteRemoveIssuer() public {
+        ISignetGroup g = _makeGroupWithIssuer();
+        assertEq(g.getIssuers().length, 1);
+
+        vm.prank(manager);
+        uint256 expectedAfter = block.timestamp + 1 days;
+        vm.expectEmit(true, false, false, true);
+        emit ISignetGroup.IssuerRemovalQueued(HASH1, expectedAfter);
+        g.queueRemoveIssuer(HASH1);
+
+        // Cannot execute before delay
+        vm.expectRevert("delay not elapsed");
+        g.executeRemoveIssuer(HASH1);
+
+        vm.warp(block.timestamp + 1 days);
+        vm.expectEmit(true, false, false, false);
+        emit ISignetGroup.IssuerRemoved(HASH1, ISS1);
+        g.executeRemoveIssuer(HASH1);
+
+        assertEq(g.getIssuers().length, 0);
+    }
+
+    // -------------------------------------------------------------------------
+    // cancelRemoveIssuer
+    // -------------------------------------------------------------------------
+
+    function testCancelRemoveIssuer() public {
+        ISignetGroup g = _makeGroupWithIssuer();
+
+        vm.prank(manager);
+        g.queueRemoveIssuer(HASH1);
+
+        vm.prank(manager);
+        vm.expectEmit(true, false, false, false);
+        emit ISignetGroup.IssuerRemovalCancelled(HASH1);
+        g.cancelRemoveIssuer(HASH1);
+
+        vm.warp(block.timestamp + 2 days);
+        vm.expectRevert("no queued removal");
+        g.executeRemoveIssuer(HASH1);
+
+        // Issuer still present
+        assertEq(g.getIssuers().length, 1);
+    }
+
+    // -------------------------------------------------------------------------
+    // Remove before delay reverts
+    // -------------------------------------------------------------------------
+
+    function testRemoveBeforeDelayReverts() public {
+        ISignetGroup g = _makeGroupWithIssuer();
+
+        vm.prank(manager);
+        g.queueRemoveIssuer(HASH1);
+
+        vm.warp(block.timestamp + 1 days - 1);
+        vm.expectRevert("delay not elapsed");
+        g.executeRemoveIssuer(HASH1);
+    }
+
+    // -------------------------------------------------------------------------
+    // getIssuers view — multiple issuers, swap-and-pop correctness
+    // -------------------------------------------------------------------------
+
+    function testGetIssuers_MultipleAndSwapPop() public {
+        ISignetGroup g = _makeGroup();
+
+        string[] memory cids1 = new string[](1); cids1[0] = CLIENT_A;
+        string[] memory cids2 = new string[](1); cids2[0] = CLIENT_B;
+
+        vm.startPrank(manager);
+        g.queueAddIssuer(ISS1, cids1);
+        g.queueAddIssuer(ISS2, cids2);
+        vm.stopPrank();
+
+        vm.warp(block.timestamp + 1 days);
+        g.executeAddIssuer(HASH1);
+        g.executeAddIssuer(HASH2);
+
+        ISignetGroup.OAuthIssuer[] memory issuers = g.getIssuers();
+        assertEq(issuers.length, 2);
+
+        // Remove first issuer (tests swap-and-pop)
+        vm.prank(manager);
+        g.queueRemoveIssuer(HASH1);
+        vm.warp(block.timestamp + 1 days);
+        g.executeRemoveIssuer(HASH1);
+
+        issuers = g.getIssuers();
+        assertEq(issuers.length, 1);
+        assertEq(issuers[0].issuer, ISS2);
+    }
+
+    // -------------------------------------------------------------------------
+    // isClientIdTrusted view
+    // -------------------------------------------------------------------------
+
+    function testIsClientIdTrusted() public {
+        ISignetGroup g = _makeGroupWithIssuer();
+
+        assertTrue(g.isClientIdTrusted(HASH1, CLIENT_A));
+        assertTrue(g.isClientIdTrusted(HASH1, CLIENT_B));
+        assertFalse(g.isClientIdTrusted(HASH1, "unknown-client"));
+        assertFalse(g.isClientIdTrusted(HASH2, CLIENT_A)); // HASH2 not registered
+    }
+
+    // -------------------------------------------------------------------------
+    // Access control: only manager can queue/cancel
+    // -------------------------------------------------------------------------
+
+    function testOnlyManagerCanQueueAddIssuer() public {
+        ISignetGroup g = _makeGroup();
+        string[] memory cids = new string[](0);
+        vm.prank(node1);
+        vm.expectRevert("not manager");
+        g.queueAddIssuer(ISS1, cids);
+    }
+
+    function testOnlyManagerCanQueueRemoveIssuer() public {
+        ISignetGroup g = _makeGroupWithIssuer();
+        vm.prank(node1);
+        vm.expectRevert("not manager");
+        g.queueRemoveIssuer(HASH1);
     }
 }

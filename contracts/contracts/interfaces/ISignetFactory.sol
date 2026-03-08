@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.24;
 
+import "./ISignetGroup.sol";
+
 /// @title ISignetFactory
 /// @notice Interface for the Signet node registry and group factory.
 interface ISignetFactory {
@@ -48,13 +50,19 @@ interface ISignetFactory {
     // -------------------------------------------------------------------------
 
     /// @notice Deploy a new SignetGroup via the beacon proxy.
-    /// @param nodeAddrs  Initial set of node addresses.
-    /// @param threshold  Maximum tolerated corruptions (quorum = threshold + 1).
-    /// @param removalDelay  Seconds delay before a queued removal can execute.
+    /// @param nodeAddrs          Initial set of node addresses.
+    /// @param threshold          Maximum tolerated corruptions (quorum = threshold + 1).
+    /// @param removalDelay       Seconds delay before a queued node removal can execute.
+    /// @param issuerAddDelay     Seconds delay before a queued issuer addition can execute.
+    /// @param issuerRemovalDelay Seconds delay before a queued issuer removal can execute.
+    /// @param initialIssuers     OAuth issuers added immediately at creation (no delay).
     function createGroup(
         address[] calldata nodeAddrs,
         uint256 threshold,
-        uint256 removalDelay
+        uint256 removalDelay,
+        uint256 issuerAddDelay,
+        uint256 issuerRemovalDelay,
+        ISignetGroup.InitialIssuer[] calldata initialIssuers
     ) external returns (address group);
 
     /// @notice Upgrade the SignetGroup implementation for all groups.

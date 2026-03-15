@@ -1,0 +1,8 @@
+[package]
+name = "jwt_auth"
+type = "bin"
+authors = [""]
+compiler_version = ">=1.0.0"
+
+[dependencies]
+jwt = { path = "../noir-jwt-local" }

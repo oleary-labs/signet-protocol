@@ -1,0 +1,3 @@
+# Noir build artifacts
+**/target/
+**/Prover.toml

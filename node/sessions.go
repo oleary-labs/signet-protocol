@@ -29,6 +29,13 @@ type SessionInfo struct {
 	Sub string    // JWT subject (user ID)
 	Iss string    // JWT issuer
 	Exp time.Time // JWT expiry
+	Aud string    // JWT audience
+	Azp string    // JWT authorized party / client_id
+
+	// Production mode: stored so coord messages can carry the proof for
+	// other participants to verify independently.
+	Proof       []byte // ZK proof bytes (nil in test mode)
+	JWKSModulus []byte // RSA modulus used in the proof
 }
 
 // SessionStore is a thread-safe in-memory cache mapping compressed session

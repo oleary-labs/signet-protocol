@@ -118,6 +118,20 @@ func New(cfg *Config, log *zap.Logger) (*Node, error) {
 		log.Info("connected to bootstrap peer", zap.String("peer", pi.ID.String()))
 	}
 
+	// Load circuit verification key if configured (required for production ZK auth).
+	var circuitVK []byte
+	if cfg.VKPath != "" {
+		var err error
+		circuitVK, err = os.ReadFile(cfg.VKPath)
+		if err != nil {
+			store.Close()
+			h.Close()
+			cancel()
+			return nil, fmt.Errorf("read circuit VK from %s: %w", cfg.VKPath, err)
+		}
+		log.Info("loaded circuit verification key", zap.String("path", cfg.VKPath), zap.Int("bytes", len(circuitVK)))
+	}
+
 	n := &Node{
 		cfg:     cfg,
 		host:    h,
@@ -128,7 +142,7 @@ func New(cfg *Config, log *zap.Logger) (*Node, error) {
 		store:   store,
 		configs: make(map[shardKey]*lss.Config),
 		groups:   make(map[string]*GroupInfo),
-		auth:     newGroupAuth(ctx, cfg.TestMode, log),
+		auth:     newGroupAuth(ctx, cfg.TestMode, circuitVK, log),
 		sessions: newSessionStore(),
 	}
 	n.sessions.startCleanupLoop(ctx)
@@ -338,14 +352,21 @@ func (n *Node) handleListKeys(w http.ResponseWriter, r *http.Request) {
 //
 // Production mode:
 //
-//	{"group_id":"0x...","proof":"hex...","header":"eyJ...","payload":"eyJ...",
-//	 "session_pub":"02abc...","sub":"user123","iss":"https://...","exp":1709900000}
+//	{"group_id":"0x...","proof":"hex...","session_pub":"02abc...",
+//	 "sub":"user123","iss":"https://...","exp":1709900000,
+//	 "aud":"app.example.com","azp":"client-id","jwks_modulus":"hex..."}
 func (n *Node) handleAuth(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		GroupID    string `json:"group_id"`
-		Token      string `json:"token"`       // test mode: raw JWT
-		Proof      string `json:"proof"`        // production mode: ZK proof hex
-		SessionPub string `json:"session_pub"`  // hex, 33-byte compressed secp256k1
+		GroupID     string `json:"group_id"`
+		Token       string `json:"token"`        // test mode: raw JWT
+		Proof       string `json:"proof"`         // production: ZK proof hex
+		SessionPub  string `json:"session_pub"`   // hex, 33-byte compressed secp256k1
+		Sub         string `json:"sub"`           // production: JWT subject
+		Iss         string `json:"iss"`           // production: JWT issuer
+		Exp         uint64 `json:"exp"`           // production: JWT expiry unix timestamp
+		Aud         string `json:"aud"`           // production: JWT audience
+		Azp         string `json:"azp"`           // production: JWT authorized party
+		JWKSModulus string `json:"jwks_modulus"`  // production: RSA modulus hex
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		httpError(w, http.StatusBadRequest, "decode body: "+err.Error())
@@ -378,6 +399,8 @@ func (n *Node) handleAuth(w http.ResponseWriter, r *http.Request) {
 			Sub: claims.Sub,
 			Iss: claims.Iss,
 			Exp: claims.Exp,
+			Aud: claims.Aud,
+			Azp: claims.Azp,
 		})
 		n.log.Info("auth: session registered (test mode)",
 			zap.String("group_id", req.GroupID),
@@ -391,9 +414,69 @@ func (n *Node) handleAuth(w http.ResponseWriter, r *http.Request) {
 			"expires_at": claims.Exp.Unix(),
 		})
 	} else {
-		// Production mode: verify ZK proof.
-		// TODO: implement ZK proof verification when noir-jwt circuit is ready.
-		httpError(w, http.StatusNotImplemented, "ZK proof verification not yet implemented")
+		// Production mode: verify ZK proof and cache session.
+		if req.Proof == "" {
+			httpError(w, http.StatusBadRequest, "proof is required in production mode")
+			return
+		}
+		if req.Sub == "" || req.Iss == "" || req.Exp == 0 {
+			httpError(w, http.StatusBadRequest, "sub, iss, and exp are required in production mode")
+			return
+		}
+		if req.JWKSModulus == "" {
+			httpError(w, http.StatusBadRequest, "jwks_modulus is required in production mode")
+			return
+		}
+
+		proofBytes, err := hex.DecodeString(strings.TrimPrefix(req.Proof, "0x"))
+		if err != nil || len(proofBytes) == 0 {
+			httpError(w, http.StatusBadRequest, "invalid proof hex")
+			return
+		}
+		modulusBytes, err := hex.DecodeString(strings.TrimPrefix(req.JWKSModulus, "0x"))
+		if err != nil || len(modulusBytes) == 0 {
+			httpError(w, http.StatusBadRequest, "invalid jwks_modulus hex")
+			return
+		}
+
+		ap := &AuthProof{
+			Proof:       proofBytes,
+			Sub:         req.Sub,
+			Iss:         req.Iss,
+			Exp:         req.Exp,
+			Aud:         req.Aud,
+			Azp:         req.Azp,
+			JWKSModulus: modulusBytes,
+			SessionPub:  sessionPubBytes,
+		}
+
+		sub, err := n.auth.ValidateAuthProof(r.Context(), req.GroupID, ap)
+		if err != nil {
+			httpError(w, http.StatusUnauthorized, "proof verification failed: "+err.Error())
+			return
+		}
+
+		pubHex := sessionPubToHex(sessionPubBytes)
+		n.sessions.Put(pubHex, &SessionInfo{
+			Sub:         sub,
+			Iss:         req.Iss,
+			Exp:         time.Unix(int64(req.Exp), 0),
+			Aud:         req.Aud,
+			Azp:         req.Azp,
+			Proof:       proofBytes,
+			JWKSModulus: modulusBytes,
+		})
+		n.log.Info("auth: session registered (production)",
+			zap.String("group_id", req.GroupID),
+			zap.String("sub", sub),
+			zap.String("session_pub", pubHex))
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{
+			"status":     "ok",
+			"sub":        sub,
+			"expires_at": int64(req.Exp),
+		})
 	}
 }
 
@@ -796,14 +879,18 @@ func (n *Node) validateSessionRequest(
 	}
 
 	ap := &AuthProof{
-		Sub:        info.Sub,
-		Iss:        info.Iss,
-		Exp:        uint64(info.Exp.Unix()),
-		SessionPub: sessionPubBytes,
-		RequestSig: reqSigBytes,
-		Nonce:      nonce,
-		Timestamp:  timestamp,
-		TestMode:   n.cfg.TestMode,
+		Proof:       info.Proof,
+		Sub:         info.Sub,
+		Iss:         info.Iss,
+		Exp:         uint64(info.Exp.Unix()),
+		Aud:         info.Aud,
+		Azp:         info.Azp,
+		JWKSModulus: info.JWKSModulus,
+		SessionPub:  sessionPubBytes,
+		RequestSig:  reqSigBytes,
+		Nonce:       nonce,
+		Timestamp:   timestamp,
+		TestMode:    n.cfg.TestMode,
 	}
 	return ap, resolvedKeyID, nil
 }

@@ -2,14 +2,17 @@ package node
 
 import (
 	"context"
+	"crypto/rsa"
 	"encoding/json"
 	"fmt"
+	"math/big"
 	"net/http"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/ethereum/go-ethereum/crypto"
+	"github.com/lestrrat-go/jwx/v2/jwa"
 	"github.com/lestrrat-go/jwx/v2/jwk"
 	"github.com/lestrrat-go/jwx/v2/jwt"
 	"go.uber.org/zap"
@@ -31,20 +34,22 @@ func IssuerHash(issuer string) [32]byte {
 // GroupAuth is a per-group OAuth trust store with a shared JWKS cache.
 // Thread-safe; designed to be populated from chain events.
 type GroupAuth struct {
-	mu       sync.RWMutex
-	groups   map[string][]IssuerInfo // groupID hex → trusted issuers
-	cache    *jwk.Cache
-	testMode bool
-	log      *zap.Logger
+	mu        sync.RWMutex
+	groups    map[string][]IssuerInfo // groupID hex → trusted issuers
+	cache     *jwk.Cache
+	testMode  bool
+	circuitVK []byte // verification key for the jwt_auth circuit (bb format)
+	log       *zap.Logger
 }
 
-func newGroupAuth(ctx context.Context, testMode bool, log *zap.Logger) *GroupAuth {
+func newGroupAuth(ctx context.Context, testMode bool, circuitVK []byte, log *zap.Logger) *GroupAuth {
 	cache := jwk.NewCache(ctx)
 	return &GroupAuth{
-		groups:   make(map[string][]IssuerInfo),
-		cache:    cache,
-		testMode: testMode,
-		log:      log,
+		groups:    make(map[string][]IssuerInfo),
+		cache:     cache,
+		testMode:  testMode,
+		circuitVK: circuitVK,
+		log:       log,
 	}
 }
 
@@ -285,9 +290,23 @@ func (g *GroupAuth) ValidateAuthProof(ctx context.Context, groupID string, proof
 		if len(proof.Proof) == 0 {
 			return "", fmt.Errorf("auth proof missing ZK proof bytes")
 		}
-		// TODO: verify noir-jwt ZK proof against public inputs:
-		//   (ClaimsHash, Sub, Iss, Exp, Aud, Azp, JWKSModulus, SessionPub)
-		return "", fmt.Errorf("ZK proof verification not yet implemented")
+		if len(g.circuitVK) == 0 {
+			return "", fmt.Errorf("no circuit verification key configured (set vk_path)")
+		}
+
+		// Verify the JWKS modulus matches a real RSA key from the issuer's OIDC JWKS.
+		if err := g.verifyJWKSModulus(ctx, groupID, proof.Iss, proof.JWKSModulus); err != nil {
+			return "", fmt.Errorf("modulus check: %w", err)
+		}
+
+		// Encode public inputs from the proof's claim fields and run bb verify.
+		publicInputs, err := encodePublicInputs(proof)
+		if err != nil {
+			return "", fmt.Errorf("encode public inputs: %w", err)
+		}
+		if err := verifyBBProof(proof.Proof, publicInputs, g.circuitVK); err != nil {
+			return "", fmt.Errorf("ZK proof invalid: %w", err)
+		}
 	}
 
 	return proof.Sub, nil
@@ -319,6 +338,57 @@ func discoverJWKSURI(ctx context.Context, issuer string) (string, error) {
 		return "", fmt.Errorf("discovery document missing jwks_uri")
 	}
 	return doc.JWKSURI, nil
+}
+
+// verifyJWKSModulus checks that the given RSA modulus (big-endian bytes) matches
+// one of the RSA keys in the cached JWKS for the given issuer. This prevents a
+// client from using a fake RSA key to generate proofs for arbitrary claims.
+func (g *GroupAuth) verifyJWKSModulus(ctx context.Context, groupID, issuer string, modulus []byte) error {
+	g.mu.RLock()
+	issuers := g.groups[groupID]
+	g.mu.RUnlock()
+
+	var matched *IssuerInfo
+	for i := range issuers {
+		if issuers[i].Issuer == issuer {
+			matched = &issuers[i]
+			break
+		}
+	}
+	if matched == nil {
+		return fmt.Errorf("untrusted issuer: %s", issuer)
+	}
+	if matched.JwksURI == "" {
+		return fmt.Errorf("no JWKS URI for issuer %s", issuer)
+	}
+
+	keySet, err := g.cache.Get(ctx, matched.JwksURI)
+	if err != nil {
+		return fmt.Errorf("fetch JWKS: %w", err)
+	}
+
+	proofModulus := new(big.Int).SetBytes(modulus)
+	for i := 0; i < keySet.Len(); i++ {
+		key, ok := keySet.Key(i)
+		if !ok {
+			continue
+		}
+		if key.KeyType() != jwa.RSA {
+			continue
+		}
+		var raw interface{}
+		if err := key.Raw(&raw); err != nil {
+			continue
+		}
+		rsaPub, ok := raw.(*rsa.PublicKey)
+		if !ok {
+			continue
+		}
+		if rsaPub.N.Cmp(proofModulus) == 0 {
+			return nil
+		}
+	}
+	return fmt.Errorf("proof RSA modulus does not match any key in JWKS for %s", issuer)
 }
 
 func containsString(slice []string, s string) bool {

@@ -88,11 +88,11 @@ func (n *Node) handleCoordStream(s libp2pnet.Stream) {
 
 	// Validate auth if the group has trusted issuers configured.
 	if n.auth.HasIssuers(msg.GroupID) {
-		var sub string
+		var keyPrefix string
 		if msg.Auth != nil {
 			// New path: AuthProof (ZK proof or test-mode attestation).
 			var err error
-			sub, err = n.auth.ValidateAuthProof(n.ctx, msg.GroupID, msg.Auth)
+			keyPrefix, err = n.auth.ValidateAuthProof(n.ctx, msg.GroupID, msg.Auth)
 			if err != nil {
 				n.log.Warn("coord: invalid auth proof",
 					zap.String("group_id", msg.GroupID),
@@ -134,7 +134,7 @@ func (n *Node) handleCoordStream(s libp2pnet.Stream) {
 		} else if len(msg.AuthToken) > 0 {
 			// Legacy path: raw JWT forwarding.
 			var err error
-			sub, err = n.auth.ValidateJWT(n.ctx, msg.GroupID, msg.AuthToken)
+			keyPrefix, err = n.auth.ValidateJWT(n.ctx, msg.GroupID, msg.AuthToken)
 			if err != nil {
 				n.log.Warn("coord: invalid auth token",
 					zap.String("group_id", msg.GroupID),
@@ -148,12 +148,12 @@ func (n *Node) handleCoordStream(s libp2pnet.Stream) {
 				zap.String("key_id", msg.KeyID))
 			return
 		}
-		// KeyID must equal sub or start with sub+":"
-		if msg.KeyID != sub && !strings.HasPrefix(msg.KeyID, sub+":") {
-			n.log.Warn("coord: key_id does not match token sub",
+		// KeyID must equal iss:sub or start with iss:sub+":"
+		if msg.KeyID != keyPrefix && !strings.HasPrefix(msg.KeyID, keyPrefix+":") {
+			n.log.Warn("coord: key_id does not match token identity",
 				zap.String("group_id", msg.GroupID),
 				zap.String("key_id", msg.KeyID),
-				zap.String("sub", sub))
+				zap.String("key_prefix", keyPrefix))
 			return
 		}
 	}

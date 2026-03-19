@@ -541,14 +541,14 @@ func (n *Node) handleKeygen(w http.ResponseWriter, r *http.Request) {
 			authProof = ap
 		} else if token := extractBearer(r); token != "" {
 			// Legacy path: raw JWT in Authorization header.
-			sub, err := n.auth.ValidateJWT(r.Context(), req.GroupID, []byte(token))
+			issAndSub, err := n.auth.ValidateJWT(r.Context(), req.GroupID, []byte(token))
 			if err != nil {
 				httpError(w, http.StatusUnauthorized, "invalid token: "+err.Error())
 				return
 			}
-			keyID = sub
+			keyID = issAndSub
 			if req.KeySuffix != "" {
-				keyID = sub + ":" + req.KeySuffix
+				keyID = issAndSub + ":" + req.KeySuffix
 			}
 			authToken = []byte(token)
 		} else {
@@ -711,14 +711,14 @@ func (n *Node) handleSign(w http.ResponseWriter, r *http.Request) {
 			authProof = ap
 		} else if token := extractBearer(r); token != "" {
 			// Legacy path: raw JWT in Authorization header.
-			sub, err := n.auth.ValidateJWT(r.Context(), req.GroupID, []byte(token))
+			issAndSub, err := n.auth.ValidateJWT(r.Context(), req.GroupID, []byte(token))
 			if err != nil {
 				httpError(w, http.StatusUnauthorized, "invalid token: "+err.Error())
 				return
 			}
-			keyID = sub
+			keyID = issAndSub
 			if req.KeySuffix != "" {
-				keyID = sub + ":" + req.KeySuffix
+				keyID = issAndSub + ":" + req.KeySuffix
 			}
 			authToken = []byte(token)
 		} else {
@@ -851,10 +851,10 @@ func (n *Node) validateSessionRequest(
 		return nil, "", &httpErr{http.StatusUnauthorized, "session expired; re-authenticate"}
 	}
 
-	// Derive key_id from session sub.
-	resolvedKeyID := info.Sub
+	// Derive key_id from session iss+sub (globally unique pair).
+	resolvedKeyID := info.Iss + ":" + info.Sub
 	if keySuffix != "" {
-		resolvedKeyID = info.Sub + ":" + keySuffix
+		resolvedKeyID = info.Iss + ":" + info.Sub + ":" + keySuffix
 	}
 
 	// Verify request signature. The signature must cover the resolved keyID

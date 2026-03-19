@@ -147,7 +147,7 @@ func (g *GroupAuth) ValidateJWT(ctx context.Context, groupID string, tokenBytes 
 	if err != nil {
 		return "", err
 	}
-	return claims.Sub, nil
+	return claims.Iss + ":" + claims.Sub, nil
 }
 
 // ValidateJWTForSession validates a raw JWT bearer token for the given group
@@ -309,7 +309,7 @@ func (g *GroupAuth) ValidateAuthProof(ctx context.Context, groupID string, proof
 		}
 	}
 
-	return proof.Sub, nil
+	return proof.Iss + ":" + proof.Sub, nil
 }
 
 // discoverJWKSURI fetches the OpenID Connect discovery document for issuer and

@@ -49,13 +49,19 @@ func (r *keygenRound1) Receive(msg *Message) error {
 	if msg.Round != 1 || !msg.Broadcast {
 		return fmt.Errorf("round1: unexpected message round=%d broadcast=%v", msg.Round, msg.Broadcast)
 	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if !r.parties.Contains(msg.From) {
+		return fmt.Errorf("round1: unknown sender %s", msg.From)
+	}
+	if _, dup := r.broadcasts[msg.From]; dup {
+		return fmt.Errorf("round1: duplicate message from %s", msg.From)
+	}
 	var payload keygen1Payload
 	if err := cbor.Unmarshal(msg.Data, &payload); err != nil {
 		return fmt.Errorf("round1: unmarshal broadcast: %w", err)
 	}
-	r.mu.Lock()
 	r.broadcasts[msg.From] = &payload
-	r.mu.Unlock()
 	return nil
 }
 
@@ -180,6 +186,15 @@ func (r *keygenRound2) Receive(msg *Message) error {
 	if msg.To != r.self {
 		return fmt.Errorf("round2: message not for us: to=%s self=%s", msg.To, r.self)
 	}
+	if !r.parties.Contains(msg.From) {
+		return fmt.Errorf("round2: unknown sender %s", msg.From)
+	}
+	r.mu.Lock()
+	if _, dup := r.shares[msg.From]; dup {
+		r.mu.Unlock()
+		return fmt.Errorf("round2: duplicate share from %s", msg.From)
+	}
+	r.mu.Unlock()
 
 	var payload keygen2Payload
 	if err := cbor.Unmarshal(msg.Data, &payload); err != nil {

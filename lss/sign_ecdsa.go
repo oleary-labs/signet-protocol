@@ -78,9 +78,16 @@ type ecdsaSignRound1 struct {
 // This is only safe under the semi-honest adversary model. For stronger security
 // guarantees during signing, use Sign (Schnorr) instead.
 func SignECDSA(cfg *Config, signers []PartyID, messageHash []byte) Round {
+	sorted := NewPartyIDSlice(signers)
+	if len(sorted) < cfg.Threshold {
+		return &errRound{err: fmt.Errorf("ecdsa sign: insufficient signers: have %d, need %d", len(sorted), cfg.Threshold)}
+	}
+	if !sorted.Contains(cfg.ID) {
+		return &errRound{err: fmt.Errorf("ecdsa sign: self (%s) not in signer set", cfg.ID)}
+	}
 	return &ecdsaSignRound1{
 		cfg:         cfg,
-		signers:     NewPartyIDSlice(signers),
+		signers:     sorted,
 		messageHash: messageHash,
 		nonces:      make(map[PartyID]*Point),
 	}
@@ -90,6 +97,14 @@ func (r *ecdsaSignRound1) Receive(msg *Message) error {
 	if msg.Round != 1 || !msg.Broadcast {
 		return fmt.Errorf("ecdsa sign round1: unexpected message round=%d broadcast=%v", msg.Round, msg.Broadcast)
 	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if !r.signers.Contains(msg.From) {
+		return fmt.Errorf("ecdsa sign round1: unknown sender %s", msg.From)
+	}
+	if _, dup := r.nonces[msg.From]; dup {
+		return fmt.Errorf("ecdsa sign round1: duplicate message from %s", msg.From)
+	}
 	var payload ecdsaSign1Payload
 	if err := cbor.Unmarshal(msg.Data, &payload); err != nil {
 		return fmt.Errorf("ecdsa sign round1: unmarshal: %w", err)
@@ -98,9 +113,7 @@ func (r *ecdsaSignRound1) Receive(msg *Message) error {
 	if err != nil {
 		return fmt.Errorf("ecdsa sign round1: parse nonce point from %s: %w", msg.From, err)
 	}
-	r.mu.Lock()
 	r.nonces[msg.From] = pt
-	r.mu.Unlock()
 	return nil
 }
 
@@ -174,6 +187,14 @@ func (r *ecdsaSignRound2) Receive(msg *Message) error {
 	if msg.Round != 2 || !msg.Broadcast {
 		return fmt.Errorf("ecdsa sign round2: unexpected message round=%d broadcast=%v", msg.Round, msg.Broadcast)
 	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if !r.signers.Contains(msg.From) {
+		return fmt.Errorf("ecdsa sign round2: unknown sender %s", msg.From)
+	}
+	if _, dup := r.nonceShares[msg.From]; dup {
+		return fmt.Errorf("ecdsa sign round2: duplicate message from %s", msg.From)
+	}
 	var payload ecdsaSign2Payload
 	if err := cbor.Unmarshal(msg.Data, &payload); err != nil {
 		return fmt.Errorf("ecdsa sign round2: unmarshal: %w", err)
@@ -196,9 +217,7 @@ func (r *ecdsaSignRound2) Receive(msg *Message) error {
 		return fmt.Errorf("ecdsa sign round2: nonce verification failed from %s: k*G != K", msg.From)
 	}
 
-	r.mu.Lock()
 	r.nonceShares[msg.From] = nonceShare
-	r.mu.Unlock()
 	return nil
 }
 
@@ -234,6 +253,9 @@ func (r *ecdsaSignRound2) Finalize() ([]*Message, Round, interface{}, error) {
 	for _, ki := range r.nonceShares {
 		k = k.Add(ki)
 	}
+	if k.IsZero() {
+		return nil, nil, nil, fmt.Errorf("ecdsa sign round2: combined nonce k is zero (degenerate nonce)")
+	}
 	kInv := k.Inverse()
 
 	// R = Σ K_i (sum of nonce points from round 1).
@@ -242,6 +264,9 @@ func (r *ecdsaSignRound2) Finalize() ([]*Message, Round, interface{}, error) {
 		R = R.Add(Ki)
 	}
 	rScalar := R.XScalar()
+	if rScalar.IsZero() {
+		return nil, nil, nil, fmt.Errorf("ecdsa sign round2: combined nonce R.x is zero (degenerate nonce)")
+	}
 
 	return outMsgs, &ecdsaSignRound3{
 		cfg:         r.cfg,
@@ -275,6 +300,14 @@ func (r *ecdsaSignRound3) Receive(msg *Message) error {
 	if msg.Round != 3 || !msg.Broadcast {
 		return fmt.Errorf("ecdsa sign round3: unexpected message round=%d broadcast=%v", msg.Round, msg.Broadcast)
 	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if !r.signers.Contains(msg.From) {
+		return fmt.Errorf("ecdsa sign round3: unknown sender %s", msg.From)
+	}
+	if _, dup := r.partials[msg.From]; dup {
+		return fmt.Errorf("ecdsa sign round3: duplicate message from %s", msg.From)
+	}
 	var payload ecdsaSign3Payload
 	if err := cbor.Unmarshal(msg.Data, &payload); err != nil {
 		return fmt.Errorf("ecdsa sign round3: unmarshal: %w", err)
@@ -286,9 +319,7 @@ func (r *ecdsaSignRound3) Receive(msg *Message) error {
 	copy(arr[:], payload.S)
 	partial := ScalarFromBytes(arr)
 
-	r.mu.Lock()
 	r.partials[msg.From] = partial
-	r.mu.Unlock()
 	return nil
 }
 

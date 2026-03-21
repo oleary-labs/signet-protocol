@@ -2,6 +2,7 @@ package lss
 
 import (
 	"crypto/rand"
+	"crypto/sha256"
 	"fmt"
 	"sync"
 
@@ -38,18 +39,33 @@ func (sig *Signature) SigEthereum() ([]byte, error) {
 	return out, nil
 }
 
-// schnorrSign1Payload is the round-1 broadcast payload (nonce point).
-type schnorrSign1Payload struct {
+// errRound is a sentinel round that returns an error immediately.
+type errRound struct{ err error }
+
+func (r *errRound) Receive(msg *Message) error                            { return r.err }
+func (r *errRound) Finalize() ([]*Message, Round, interface{}, error) {
+	return nil, nil, nil, r.err
+}
+
+// schnorrCommitPayload is the round-1 broadcast payload (nonce commitment).
+type schnorrCommitPayload struct {
+	H []byte `cbor:"h"` // 32-byte SHA-256(compressed nonce point)
+}
+
+// schnorrRevealPayload is the round-2 broadcast payload (nonce point reveal).
+type schnorrRevealPayload struct {
 	K []byte `cbor:"k"` // 33-byte compressed nonce point K = k*G
 }
 
-// schnorrSign2Payload is the round-2 broadcast payload (partial signature).
-type schnorrSign2Payload struct {
+// schnorrPartialPayload is the round-3 broadcast payload (partial signature).
+type schnorrPartialPayload struct {
 	S []byte `cbor:"s"` // 32-byte partial signature scalar
 }
 
-// schnorrSignRound1 broadcasts each party's nonce point K_i = k_i*G.
-type schnorrSignRound1 struct {
+// schnorrCommitRound broadcasts each party's nonce commitment H(K_i).
+// This commit-reveal structure prevents adaptive nonce attacks: no party can
+// choose its nonce after seeing others' nonces.
+type schnorrCommitRound struct {
 	cfg         *Config
 	signers     PartyIDSlice
 	messageHash []byte
@@ -57,48 +73,68 @@ type schnorrSignRound1 struct {
 	mu            sync.Mutex
 	nonce         *Scalar            // our k_i (never revealed)
 	noncePoint    *Point             // our K_i = k_i*G
-	nonces        map[PartyID]*Point // received nonce points
+	commitments   map[PartyID][32]byte // H(K_i) from each party
 	broadcastSent bool
 }
 
 // Sign returns the starting Round for threshold Schnorr signing.
 //
-// This is the primary signing implementation. Each party's nonce scalar k_i is
-// never revealed — only the nonce point K_i = k_i*G is broadcast. This preserves
-// threshold security during signing: a single compromised signer cannot extract
-// the group private key.
+// This is the primary signing implementation. The protocol uses a commit-reveal
+// structure to prevent adaptive nonce attacks:
+//   Round 1: Broadcast H(K_i) — nonce commitment
+//   Round 2: Broadcast K_i    — nonce reveal (verified against commitment)
+//   Round 3: Broadcast s_i    — partial signature
+//   Round 4: Local combine + verify
+//
+// Each party's nonce scalar k_i is never revealed — only the nonce point K_i = k_i*G
+// is broadcast. This preserves threshold security during signing: a single compromised
+// signer cannot extract the group private key.
 //
 // Partial signature: s_i = k_i + r · λ_i · a_i · m
 // Combined:          s   = Σ s_i = k + r · m · a
 // Verification:      s·G == R + r·m·X  (Schnorr-style)
 func Sign(cfg *Config, signers []PartyID, messageHash []byte) Round {
-	return &schnorrSignRound1{
+	sorted := NewPartyIDSlice(signers)
+	if len(sorted) < cfg.Threshold {
+		return &errRound{err: fmt.Errorf("sign: insufficient signers: have %d, need %d", len(sorted), cfg.Threshold)}
+	}
+	if !sorted.Contains(cfg.ID) {
+		return &errRound{err: fmt.Errorf("sign: self (%s) not in signer set", cfg.ID)}
+	}
+	return &schnorrCommitRound{
 		cfg:         cfg,
-		signers:     NewPartyIDSlice(signers),
+		signers:     sorted,
 		messageHash: messageHash,
-		nonces:      make(map[PartyID]*Point),
+		commitments: make(map[PartyID][32]byte),
 	}
 }
 
-func (r *schnorrSignRound1) Receive(msg *Message) error {
+func (r *schnorrCommitRound) Receive(msg *Message) error {
 	if msg.Round != 1 || !msg.Broadcast {
 		return fmt.Errorf("sign round1: unexpected message round=%d broadcast=%v", msg.Round, msg.Broadcast)
 	}
-	var payload schnorrSign1Payload
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if !r.signers.Contains(msg.From) {
+		return fmt.Errorf("sign round1: unknown sender %s", msg.From)
+	}
+	if _, dup := r.commitments[msg.From]; dup {
+		return fmt.Errorf("sign round1: duplicate message from %s", msg.From)
+	}
+	var payload schnorrCommitPayload
 	if err := cbor.Unmarshal(msg.Data, &payload); err != nil {
 		return fmt.Errorf("sign round1: unmarshal: %w", err)
 	}
-	pt, err := PointFromSlice(payload.K)
-	if err != nil {
-		return fmt.Errorf("sign round1: parse nonce point from %s: %w", msg.From, err)
+	if len(payload.H) != 32 {
+		return fmt.Errorf("sign round1: invalid commitment length %d", len(payload.H))
 	}
-	r.mu.Lock()
-	r.nonces[msg.From] = pt
-	r.mu.Unlock()
+	var h [32]byte
+	copy(h[:], payload.H)
+	r.commitments[msg.From] = h
 	return nil
 }
 
-func (r *schnorrSignRound1) Finalize() ([]*Message, Round, interface{}, error) {
+func (r *schnorrCommitRound) Finalize() ([]*Message, Round, interface{}, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -116,13 +152,16 @@ func (r *schnorrSignRound1) Finalize() ([]*Message, Round, interface{}, error) {
 			r.nonce = ScalarFromBytes(kb)
 		}
 		r.noncePoint = NewPoint().ScalarBaseMult(r.nonce)
-		r.nonces[r.cfg.ID] = r.noncePoint
+
+		// Store our own commitment.
+		Kb := r.noncePoint.Bytes()
+		r.commitments[r.cfg.ID] = sha256.Sum256(Kb[:])
 	}
 
 	var outMsgs []*Message
 	if !r.broadcastSent {
-		Kb := r.noncePoint.Bytes()
-		data, err := cbor.Marshal(&schnorrSign1Payload{K: Kb[:]})
+		h := r.commitments[r.cfg.ID]
+		data, err := cbor.Marshal(&schnorrCommitPayload{H: h[:]})
 		if err != nil {
 			return nil, nil, nil, fmt.Errorf("sign round1: marshal: %w", err)
 		}
@@ -136,92 +175,80 @@ func (r *schnorrSignRound1) Finalize() ([]*Message, Round, interface{}, error) {
 		r.broadcastSent = true
 	}
 
-	// Wait for all N nonce points.
-	if len(r.nonces) < len(r.signers) {
+	// Wait for all N commitments.
+	if len(r.commitments) < len(r.signers) {
 		return outMsgs, nil, nil, nil
 	}
 
-	return outMsgs, &schnorrSignRound2{
+	return outMsgs, &schnorrRevealRound{
 		cfg:         r.cfg,
 		signers:     r.signers,
 		messageHash: r.messageHash,
 		nonce:       r.nonce,
-		nonces:      r.nonces,
-		partials:    make(map[PartyID]*Scalar),
+		noncePoint:  r.noncePoint,
+		commitments: r.commitments,
+		nonces:      make(map[PartyID]*Point),
 	}, nil, nil
 }
 
-// schnorrSignRound2 computes and broadcasts partial Schnorr signatures.
-type schnorrSignRound2 struct {
+// schnorrRevealRound reveals nonce points and verifies against round-1 commitments.
+type schnorrRevealRound struct {
 	cfg         *Config
 	signers     PartyIDSlice
 	messageHash []byte
 	nonce       *Scalar
-	nonces      map[PartyID]*Point
+	noncePoint  *Point
+	commitments map[PartyID][32]byte // H(K_i) from round 1
 
 	mu            sync.Mutex
-	partials      map[PartyID]*Scalar
+	nonces        map[PartyID]*Point
 	broadcastSent bool
-	R             *Point  // combined nonce point
-	r             *Scalar // x-coordinate of R
 }
 
-func (r *schnorrSignRound2) Receive(msg *Message) error {
+func (r *schnorrRevealRound) Receive(msg *Message) error {
 	if msg.Round != 2 || !msg.Broadcast {
 		return fmt.Errorf("sign round2: unexpected message round=%d broadcast=%v", msg.Round, msg.Broadcast)
 	}
-	var payload schnorrSign2Payload
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if !r.signers.Contains(msg.From) {
+		return fmt.Errorf("sign round2: unknown sender %s", msg.From)
+	}
+	if _, dup := r.nonces[msg.From]; dup {
+		return fmt.Errorf("sign round2: duplicate message from %s", msg.From)
+	}
+	var payload schnorrRevealPayload
 	if err := cbor.Unmarshal(msg.Data, &payload); err != nil {
 		return fmt.Errorf("sign round2: unmarshal: %w", err)
 	}
-	if len(payload.S) != 32 {
-		return fmt.Errorf("sign round2: invalid partial sig length %d", len(payload.S))
+	pt, err := PointFromSlice(payload.K)
+	if err != nil {
+		return fmt.Errorf("sign round2: parse nonce point from %s: %w", msg.From, err)
 	}
-	var arr [32]byte
-	copy(arr[:], payload.S)
-	partial := ScalarFromBytes(arr)
 
-	r.mu.Lock()
-	r.partials[msg.From] = partial
-	r.mu.Unlock()
+	// Verify nonce against round-1 commitment: SHA256(K_j) == H_j.
+	commitment, ok := r.commitments[msg.From]
+	if !ok {
+		return fmt.Errorf("sign round2: no round1 commitment from %s", msg.From)
+	}
+	ptBytes := pt.Bytes()
+	h := sha256.Sum256(ptBytes[:])
+	if h != commitment {
+		return fmt.Errorf("sign round2: nonce commitment verification failed from %s", msg.From)
+	}
+
+	r.nonces[msg.From] = pt
 	return nil
 }
 
-func (r *schnorrSignRound2) Finalize() ([]*Message, Round, interface{}, error) {
+func (r *schnorrRevealRound) Finalize() ([]*Message, Round, interface{}, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	// Compute R and r on first call.
-	if r.R == nil {
-		R := NewPoint()
-		for _, K := range r.nonces {
-			R = R.Add(K)
-		}
-		r.R = R
-		r.r = R.XScalar()
-	}
-
-	// Compute and broadcast our partial signature once.
 	var outMsgs []*Message
 	if !r.broadcastSent {
-		// m = message hash as scalar (direct reduction mod N).
-		m := &Scalar{}
-		m.s.SetByteSlice(r.messageHash)
-
-		lambda, err := LagrangeCoefficient([]PartyID(r.signers), r.cfg.ID)
-		if err != nil {
-			return nil, nil, nil, fmt.Errorf("sign round2: lagrange: %w", err)
-		}
-
-		// s_i = k_i + r · λ_i · a_i · m
-		partialSig := r.nonce.Add(
-			r.r.Mul(lambda).Mul(r.cfg.Share).Mul(m),
-		)
-
-		r.partials[r.cfg.ID] = partialSig
-
-		sBytes := partialSig.Bytes()
-		data, err := cbor.Marshal(&schnorrSign2Payload{S: sBytes[:]})
+		Kb := r.noncePoint.Bytes()
+		data, err := cbor.Marshal(&schnorrRevealPayload{K: Kb[:]})
 		if err != nil {
 			return nil, nil, nil, fmt.Errorf("sign round2: marshal: %w", err)
 		}
@@ -233,6 +260,111 @@ func (r *schnorrSignRound2) Finalize() ([]*Message, Round, interface{}, error) {
 			Data:      data,
 		})
 		r.broadcastSent = true
+		r.nonces[r.cfg.ID] = r.noncePoint
+	}
+
+	// Wait for all N nonce reveals.
+	if len(r.nonces) < len(r.signers) {
+		return outMsgs, nil, nil, nil
+	}
+
+	// Compute combined nonce point R.
+	R := NewPoint()
+	for _, K := range r.nonces {
+		R = R.Add(K)
+	}
+	rScalar := R.XScalar()
+	if rScalar.IsZero() {
+		return nil, nil, nil, fmt.Errorf("sign round2: combined nonce R.x is zero (degenerate nonce)")
+	}
+
+	return outMsgs, &schnorrPartialRound{
+		cfg:         r.cfg,
+		signers:     r.signers,
+		messageHash: r.messageHash,
+		nonce:       r.nonce,
+		R:           R,
+		r:           rScalar,
+		partials:    make(map[PartyID]*Scalar),
+	}, nil, nil
+}
+
+// schnorrPartialRound computes and broadcasts partial Schnorr signatures.
+type schnorrPartialRound struct {
+	cfg         *Config
+	signers     PartyIDSlice
+	messageHash []byte
+	nonce       *Scalar
+	R           *Point
+	r           *Scalar
+
+	mu            sync.Mutex
+	partials      map[PartyID]*Scalar
+	broadcastSent bool
+}
+
+func (r *schnorrPartialRound) Receive(msg *Message) error {
+	if msg.Round != 3 || !msg.Broadcast {
+		return fmt.Errorf("sign round3: unexpected message round=%d broadcast=%v", msg.Round, msg.Broadcast)
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if !r.signers.Contains(msg.From) {
+		return fmt.Errorf("sign round3: unknown sender %s", msg.From)
+	}
+	if _, dup := r.partials[msg.From]; dup {
+		return fmt.Errorf("sign round3: duplicate message from %s", msg.From)
+	}
+	var payload schnorrPartialPayload
+	if err := cbor.Unmarshal(msg.Data, &payload); err != nil {
+		return fmt.Errorf("sign round3: unmarshal: %w", err)
+	}
+	if len(payload.S) != 32 {
+		return fmt.Errorf("sign round3: invalid partial sig length %d", len(payload.S))
+	}
+	var arr [32]byte
+	copy(arr[:], payload.S)
+	partial := ScalarFromBytes(arr)
+
+	r.partials[msg.From] = partial
+	return nil
+}
+
+func (r *schnorrPartialRound) Finalize() ([]*Message, Round, interface{}, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	var outMsgs []*Message
+	if !r.broadcastSent {
+		// m = message hash as scalar (direct reduction mod N).
+		m := &Scalar{}
+		m.s.SetByteSlice(r.messageHash)
+
+		lambda, err := LagrangeCoefficient([]PartyID(r.signers), r.cfg.ID)
+		if err != nil {
+			return nil, nil, nil, fmt.Errorf("sign round3: lagrange: %w", err)
+		}
+
+		// s_i = k_i + r · λ_i · a_i · m
+		partialSig := r.nonce.Add(
+			r.r.Mul(lambda).Mul(r.cfg.Share).Mul(m),
+		)
+
+		r.partials[r.cfg.ID] = partialSig
+
+		sBytes := partialSig.Bytes()
+		data, err := cbor.Marshal(&schnorrPartialPayload{S: sBytes[:]})
+		if err != nil {
+			return nil, nil, nil, fmt.Errorf("sign round3: marshal: %w", err)
+		}
+		outMsgs = append(outMsgs, &Message{
+			From:      r.cfg.ID,
+			To:        "",
+			Round:     3,
+			Broadcast: true,
+			Data:      data,
+		})
+		r.broadcastSent = true
 	}
 
 	// Wait for all N partial signatures.
@@ -240,7 +372,7 @@ func (r *schnorrSignRound2) Finalize() ([]*Message, Round, interface{}, error) {
 		return outMsgs, nil, nil, nil
 	}
 
-	return outMsgs, &schnorrSignRound3{
+	return outMsgs, &schnorrCombineRound{
 		cfg:         r.cfg,
 		signers:     r.signers,
 		messageHash: r.messageHash,
@@ -250,8 +382,8 @@ func (r *schnorrSignRound2) Finalize() ([]*Message, Round, interface{}, error) {
 	}, nil, nil
 }
 
-// schnorrSignRound3 combines partial signatures and verifies (local, no messages).
-type schnorrSignRound3 struct {
+// schnorrCombineRound combines partial signatures and verifies (local, no messages).
+type schnorrCombineRound struct {
 	cfg         *Config
 	signers     PartyIDSlice
 	messageHash []byte
@@ -260,11 +392,11 @@ type schnorrSignRound3 struct {
 	partials    map[PartyID]*Scalar
 }
 
-func (r *schnorrSignRound3) Receive(msg *Message) error {
-	return fmt.Errorf("sign round3: no messages expected")
+func (r *schnorrCombineRound) Receive(msg *Message) error {
+	return fmt.Errorf("sign round4: no messages expected")
 }
 
-func (r *schnorrSignRound3) Finalize() ([]*Message, Round, interface{}, error) {
+func (r *schnorrCombineRound) Finalize() ([]*Message, Round, interface{}, error) {
 	// s = Σ s_i
 	s := NewScalar()
 	s.s.SetInt(0)
@@ -275,7 +407,7 @@ func (r *schnorrSignRound3) Finalize() ([]*Message, Round, interface{}, error) {
 	// Verify: s*G == R + r*m*X
 	pubKey, err := r.cfg.PublicKey()
 	if err != nil {
-		return nil, nil, nil, fmt.Errorf("sign round3: public key: %w", err)
+		return nil, nil, nil, fmt.Errorf("sign round4: public key: %w", err)
 	}
 
 	m := &Scalar{}
@@ -288,7 +420,7 @@ func (r *schnorrSignRound3) Finalize() ([]*Message, Round, interface{}, error) {
 	rhs := r.R.Add(rmX)
 
 	if !lhs.Equal(rhs) {
-		return nil, nil, nil, fmt.Errorf("sign round3: Schnorr signature verification failed: s*G != R + r*m*X")
+		return nil, nil, nil, fmt.Errorf("sign round4: Schnorr signature verification failed: s*G != R + r*m*X")
 	}
 
 	Rb := r.R.Bytes()

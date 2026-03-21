@@ -81,13 +81,19 @@ func (r *reshareRound1) Receive(msg *Message) error {
 	if msg.Round != 1 || !msg.Broadcast {
 		return fmt.Errorf("reshare round1: unexpected message round=%d broadcast=%v", msg.Round, msg.Broadcast)
 	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if !r.allParties.Contains(msg.From) {
+		return fmt.Errorf("reshare round1: unknown sender %s", msg.From)
+	}
+	if _, dup := r.broadcasts[msg.From]; dup {
+		return fmt.Errorf("reshare round1: duplicate message from %s", msg.From)
+	}
 	var payload reshare1Payload
 	if err := cbor.Unmarshal(msg.Data, &payload); err != nil {
 		return fmt.Errorf("reshare round1: unmarshal: %w", err)
 	}
-	r.mu.Lock()
 	r.broadcasts[msg.From] = &payload
-	r.mu.Unlock()
 	return nil
 }
 
@@ -237,9 +243,18 @@ func (r *reshareRound2) Receive(msg *Message) error {
 	if msg.To != r.self {
 		return fmt.Errorf("reshare round2: message not for us")
 	}
+	if !r.oldParties.Contains(msg.From) {
+		return fmt.Errorf("reshare round2: unknown sender %s (not in old party set)", msg.From)
+	}
 	if !r.inNew {
 		return fmt.Errorf("reshare round2: we are not in the new group")
 	}
+	r.mu.Lock()
+	if _, dup := r.shares[msg.From]; dup {
+		r.mu.Unlock()
+		return fmt.Errorf("reshare round2: duplicate share from %s", msg.From)
+	}
+	r.mu.Unlock()
 
 	var payload reshare2Payload
 	if err := cbor.Unmarshal(msg.Data, &payload); err != nil {

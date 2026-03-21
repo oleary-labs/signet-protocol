@@ -52,7 +52,7 @@ Round 5's 1013ms spread between fastest and slowest node points to unequal Paill
 
 ## The 15ms Claim
 
-The `threshold-local/README.md` benchmarks state:
+The luxfi/threshold library benchmarks (historical reference) state:
 
 ```
 Key generation (5-of-9): ~28 ms

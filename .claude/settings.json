@@ -1,7 +1,7 @@
 {
   "project": {
     "name": "onekey-research",
-    "description": "Research project for OneKey threshold signing using luxfi/threshold with libp2p P2P networking",
+    "description": "Research project for threshold signing using custom LSS MPC protocol (signet/lss) with libp2p P2P networking",
     "language": "Go",
     "test_command": "go test ./..."
   }

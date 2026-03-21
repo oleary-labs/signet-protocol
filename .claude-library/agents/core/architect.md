@@ -15,7 +15,7 @@ Design simple, working solutions for threshold MPC protocols and libp2p P2P netw
 - Add layers not required by the current task
 
 ## Domain Knowledge
-- **Threshold signing**: Uses `luxfi/threshold` CMP protocol; parties identified by `party.ID`
+- **Threshold signing**: Custom LSS protocol in `signet/lss`; parties identified by `lss.PartyID`; `lss.Run()` drives round loop
 - **libp2p networking**: Hosts communicate via streams; use pubsub for broadcast, direct streams for point-to-point
 - **Session management**: `network/session.go` manages party sessions; `network/loop.go` handles message routing
 - **Discovery**: `network/discovery.go` uses Kademlia DHT for peer discovery

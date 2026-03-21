@@ -1,6 +1,6 @@
 # signet
 
-Research implementation of a threshold signing network using the [luxfi/threshold](https://github.com/luxfi/threshold) CMP protocol over libp2p.
+Research implementation of a threshold signing network using a custom LSS (Linear Secret Sharing) MPC protocol over libp2p.
 
 Nodes hold persistent secp256k1 identities, connect to each other over a libp2p mesh, and expose an HTTP API for distributed key generation and threshold signing. Signatures are produced in Ethereum-compatible format (65-byte R+S+V).
 
@@ -168,7 +168,7 @@ Lists all keygen configs held in memory (public metadata only).
 
 ### `POST /v1/keygen`
 
-Runs a distributed key generation session (CMP protocol, 5 rounds).
+Runs a distributed key generation session (LSS protocol, 3 rounds).
 
 Send to **any one node** in the `parties` list. It will coordinate with the others.
 
@@ -198,7 +198,7 @@ Response (once the protocol completes):
 
 ### `POST /v1/sign`
 
-Runs a threshold signing session (CMP protocol, 5 rounds).
+Runs a threshold signing session (LSS protocol, 3 rounds).
 
 Send to **any one node** in the `signers` list. It will coordinate with the others.
 
@@ -316,7 +316,7 @@ go test -v -run TestLibp2pKeygen -timeout 3m ./...
 
 ### Identity
 
-Each node's libp2p peer ID is derived from a persistent secp256k1 private key (`key_file`). This same key is used as the node's `party.ID` in the CMP protocol — threshold key shares are permanently bound to the node's network identity.
+Each node's libp2p peer ID is derived from a persistent secp256k1 private key (`key_file`). This same key is used as the node's `lss.PartyID` in the LSS protocol — threshold key shares are permanently bound to the node's network identity.
 
 ### Session coordination
 
@@ -329,18 +329,18 @@ When a node receives a keygen or sign request it acts as the **initiator**:
 
 ### Message transport
 
-The CMP protocol sends two kinds of messages per round:
+The LSS protocol sends two kinds of messages per round:
 
 | Type | Transport | How |
 |---|---|---|
-| Directed (unicast) | libp2p stream | `/threshold/1.0.0` protocol, CBOR payload |
-| Broadcast | GossipSub | `/threshold/session/<id>` topic, CBOR payload |
+| Directed (unicast) | libp2p stream | `/signet/session/1.0.0` protocol, CBOR payload |
+| Broadcast | GossipSub | `/signet/session/<id>` topic, CBOR payload |
 
-A `SessionNetwork` joins the per-session GossipSub topic and fans both message types into a single channel consumed by the protocol `Handler`. The `HandlerLoop` drives the state machine: it forwards outgoing messages to the network and feeds incoming messages back to the handler until the output channel closes.
+A `SessionNetwork` joins the per-session GossipSub topic and fans both message types into a single `Incoming()` channel. `lss.Run()` drives the round state machine: it calls `Finalize()`, sends outgoing messages, and advances rounds as messages arrive.
 
 ### Protocol
 
-CMP (Canetti–Makriyannis–Peled) is a 5-round threshold ECDSA protocol. Keygen and signing each run 5 rounds before producing a result. After keygen every party holds a distinct secret share; during signing, `threshold + 1` parties collaborate to reconstruct the signature without any party ever holding the full private key.
+LSS (Linear Secret Sharing) is a 3-round semi-honest threshold ECDSA protocol. Keygen runs 3 rounds; signing runs 3 rounds. After keygen every party holds a distinct secret share; during signing, `threshold + 1` parties collaborate to reconstruct the signature without any party ever holding the full private key.
 
 ### Key storage
 

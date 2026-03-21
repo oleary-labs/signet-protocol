@@ -4,10 +4,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Signet: threshold signing research using `luxfi/threshold` library (LSS protocol). The project includes smart contracts, a Go node with libp2p networking, an HTTP API, blockchain integration, and a ZK-based authentication layer.
+Signet: threshold signing research implementing the LSS (Linear Secret Sharing) MPC protocol from scratch. The project includes smart contracts, a Go node with libp2p networking, an HTTP API, blockchain integration, and a ZK-based authentication layer.
 
 - Main module: `signet` (Go)
-- Local threshold library fork: `threshold-local/` (module `github.com/luxfi/threshold`)
+- LSS implementation: `signet/lss` (keygen, sign, reshare — no external threshold library)
 - Smart contracts: `contracts/` (Foundry, Solidity 0.8.24)
 - ZK circuit: `circuits/jwt_auth/` (Noir + Barretenberg)
 
@@ -100,7 +100,7 @@ When finishing a task, always provide a brief summary of:
 ## Architecture & Key Dependencies
 
 ### Go Dependencies
-- `github.com/luxfi/threshold` — threshold crypto (LSS keygen/sign, curve math, party IDs, pool)
+- `signet/lss` (internal) — LSS keygen/sign/reshare, secp256k1 math via `github.com/decred/dcrd/dcrec/secp256k1/v4`
 - `github.com/ethereum/go-ethereum v1.17.1` — chain client, ABI, crypto
 - `github.com/lestrrat-go/jwx/v2` — JWT parsing/verification, JWKS caching (jwk, jwt, jwa)
 - `github.com/fxamacker/cbor/v2` — CBOR encoding for coord messages
@@ -113,12 +113,12 @@ When finishing a task, always provide a brief summary of:
 
 ---
 
-## LSS Protocol Design
+## LSS Protocol Design (`signet/lss`)
 
-### Handler Framework Contract
-- `initializeRound` guard: `r.MessageContent() != nil && !h.hasAllMessages(r)`
-- BroadcastRound-only rounds (MessageContent() == nil) bypass this → finalize immediately after 20ms
-- "Return self" from Finalize → `finalizeRound` schedules `tryAdvanceRound` after 10ms
+### Session Runner
+- `lss.Run(ctx, startRound, network)` drives the round loop: call `Finalize()`, send outgoing messages, receive until all arrive, advance to next round
+- `Round` interface: `Receive(*Message) error` + `Finalize() (msgs []*Message, next Round, result interface{}, err error)`
+- Returning `self` from Finalize = stay in round (not all messages arrived yet); returning `nil` next = done
 
 ### Round Pattern: "Send once, return self until all arrive"
 Used in sign/round1, sign/round2, keygen/round1:
@@ -127,16 +127,21 @@ Used in sign/round1, sign/round2, keygen/round1:
 3. Return self if count < N (use sync.Map for thread-safe counting)
 4. Return next round with fully-populated map when all N arrive
 
-### CBOR Serialization: curve.Point/Scalar must be []byte
-`curve.Point` and `curve.Scalar` are interfaces — CBOR cannot unmarshal into them directly.
-Always encode as `[]byte`, then unmarshal in StoreBroadcastMessage.
+### CBOR Serialization: Message uses msgWire alias
+`*Message` implements `encoding.BinaryMarshaler` — calling `cbor.Marshal(m)` directly causes infinite recursion.
+Always cast to `(*msgWire)(m)` in MarshalBinary/UnmarshalBinary.
 
 ### Threshold Signing Math
 LSS uses additive secret sharing (NOT standard ECDSA):
 - Partial sig: `s_i = k_i + r · λ_i · x_i · m`
-- Combined: `s = k + r · x · m`
+- Combined: `s = Σs_i`
 - Verification (Schnorr-style): `s·G = R + r·m·X`
-- Done INLINE in `sign/round3.go:verifyThreshold()` — NOT via `ecdsa.Signature.Verify`
+- Done INLINE in `lss/sign.go` round3 — NOT via standard ecdsa.Verify
+
+### secp256k1/v4 API
+- `secp256k1.ModNScalar` for scalar arithmetic (SetByteSlice, Add, Mul, etc.)
+- `secp256k1.JacobianPoint` for point operations (ScalarBaseMultNonConst, ScalarMultNonConst, AddNonConst)
+- Point → bytes: `secp256k1.NewPublicKey` from Jacobian coords + `SerializeCompressed()`
 
 ---
 
@@ -228,6 +233,3 @@ Total: 568 elements × 32 bytes = 18,176 bytes
 
 ---
 
-## Pre-existing Library Failures (NOT our bugs)
-- `protocols/lss/TestLSSDynamicReshareStress/CompletePartyReplacement` — panic: nil secp256k1Point
-- `protocols/unified/adapters` — build fail: `GeneratePreprocessing` undefined

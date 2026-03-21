@@ -1,0 +1,235 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Google PKCE Demo</title>
+  <style>
+    body { font-family: monospace; max-width: 860px; margin: 40px auto; padding: 0 20px; background: #0d1117; color: #e6edf3; }
+    h1 { color: #58a6ff; }
+    label { display: block; margin-top: 12px; color: #8b949e; font-size: 13px; }
+    input { width: 100%; box-sizing: border-box; padding: 8px; margin-top: 4px; background: #161b22; border: 1px solid #30363d; color: #e6edf3; border-radius: 6px; font-family: monospace; }
+    button { margin-top: 16px; padding: 10px 20px; background: #238636; color: #fff; border: none; border-radius: 6px; cursor: pointer; font-size: 14px; }
+    button:hover { background: #2ea043; }
+    .section { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 20px; margin-top: 24px; }
+    .section h2 { margin-top: 0; color: #58a6ff; font-size: 15px; }
+    pre { background: #0d1117; padding: 12px; border-radius: 6px; overflow-x: auto; white-space: pre-wrap; word-break: break-all; font-size: 13px; color: #e6edf3; margin: 0; }
+    .label { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: bold; margin-bottom: 8px; }
+    .header-label { background: #1f3a5f; color: #79c0ff; }
+    .payload-label { background: #1f3a1f; color: #56d364; }
+    .sig-label { background: #3a1f1f; color: #ff7b72; }
+    .field { margin: 6px 0; }
+    .key { color: #79c0ff; }
+    .val { color: #a5d6ff; }
+    .val.time { color: #d2a8ff; }
+    .error { color: #ff7b72; background: #3a1f1f; border: 1px solid #6e1c1c; border-radius: 6px; padding: 12px; margin-top: 16px; }
+    .note { color: #8b949e; font-size: 12px; margin-top: 8px; }
+    code { background: #0d1117; padding: 1px 5px; border-radius: 3px; }
+  </style>
+</head>
+<body>
+
+<h1>Google PKCE Demo</h1>
+<p style="color:#8b949e">Authenticates with Google using PKCE (Authorization Code + code_challenge). Shows the resulting JWT tokens.</p>
+
+<div class="section">
+  <h2>Configuration</h2>
+  <p class="note">
+    Go to <strong>console.cloud.google.com</strong> &rarr; APIs &amp; Services &rarr; Credentials &rarr; your OAuth 2.0 Client ID (Web application).<br>
+    Add <code>http://localhost:3000</code> as an <strong>Authorized Redirect URI</strong>.
+  </p>
+
+  <label>Google Client ID</label>
+  <input id="client-id" type="text" placeholder="123456789-abc.apps.googleusercontent.com" />
+
+  <label>Client Secret <span style="color:#8b949e">(required by Google for "Web application" client type)</span></label>
+  <input id="client-secret" type="password" placeholder="GOCSPX-..." />
+
+  <button onclick="startLogin()">Sign in with Google</button>
+</div>
+
+<div id="result" style="display:none">
+  <div id="output"></div>
+</div>
+
+<script>
+  const REDIRECT_URI = 'http://localhost:3000';
+
+  // --- PKCE helpers ---
+
+  function base64urlEncode(buf) {
+    return btoa(String.fromCharCode(...new Uint8Array(buf)))
+      .replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '');
+  }
+
+  function generateVerifier() {
+    const buf = new Uint8Array(32);
+    crypto.getRandomValues(buf);
+    return base64urlEncode(buf);
+  }
+
+  async function generateChallenge(verifier) {
+    const data = new TextEncoder().encode(verifier);
+    const digest = await crypto.subtle.digest('SHA-256', data);
+    return base64urlEncode(digest);
+  }
+
+  // --- Login ---
+
+  async function startLogin() {
+    const clientId = document.getElementById('client-id').value.trim();
+    if (!clientId) { alert('Enter your Google Client ID first.'); return; }
+
+    const verifier = generateVerifier();
+    const challenge = await generateChallenge(verifier);
+    const state = base64urlEncode(crypto.getRandomValues(new Uint8Array(16)));
+
+    sessionStorage.setItem('pkce_verifier', verifier);
+    sessionStorage.setItem('pkce_state', state);
+    sessionStorage.setItem('client_id', clientId);
+    sessionStorage.setItem('client_secret', document.getElementById('client-secret').value.trim());
+
+    const params = new URLSearchParams({
+      client_id:             clientId,
+      redirect_uri:          REDIRECT_URI,
+      response_type:         'code',
+      scope:                 'openid profile email',
+      code_challenge:        challenge,
+      code_challenge_method: 'S256',
+      state,
+    });
+
+    location.href = `https://accounts.google.com/o/oauth2/v2/auth?${params}`;
+  }
+
+  // --- Callback handling ---
+
+  async function handleCallback() {
+    const params = new URLSearchParams(location.search);
+    const code  = params.get('code');
+    const state = params.get('state');
+    const error = params.get('error');
+
+    if (error) {
+      showError(`Google returned error: <strong>${error}</strong> — ${params.get('error_description') ?? ''}`);
+      return;
+    }
+    if (!code) return;
+
+    if (state !== sessionStorage.getItem('pkce_state')) {
+      showError('State mismatch — possible CSRF attack. Aborting.');
+      return;
+    }
+
+    const verifier     = sessionStorage.getItem('pkce_verifier');
+    const clientId     = sessionStorage.getItem('client_id');
+    const clientSecret = sessionStorage.getItem('client_secret');
+
+    // Clean the code from the URL
+    history.replaceState({}, '', '/');
+
+    const body = new URLSearchParams({
+      client_id:     clientId,
+      code,
+      code_verifier: verifier,
+      grant_type:    'authorization_code',
+      redirect_uri:  REDIRECT_URI,
+    });
+    if (clientSecret) body.set('client_secret', clientSecret);
+
+    let tokens;
+    try {
+      const res = await fetch('https://oauth2.googleapis.com/token', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body,
+      });
+      tokens = await res.json();
+    } catch (e) {
+      showError(`Network error during token exchange: ${e.message}`);
+      return;
+    }
+
+    if (tokens.error) {
+      showError(`Token exchange failed: <strong>${tokens.error}</strong> — ${tokens.error_description ?? ''}`);
+      return;
+    }
+
+    renderTokens(tokens);
+  }
+
+  // --- Display ---
+
+  function decodeJwt(jwt) {
+    const [rawHeader, rawPayload] = jwt.split('.');
+    const decode = s => JSON.parse(atob(s.replace(/-/g, '+').replace(/_/g, '/')));
+    return { header: decode(rawHeader), payload: decode(rawPayload) };
+  }
+
+  function formatTime(ts) {
+    return `${ts} &nbsp;<span style="color:#8b949e">(${new Date(ts * 1000).toUTCString()})</span>`;
+  }
+
+  function renderFields(obj) {
+    return Object.entries(obj).map(([k, v]) => {
+      const isTime = ['iat', 'exp', 'auth_time', 'nbf'].includes(k);
+      const display = isTime ? formatTime(v) : JSON.stringify(v);
+      return `<div class="field"><span class="key">"${k}"</span>: <span class="val${isTime ? ' time' : ''}">${display}</span></div>`;
+    }).join('');
+  }
+
+  function renderJwt(title, jwt) {
+    let decoded;
+    try { decoded = decodeJwt(jwt); } catch { return `<pre>${jwt}</pre>`; }
+
+    return `
+      <p style="margin-top:0"><strong>${title}</strong></p>
+      <span class="label header-label">HEADER</span>
+      <pre>${renderFields(decoded.header)}</pre>
+      <span class="label payload-label">PAYLOAD</span>
+      <pre>${renderFields(decoded.payload)}</pre>
+      <span class="label sig-label">SIGNATURE</span>
+      <pre>${jwt.split('.')[2]}</pre>
+      <details style="margin-top:8px">
+        <summary style="cursor:pointer;color:#8b949e;font-size:12px">Raw JWT</summary>
+        <pre style="margin-top:6px">${jwt}</pre>
+      </details>`;
+  }
+
+  function renderTokens(tokens) {
+    document.getElementById('result').style.display = 'block';
+    let html = '';
+
+    if (tokens.id_token) {
+      html += `<div class="section" style="border-color:#238636">`;
+      html += renderJwt('ID Token (JWT) — identity claims about the user', tokens.id_token);
+      html += `</div>`;
+    }
+
+    if (tokens.access_token) {
+      html += `<div class="section">`;
+      html += `<p style="margin-top:0"><strong>Access Token</strong> <span style="color:#8b949e;font-size:12px">(opaque — used to call Google APIs on the user's behalf)</span></p>`;
+      html += `<pre>${tokens.access_token}</pre>`;
+      html += `</div>`;
+    }
+
+    if (tokens.refresh_token) {
+      html += `<div class="section">`;
+      html += `<p style="margin-top:0"><strong>Refresh Token</strong></p>`;
+      html += `<pre>${tokens.refresh_token}</pre>`;
+      html += `</div>`;
+    }
+
+    html += `<div class="section"><h2>Full Response</h2><pre>${JSON.stringify(tokens, null, 2)}</pre></div>`;
+    document.getElementById('output').innerHTML = html;
+  }
+
+  function showError(msg) {
+    document.getElementById('result').style.display = 'block';
+    document.getElementById('output').innerHTML = `<div class="error">${msg}</div>`;
+  }
+
+  handleCallback();
+</script>
+
+</body>
+</html>

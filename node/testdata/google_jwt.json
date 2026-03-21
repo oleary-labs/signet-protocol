@@ -1,0 +1,20 @@
+{
+  "description": "Real Google OIDC token for paul@oleary.com, for use in auth tests and validation",
+  "raw": "eyJhbGciOiJSUzI1NiIsImtpZCI6ImM0MWYxNDFhYTE5ZGYwYWM5N2RhYTU1ZTYwMDc2NmM0YzUzNjRjNDIiLCJ0eXAiOiJKV1QifQ.eyJpc3MiOiJodHRwczovL2FjY291bnRzLmdvb2dsZS5jb20iLCJhenAiOiI4MzgyMzczMDUxNDAtYmFoaGtuajVzajhiaXI0c2g4YWVuazRvczZldWExMWouYXBwcy5nb29nbGV1c2VyY29udGVudC5jb20iLCJhdWQiOiI4MzgyMzczMDUxNDAtYmFoaGtuajVzajhiaXI0c2g4YWVuazRvczZldWExMWouYXBwcy5nb29nbGV1c2VyY29udGVudC5jb20iLCJzdWIiOiIxMTQ4MTA5NTY2ODE2NzEzNzM5ODAiLCJoZCI6Im9sZWFyeS5jb20iLCJlbWFpbCI6InBhdWxAb2xlYXJ5LmNvbSIsImVtYWlsX3ZlcmlmaWVkIjp0cnVlLCJhdF9oYXNoIjoiaWVHTl81S2hpaUpuTHFMVUJLZkhTQSIsIm5hbWUiOiJQYXVsIE8nTGVhcnkiLCJwaWN0dXJlIjoiaHR0cHM6Ly9saDMuZ29vZ2xldXNlcmNvbnRlbnQuY29tL2EvQUNnOG9jSkhPb3M1UEliUEtNTkFaem9wYnpNV0xtYWp5T2FvTnkydFRDQXI0Sk5Xc01EVklRPXM5Ni1jIiwiZ2l2ZW5fbmFtZSI6IlBhdWwiLCJmYW1pbHlfbmFtZSI6Ik8nTGVhcnkiLCJpYXQiOjE3NzQwNDg2OTUsImV4cCI6MTc3NDA1MjI5NX0.a6x6fjTSwThmHXFBcSJva89kGwn6CRWEDVvPJ5viFllrxgT34ymRqVGqNxt3LKljFTzTNQ2Bb8jx8DNFA_-tpZQzOUi2ThNkqo08hQzlESDwLLwmmVcTRJtOk0p1jJZ88nHOmXKoTlGw6cLMI2DrrKKiG6SZLtRdp48Vz6UbPVI7xng2nv_-XljB7JMSdS4nWK-nhrkcZg-wM1yI7Ed8ViIBgO1C3ESP86JONjq_Q2RgcYB0SMADlY85D7TtF02RzMYM4vGYojNXzXRfW2UUoRRoDdrHOwrdiWkxfOTqPro7jzk1KIV2R9KGaItl9uOB0ZTdi08SII8QxpJf23ZCpw",
+  "claims": {
+    "iss": "https://accounts.google.com",
+    "sub": "114810956681671373980",
+    "email": "paul@oleary.com",
+    "hd": "oleary.com",
+    "azp": "838237305140-bahhknj5sj8bir4sh8aenk4os6eua11j.apps.googleusercontent.com",
+    "aud": "838237305140-bahhknj5sj8bir4sh8aenk4os6eua11j.apps.googleusercontent.com",
+    "iat": 1774048695,
+    "exp": 1774052295,
+    "kid": "c41f141aa19df0ac97daa55e600766c4c5364c42"
+  },
+  "signet": {
+    "key_id": "https://accounts.google.com:114810956681671373980",
+    "client_id": "838237305140-bahhknj5sj8bir4sh8aenk4os6eua11j.apps.googleusercontent.com"
+  },
+  "notes": "Token is expired (1h window). Use with testMode=true or as a fixture for claim parsing tests. Signature uses RS256 with Google key kid=c41f141aa19df0ac97daa55e600766c4c5364c42."
+}

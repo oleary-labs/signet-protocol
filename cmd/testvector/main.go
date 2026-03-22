@@ -118,20 +118,18 @@ func main() {
 		panic(err)
 	}
 
-	pubKey, err := configs["alice"].PublicKey()
-	if err != nil {
-		panic(err)
-	}
-	pubBytes := pubKey.Bytes()
-	ecdsaPub, err := crypto.DecompressPubkey(pubBytes[:])
+	groupKey := configs["alice"].GroupKey
+	ecdsaPub, err := crypto.DecompressPubkey(groupKey)
 	if err != nil {
 		panic(err)
 	}
 	addr := crypto.PubkeyToAddress(*ecdsaPub)
 
+	fmt.Printf("    bytes constant GROUP_PUB_KEY = hex\"%x\";\n", groupKey)
 	fmt.Printf("    bytes32 constant MSG_HASH = 0x%x;\n", msgHash)
 	fmt.Printf("    address constant SIGNER = %s;\n", addr)
 	fmt.Printf("    bytes32 constant SIG_RX = 0x%x;\n", ethSig[:32])
 	fmt.Printf("    bytes32 constant SIG_Z = 0x%x;\n", ethSig[32:64])
 	fmt.Printf("    uint8 constant SIG_V = %d;\n", ethSig[64])
+	fmt.Printf("    // R compressed: 0x%x\n", sig.R)
 }

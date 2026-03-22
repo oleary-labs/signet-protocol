@@ -4,36 +4,65 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+
+	"github.com/bytemare/ecc"
+	"github.com/bytemare/frost"
+	"github.com/bytemare/secret-sharing/keys"
 )
 
-// Config is the per-party persistent state after keygen or reshare.
+// Config is the per-party persistent state after keygen.
 type Config struct {
-	ID         PartyID   `json:"-"`
-	Threshold  int       `json:"-"`
-	Generation uint64    `json:"-"`
-	Share      *Scalar   // our secret share x_i
-	GroupKey   []byte    // 33-byte compressed group public key Y
-	Parties    []PartyID // sorted list of all parties in this key share set
-	ChainKey   []byte
-	RID        []byte
+	ID              PartyID            `json:"-"`
+	Threshold       int                `json:"-"`
+	MaxSigners      int                `json:"-"`
+	Generation      uint64             `json:"-"`
+	KeyShareBytes   []byte             // bytemare KeyShare.Encode()
+	GroupKey        []byte             // 33-byte compressed group public key (secp256k1)
+	Parties         []PartyID          // sorted list of all parties
+	PartyMap        map[PartyID]uint16 // PartyID → bytemare uint16 identifier
+	PublicKeyShares [][]byte           // each party's PublicKeyShare.Encode()
+	ChainKey        []byte
+	RID             []byte
 }
 
-// PublicKey returns the group public key by parsing GroupKey.
-func (c *Config) PublicKey() (*Point, error) {
-	if len(c.GroupKey) != 33 {
-		return nil, fmt.Errorf("invalid group key length %d", len(c.GroupKey))
+// FrostKeyShare decodes KeyShareBytes into a bytemare KeyShare.
+func (c *Config) FrostKeyShare() (*keys.KeyShare, error) {
+	ks := new(keys.KeyShare)
+	if err := ks.Decode(c.KeyShareBytes); err != nil {
+		return nil, fmt.Errorf("decode key share: %w", err)
 	}
-	return PointFromSlice(c.GroupKey)
+	return ks, nil
 }
 
-// PublicPoint is an alias for PublicKey.
-func (c *Config) PublicPoint() (*Point, error) {
-	return c.PublicKey()
-}
+// FrostConfiguration builds a frost.Configuration from stored data.
+func (c *Config) FrostConfiguration() (*frost.Configuration, error) {
+	g := frost.Secp256k1.Group()
 
-// PartyIDs returns the sorted party IDs for this key share set.
-func (c *Config) PartyIDs() PartyIDSlice {
-	return NewPartyIDSlice(c.Parties)
+	vk := g.NewElement()
+	if err := vk.Decode(c.GroupKey); err != nil {
+		return nil, fmt.Errorf("decode verification key: %w", err)
+	}
+
+	pks := make([]*keys.PublicKeyShare, len(c.PublicKeyShares))
+	for i, encoded := range c.PublicKeyShares {
+		pk := new(keys.PublicKeyShare)
+		if err := pk.Decode(encoded); err != nil {
+			return nil, fmt.Errorf("decode public key share %d: %w", i, err)
+		}
+		pks[i] = pk
+	}
+
+	cfg := &frost.Configuration{
+		Ciphersuite:           frost.Secp256k1,
+		Threshold:             uint16(c.Threshold),
+		MaxSigners:            uint16(c.MaxSigners),
+		VerificationKey:       vk,
+		SignerPublicKeyShares: pks,
+	}
+	if err := cfg.Init(); err != nil {
+		return nil, fmt.Errorf("init frost config: %w", err)
+	}
+	return cfg, nil
 }
 
 // Validate checks that the config is well-formed.
@@ -44,11 +73,11 @@ func (c *Config) Validate() error {
 	if c.Threshold < 1 {
 		return fmt.Errorf("threshold must be >= 1")
 	}
-	if c.Share == nil {
-		return fmt.Errorf("nil share")
+	if len(c.KeyShareBytes) == 0 {
+		return fmt.Errorf("nil key share")
 	}
-	if len(c.GroupKey) != 33 {
-		return fmt.Errorf("invalid group key: expected 33 bytes, got %d", len(c.GroupKey))
+	if len(c.GroupKey) == 0 {
+		return fmt.Errorf("empty group key")
 	}
 	if len(c.Parties) < c.Threshold {
 		return fmt.Errorf("insufficient parties: have %d, need %d", len(c.Parties), c.Threshold)
@@ -68,36 +97,48 @@ func (c *Config) Validate() error {
 
 // configJSON is the wire format for JSON marshaling.
 type configJSON struct {
-	ID         string   `json:"id"`
-	Threshold  int      `json:"threshold"`
-	Generation uint64   `json:"generation"`
-	Share      string   `json:"share"`     // hex, 32 bytes
-	GroupKey   string   `json:"group_key"` // hex, 33 bytes
-	Parties    []string `json:"parties"`
-	ChainKey   string   `json:"chain_key"` // hex
-	RID        string   `json:"rid"`       // hex
+	ID              string            `json:"id"`
+	Threshold       int               `json:"threshold"`
+	MaxSigners      int               `json:"max_signers"`
+	Generation      uint64            `json:"generation"`
+	KeyShare        string            `json:"key_share"`         // hex
+	GroupKey        string            `json:"group_key"`         // hex
+	Parties         []string          `json:"parties"`
+	PartyMap        map[string]uint16 `json:"party_map"`
+	PublicKeyShares []string          `json:"public_key_shares"` // hex
+	ChainKey        string            `json:"chain_key"`         // hex
+	RID             string            `json:"rid"`               // hex
 }
 
-// MarshalJSON encodes the Config with hex-encoded scalars and points.
+// MarshalJSON encodes the Config with hex-encoded byte fields.
 func (c *Config) MarshalJSON() ([]byte, error) {
 	parties := make([]string, len(c.Parties))
 	for i, p := range c.Parties {
 		parties[i] = string(p)
 	}
-	var shareHex string
-	if c.Share != nil {
-		b := c.Share.Bytes()
-		shareHex = hex.EncodeToString(b[:])
+
+	pm := make(map[string]uint16, len(c.PartyMap))
+	for pid, id := range c.PartyMap {
+		pm[string(pid)] = id
 	}
+
+	pks := make([]string, len(c.PublicKeyShares))
+	for i, pk := range c.PublicKeyShares {
+		pks[i] = hex.EncodeToString(pk)
+	}
+
 	return json.Marshal(&configJSON{
-		ID:         string(c.ID),
-		Threshold:  c.Threshold,
-		Generation: c.Generation,
-		Share:      shareHex,
-		GroupKey:   hex.EncodeToString(c.GroupKey),
-		Parties:    parties,
-		ChainKey:   hex.EncodeToString(c.ChainKey),
-		RID:        hex.EncodeToString(c.RID),
+		ID:              string(c.ID),
+		Threshold:       c.Threshold,
+		MaxSigners:      c.MaxSigners,
+		Generation:      c.Generation,
+		KeyShare:        hex.EncodeToString(c.KeyShareBytes),
+		GroupKey:        hex.EncodeToString(c.GroupKey),
+		Parties:         parties,
+		PartyMap:        pm,
+		PublicKeyShares: pks,
+		ChainKey:        hex.EncodeToString(c.ChainKey),
+		RID:             hex.EncodeToString(c.RID),
 	})
 }
 
@@ -109,38 +150,50 @@ func (c *Config) UnmarshalJSON(data []byte) error {
 	}
 	c.ID = PartyID(raw.ID)
 	c.Threshold = raw.Threshold
+	c.MaxSigners = raw.MaxSigners
 	c.Generation = raw.Generation
 
-	shareBytes, err := hex.DecodeString(raw.Share)
+	var err error
+	c.KeyShareBytes, err = hex.DecodeString(raw.KeyShare)
 	if err != nil {
-		return fmt.Errorf("decode share: %w", err)
+		return fmt.Errorf("decode key_share: %w", err)
 	}
-	var shareArr [32]byte
-	copy(shareArr[:], shareBytes)
-	c.Share = ScalarFromBytes(shareArr)
 
-	groupKey, err := hex.DecodeString(raw.GroupKey)
+	c.GroupKey, err = hex.DecodeString(raw.GroupKey)
 	if err != nil {
 		return fmt.Errorf("decode group_key: %w", err)
 	}
-	c.GroupKey = groupKey
 
 	c.Parties = make([]PartyID, len(raw.Parties))
 	for i, p := range raw.Parties {
 		c.Parties[i] = PartyID(p)
 	}
 
-	chainKey, err := hex.DecodeString(raw.ChainKey)
+	c.PartyMap = make(map[PartyID]uint16, len(raw.PartyMap))
+	for pid, id := range raw.PartyMap {
+		c.PartyMap[PartyID(pid)] = id
+	}
+
+	c.PublicKeyShares = make([][]byte, len(raw.PublicKeyShares))
+	for i, h := range raw.PublicKeyShares {
+		c.PublicKeyShares[i], err = hex.DecodeString(h)
+		if err != nil {
+			return fmt.Errorf("decode public_key_shares[%d]: %w", i, err)
+		}
+	}
+
+	c.ChainKey, err = hex.DecodeString(raw.ChainKey)
 	if err != nil {
 		return fmt.Errorf("decode chain_key: %w", err)
 	}
-	c.ChainKey = chainKey
 
-	rid, err := hex.DecodeString(raw.RID)
+	c.RID, err = hex.DecodeString(raw.RID)
 	if err != nil {
 		return fmt.Errorf("decode rid: %w", err)
 	}
-	c.RID = rid
 
 	return nil
 }
+
+// groupForSecp256k1 is a convenience for getting the secp256k1 ecc.Group.
+var groupSecp256k1 = ecc.Group(frost.Secp256k1)

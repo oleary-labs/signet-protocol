@@ -1,9 +1,12 @@
 package tss
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"testing"
+
+	"github.com/bytemare/frost"
 )
 
 // inMemNetwork is a simple in-process Network for testing.
@@ -42,94 +45,6 @@ func (r *routingNetwork) Send(msg *Message) {
 
 func (r *routingNetwork) Incoming() <-chan *Message {
 	return r.nets[r.self].ch
-}
-
-func TestScalarArithmetic(t *testing.T) {
-	a := NewScalar()
-	a.s.SetInt(5)
-	b := NewScalar()
-	b.s.SetInt(7)
-	c := a.Add(b)
-	var expected [32]byte
-	expected[31] = 12
-	if c.Bytes() != expected {
-		t.Errorf("Add: expected 12, got %x", c.Bytes())
-	}
-
-	d := a.Mul(b)
-	var exp35 [32]byte
-	exp35[31] = 35
-	if d.Bytes() != exp35 {
-		t.Errorf("Mul: expected 35, got %x", d.Bytes())
-	}
-
-	aInv := a.Inverse()
-	one := a.Mul(aInv)
-	var expOne [32]byte
-	expOne[31] = 1
-	if one.Bytes() != expOne {
-		t.Errorf("Inverse: a * a^-1 != 1")
-	}
-
-	aNeg := a.Negate()
-	zero := a.Add(aNeg)
-	if !zero.IsZero() {
-		t.Errorf("Negate: a + (-a) != 0")
-	}
-}
-
-func TestPointArithmetic(t *testing.T) {
-	G := GeneratorPoint()
-	if G.IsIdentity() {
-		t.Fatal("generator should not be identity")
-	}
-
-	two := NewScalar()
-	two.s.SetInt(2)
-	twoG := NewPoint().ScalarBaseMult(two)
-	GplusG := G.Add(G)
-	if !twoG.Equal(GplusG) {
-		t.Error("2*G != G+G")
-	}
-
-	b := G.Bytes()
-	G2, err := PointFromBytes(b)
-	if err != nil {
-		t.Fatalf("PointFromBytes: %v", err)
-	}
-	if !G.Equal(G2) {
-		t.Error("serialization round-trip failed")
-	}
-}
-
-func TestLagrange(t *testing.T) {
-	parties := []PartyID{"alice", "bob", "carol"}
-	for _, p := range parties {
-		lambda, err := LagrangeCoefficient(parties, p)
-		if err != nil {
-			t.Fatalf("LagrangeCoefficient(%s): %v", p, err)
-		}
-		if lambda.IsZero() {
-			t.Errorf("Lagrange coefficient for %s is zero", p)
-		}
-	}
-}
-
-func TestPolynomial(t *testing.T) {
-	secret := NewScalar()
-	secret.s.SetInt(42)
-
-	poly, err := NewPolynomial(2, secret)
-	if err != nil {
-		t.Fatalf("NewPolynomial: %v", err)
-	}
-
-	zero := NewScalar()
-	zero.s.SetInt(0)
-	result := poly.Evaluate(zero)
-	if !result.Equal(secret) {
-		t.Errorf("f(0) != secret: got %x want %x", result.Bytes(), secret.Bytes())
-	}
 }
 
 func TestKeygenRoundtrip(t *testing.T) {
@@ -180,25 +95,16 @@ func TestKeygenRoundtrip(t *testing.T) {
 	}
 
 	// All parties should get the same group public key.
-	pub0, err := configs["alice"].PublicKey()
-	if err != nil {
-		t.Fatalf("PublicKey alice: %v", err)
+	gk0 := configs["alice"].GroupKey
+	gk1 := configs["bob"].GroupKey
+	gk2 := configs["carol"].GroupKey
+	if !bytes.Equal(gk0, gk1) {
+		t.Error("alice and bob group keys differ")
 	}
-	pub1, err := configs["bob"].PublicKey()
-	if err != nil {
-		t.Fatalf("PublicKey bob: %v", err)
+	if !bytes.Equal(gk0, gk2) {
+		t.Error("alice and carol group keys differ")
 	}
-	pub2, err := configs["carol"].PublicKey()
-	if err != nil {
-		t.Fatalf("PublicKey carol: %v", err)
-	}
-	if !pub0.Equal(pub1) {
-		t.Error("alice and bob public keys differ")
-	}
-	if !pub0.Equal(pub2) {
-		t.Error("alice and carol public keys differ")
-	}
-	t.Logf("FROST group public key: %x", pub0.Bytes())
+	t.Logf("FROST group public key: %x", gk0)
 }
 
 func TestKeygenAndSign(t *testing.T) {
@@ -240,9 +146,9 @@ func TestKeygenAndSign(t *testing.T) {
 
 	// Sign with alice and bob (threshold=2).
 	signers := []PartyID{"alice", "bob"}
-	msgHash := make([]byte, 32)
-	for i := range msgHash {
-		msgHash[i] = byte(i + 1)
+	msg := make([]byte, 32)
+	for i := range msg {
+		msg[i] = byte(i + 1)
 	}
 
 	signNets := map[PartyID]*inMemNetwork{}
@@ -259,7 +165,7 @@ func TestKeygenAndSign(t *testing.T) {
 		p := p
 		net := &routingNetwork{self: p, nets: signNets, parties: signers}
 		go func() {
-			round := Sign(configs[p], signers, msgHash)
+			round := Sign(configs[p], signers, msg)
 			res, err := Run(context.Background(), round, net)
 			if err != nil {
 				sresults <- sresult{id: p, err: err}
@@ -290,25 +196,69 @@ func TestKeygenAndSign(t *testing.T) {
 	if len(ethSig) != 65 {
 		t.Errorf("expected 65-byte eth sig, got %d", len(ethSig))
 	}
+
+	// Verify signature with frost.VerifySignature.
+	g := frost.Secp256k1.Group()
+	vk := g.NewElement()
+	if err := vk.Decode(configs["alice"].GroupKey); err != nil {
+		t.Fatalf("decode verification key: %v", err)
+	}
+	frostSig := &frost.Signature{
+		R:     g.NewElement(),
+		Z:     g.NewScalar(),
+		Group: g,
+	}
+	if err := frostSig.R.Decode(sig.R[:]); err != nil {
+		t.Fatalf("decode R: %v", err)
+	}
+	if err := frostSig.Z.Decode(sig.Z[:]); err != nil {
+		t.Fatalf("decode Z: %v", err)
+	}
+	if err := frost.VerifySignature(frost.Secp256k1, msg, frostSig, vk); err != nil {
+		t.Fatalf("FROST signature verification failed: %v", err)
+	}
+	t.Log("FROST signature verified successfully")
 }
 
 func TestConfigJSON(t *testing.T) {
-	share := NewScalar()
-	share.s.SetInt(12345)
+	// Run a quick keygen to get a real Config.
+	parties := []PartyID{"alice", "bob"}
+	threshold := 2
 
-	// Use a real group key (generator point).
-	G := GeneratorPoint()
-	groupKeyBytes := G.Bytes()
+	nets := map[PartyID]*inMemNetwork{}
+	for _, p := range parties {
+		nets[p] = newInMemNetwork(1000)
+	}
 
-	cfg := &Config{
-		ID:         "alice",
-		Threshold:  2,
-		Generation: 1,
-		Share:      share,
-		GroupKey:   groupKeyBytes[:],
-		Parties:    []PartyID{"alice", "bob"},
-		ChainKey:   []byte("chainkey"),
-		RID:        []byte("rid"),
+	type result struct {
+		id  PartyID
+		cfg *Config
+		err error
+	}
+	results := make(chan result, len(parties))
+	for _, p := range parties {
+		p := p
+		net := &routingNetwork{self: p, nets: nets, parties: parties}
+		go func() {
+			round := Keygen(p, parties, threshold)
+			res, err := Run(context.Background(), round, net)
+			if err != nil {
+				results <- result{id: p, err: err}
+				return
+			}
+			results <- result{id: p, cfg: res.(*Config)}
+		}()
+	}
+
+	var cfg *Config
+	for i := 0; i < len(parties); i++ {
+		r := <-results
+		if r.err != nil {
+			t.Fatalf("keygen %s: %v", r.id, r.err)
+		}
+		if cfg == nil {
+			cfg = r.cfg
+		}
 	}
 
 	data, err := json.Marshal(cfg)
@@ -327,18 +277,16 @@ func TestConfigJSON(t *testing.T) {
 	if cfg2.Threshold != cfg.Threshold {
 		t.Errorf("Threshold mismatch: %d vs %d", cfg2.Threshold, cfg.Threshold)
 	}
-	if cfg2.Generation != cfg.Generation {
-		t.Errorf("Generation mismatch: %d vs %d", cfg2.Generation, cfg.Generation)
+	if cfg2.MaxSigners != cfg.MaxSigners {
+		t.Errorf("MaxSigners mismatch: %d vs %d", cfg2.MaxSigners, cfg.MaxSigners)
 	}
-	if !cfg2.Share.Equal(cfg.Share) {
-		t.Error("Share mismatch")
+	if !bytes.Equal(cfg2.GroupKey, cfg.GroupKey) {
+		t.Error("GroupKey mismatch")
 	}
-	if len(cfg2.GroupKey) != 33 {
-		t.Errorf("GroupKey length: got %d, want 33", len(cfg2.GroupKey))
+	if !bytes.Equal(cfg2.KeyShareBytes, cfg.KeyShareBytes) {
+		t.Error("KeyShareBytes mismatch")
 	}
-	for i, b := range cfg.GroupKey {
-		if cfg2.GroupKey[i] != b {
-			t.Errorf("GroupKey[%d] mismatch: got %x, want %x", i, cfg2.GroupKey[i], b)
-		}
+	if len(cfg2.PublicKeyShares) != len(cfg.PublicKeyShares) {
+		t.Errorf("PublicKeyShares length: got %d, want %d", len(cfg2.PublicKeyShares), len(cfg.PublicKeyShares))
 	}
 }

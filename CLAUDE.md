@@ -4,10 +4,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Signet: threshold signing research implementing the LSS (Linear Secret Sharing) MPC protocol from scratch. The project includes smart contracts, a Go node with libp2p networking, an HTTP API, blockchain integration, and a ZK-based authentication layer.
+Signet: threshold signing research using FROST (RFC 9591) on secp256k1. The project includes smart contracts, a Go node with libp2p networking, an HTTP API, blockchain integration, and a ZK-based authentication layer.
 
 - Main module: `signet` (Go)
-- LSS implementation: `signet/lss` (keygen, sign, reshare — no external threshold library)
+- TSS (Threshold Signature Scheme): `signet/tss` — thin adapter over `github.com/bytemare/frost` + `github.com/bytemare/dkg`
 - Smart contracts: `contracts/` (Foundry, Solidity 0.8.24)
 - ZK circuit: `circuits/jwt_auth/` (Noir + Barretenberg)
 

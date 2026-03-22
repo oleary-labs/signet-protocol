@@ -312,12 +312,10 @@ func (n *Node) handleListKeys(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 			ethAddr := ""
-			if pub, err := cfg.PublicPoint(); err == nil {
-				if addr, err := network.EthereumAddressFromPoint(pub); err == nil {
-					ethAddr = "0x" + hex.EncodeToString(addr[:])
-				}
+			if addr, err := network.EthereumAddressFromGroupKey(cfg.GroupKey); err == nil {
+				ethAddr = "0x" + hex.EncodeToString(addr[:])
 			}
-			partyIDs := cfg.PartyIDs()
+			partyIDs := cfg.Parties
 			parties := make([]string, len(partyIDs))
 			for i, p := range partyIDs {
 				parties[i] = string(p)
@@ -604,17 +602,7 @@ func (n *Node) handleKeygen(w http.ResponseWriter, r *http.Request) {
 	n.configs[shardKey{req.GroupID, keyID}] = cfg
 	n.mu.Unlock()
 
-	pub, err := cfg.PublicPoint()
-	if err != nil {
-		httpError(w, http.StatusInternalServerError, "public point: "+err.Error())
-		return
-	}
-	pubBytes, err := pub.MarshalBinary()
-	if err != nil {
-		httpError(w, http.StatusInternalServerError, "marshal public key: "+err.Error())
-		return
-	}
-	ethAddr, err := network.EthereumAddressFromPoint(pub)
+	ethAddr, err := network.EthereumAddressFromGroupKey(cfg.GroupKey)
 	if err != nil {
 		httpError(w, http.StatusInternalServerError, "eth addr: "+err.Error())
 		return
@@ -630,7 +618,7 @@ func (n *Node) handleKeygen(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]any{
 		"group_id":         req.GroupID,
 		"key_id":           keyID,
-		"public_key":       "0x" + hex.EncodeToString(pubBytes),
+		"public_key":       "0x" + hex.EncodeToString(cfg.GroupKey),
 		"ethereum_address": "0x" + hex.EncodeToString(ethAddr[:]),
 	})
 }

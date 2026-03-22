@@ -72,13 +72,9 @@ func EthereumAddress(pub crypto.PubKey) ([20]byte, error) {
 	return addr, nil
 }
 
-// EthereumAddressFromPoint derives the Ethereum address from a tss.Point
-// (e.g. as returned by cfg.PublicPoint()).
-func EthereumAddressFromPoint(pt *tss.Point) ([20]byte, error) {
-	compressed, err := pt.MarshalBinary()
-	if err != nil {
-		return [20]byte{}, fmt.Errorf("marshal point: %w", err)
-	}
+// EthereumAddressFromGroupKey derives the Ethereum address from a 33-byte
+// compressed secp256k1 public key (e.g. cfg.GroupKey).
+func EthereumAddressFromGroupKey(compressed []byte) ([20]byte, error) {
 	uncompressed, err := decompressSecp256k1(compressed)
 	if err != nil {
 		return [20]byte{}, fmt.Errorf("decompress point: %w", err)

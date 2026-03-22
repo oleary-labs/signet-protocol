@@ -1,28 +1,9 @@
 package tss
 
-import (
-	"crypto/sha256"
-	"fmt"
-	"sort"
-
-	secp256k1 "github.com/decred/dcrd/dcrec/secp256k1/v4"
-)
+import "sort"
 
 // PartyID is a string identifier for a party in a threshold protocol.
 type PartyID string
-
-// Scalar derives a deterministic non-zero scalar from the party ID using SHA-256.
-func (id PartyID) Scalar() *Scalar {
-	h := sha256.Sum256([]byte(id))
-	sc := ScalarFromBytes(h)
-	// If the hash happens to be zero mod N (astronomically unlikely), increment.
-	if sc.IsZero() {
-		var one secp256k1.ModNScalar
-		one.SetInt(1)
-		sc.s.Add(&one)
-	}
-	return sc
-}
 
 // PartyIDSlice is a sorted, deduplicated slice of party IDs.
 type PartyIDSlice []PartyID
@@ -52,31 +33,22 @@ func (s PartyIDSlice) Contains(id PartyID) bool {
 	return false
 }
 
-// LagrangeCoefficient computes the Lagrange coefficient for `self` evaluated at x=0
-// given the set of signers. Each party's "x coordinate" is derived from its PartyID
-// scalar: x_i = PartyID.Scalar().
-//
-// λ_self(0) = ∏_{j ≠ self} x_j / (x_j - x_self)   (mod N)
-func LagrangeCoefficient(signers []PartyID, self PartyID) (*Scalar, error) {
-	xSelf := self.Scalar()
-
-	num := NewScalar()
-	num.s.SetInt(1)
-	den := NewScalar()
-	den.s.SetInt(1)
-
-	for _, j := range signers {
-		if j == self {
-			continue
-		}
-		xj := j.Scalar()
-		num = num.Mul(xj)
-		diff := xj.Add(xSelf.Negate()) // x_j - x_self
-		if diff.IsZero() {
-			return nil, fmt.Errorf("lagrange: duplicate x-coordinate for %s and %s", j, self)
-		}
-		den = den.Mul(diff)
+// BuildPartyMap creates a deterministic mapping from PartyID to bytemare uint16
+// identifier. Party IDs are sorted alphabetically and assigned [1, n].
+func BuildPartyMap(parties []PartyID) map[PartyID]uint16 {
+	sorted := NewPartyIDSlice(parties)
+	m := make(map[PartyID]uint16, len(sorted))
+	for i, p := range sorted {
+		m[p] = uint16(i + 1)
 	}
+	return m
+}
 
-	return num.Mul(den.Inverse()), nil
+// ReversePartyMap returns a uint16 → PartyID lookup from a PartyMap.
+func ReversePartyMap(pm map[PartyID]uint16) map[uint16]PartyID {
+	m := make(map[uint16]PartyID, len(pm))
+	for pid, id := range pm {
+		m[id] = pid
+	}
+	return m
 }

@@ -8,21 +8,27 @@ import {PackedUserOperation} from "../contracts/interfaces/IAccount.sol";
 
 /// @dev Wrapper to expose the library function for testing.
 contract FROSTVerifierHarness {
-    function verify(bytes32 msgHash, bytes memory signature, address signer) external view returns (bool) {
-        return FROSTVerifier.verify(msgHash, signature, signer);
+    function verify(
+        bytes memory message,
+        bytes memory signature,
+        bytes memory groupPublicKey,
+        address signer
+    ) external view returns (bool) {
+        return FROSTVerifier.verify(message, signature, groupPublicKey, signer);
     }
 }
 
 contract FROSTVerifierTest is Test {
     FROSTVerifierHarness verifier;
 
-    // Test vector generated from FROST 2-of-3 threshold Schnorr signing (tss package).
+    // Test vector generated from FROST 2-of-3 threshold Schnorr signing (bytemare/frost).
     // Produced by cmd/testvector with parties ["alice","bob","carol"], threshold=2,
-    // signers=["alice","bob"], msgHash=0x0102...1f20.
+    // signers=["alice","bob"], msg=0x0102...1f20.
+    bytes constant GROUP_PUB_KEY = hex"023f7604a1c4b0d0d27fa514d44e641e13ccb8f24598e4e702e502026a9ea5c92e";
     bytes32 constant MSG_HASH = 0x0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20;
-    address constant SIGNER = 0x61C17C5Be88fa04d59464e49999DbA73f94771f6;
-    bytes32 constant SIG_RX = 0x1ad760891f617cd8f0b8185f2ffaf09270bacd83a0bbad19fefcddef901bdfce;
-    bytes32 constant SIG_Z = 0xf9c96d5b895e5c3a0502cd70b817240425b843689d8f45ceaf8e7e87a2fafe65;
+    address constant SIGNER = 0xaAF830452688305749D3e306eB54095C7411d276;
+    bytes32 constant SIG_RX = 0x7d02f48940f10854f148a07fbb86b7af2b6764318772c648fbd37452c290ffd5;
+    bytes32 constant SIG_Z = 0x56cc68b7bf192683e1015431da5884788f9280846270c10b00ed7b493b34e790;
     uint8 constant SIG_V = 0;
 
     function setUp() public {
@@ -33,50 +39,54 @@ contract FROSTVerifierTest is Test {
         return abi.encodePacked(SIG_RX, SIG_Z, SIG_V);
     }
 
+    function _msg() internal pure returns (bytes memory) {
+        return abi.encodePacked(MSG_HASH);
+    }
+
     function testVerifyValid() public view {
-        assertTrue(verifier.verify(MSG_HASH, _sig(), SIGNER));
+        assertTrue(verifier.verify(_msg(), _sig(), GROUP_PUB_KEY, SIGNER));
     }
 
     function testVerifyWrongSigner() public view {
-        assertFalse(verifier.verify(MSG_HASH, _sig(), address(0xdead)));
+        assertFalse(verifier.verify(_msg(), _sig(), GROUP_PUB_KEY, address(0xdead)));
     }
 
     function testVerifyWrongMessage() public view {
-        assertFalse(verifier.verify(bytes32(uint256(1)), _sig(), SIGNER));
+        assertFalse(verifier.verify(abi.encodePacked(bytes32(uint256(1))), _sig(), GROUP_PUB_KEY, SIGNER));
     }
 
     function testVerifyTamperedZ() public view {
         bytes memory sig = abi.encodePacked(SIG_RX, bytes32(uint256(SIG_Z) ^ 1), SIG_V);
-        assertFalse(verifier.verify(MSG_HASH, sig, SIGNER));
+        assertFalse(verifier.verify(_msg(), sig, GROUP_PUB_KEY, SIGNER));
     }
 
     function testVerifyTamperedRx() public view {
         bytes memory sig = abi.encodePacked(bytes32(uint256(SIG_RX) ^ 1), SIG_Z, SIG_V);
-        assertFalse(verifier.verify(MSG_HASH, sig, SIGNER));
+        assertFalse(verifier.verify(_msg(), sig, GROUP_PUB_KEY, SIGNER));
     }
 
     function testVerifyFlippedV() public view {
         uint8 wrongV = SIG_V == 0 ? 1 : 0;
         bytes memory sig = abi.encodePacked(SIG_RX, SIG_Z, wrongV);
-        assertFalse(verifier.verify(MSG_HASH, sig, SIGNER));
+        assertFalse(verifier.verify(_msg(), sig, GROUP_PUB_KEY, SIGNER));
     }
 
     function testVerifyBadLength() public view {
-        assertFalse(verifier.verify(MSG_HASH, hex"deadbeef", SIGNER));
-        assertFalse(verifier.verify(MSG_HASH, "", SIGNER));
+        assertFalse(verifier.verify(_msg(), hex"deadbeef", GROUP_PUB_KEY, SIGNER));
+        assertFalse(verifier.verify(_msg(), "", GROUP_PUB_KEY, SIGNER));
     }
 
     function testVerifyZeroSigner() public view {
-        assertFalse(verifier.verify(MSG_HASH, _sig(), address(0)));
+        assertFalse(verifier.verify(_msg(), _sig(), GROUP_PUB_KEY, address(0)));
     }
 
     function testGasCost() public {
         uint256 gasBefore = gasleft();
-        verifier.verify(MSG_HASH, _sig(), SIGNER);
+        verifier.verify(_msg(), _sig(), GROUP_PUB_KEY, SIGNER);
         uint256 gasUsed = gasBefore - gasleft();
         emit log_named_uint("FROST verify gas", gasUsed);
-        // modexp precompile dominates; ~12-14k gas total.
-        assertLt(gasUsed, 16_000);
+        // SHA-256 precompile calls + modexp + ecrecover. May be higher than before.
+        assertLt(gasUsed, 30_000);
     }
 }
 
@@ -84,15 +94,16 @@ contract SignetAccountFROSTTest is Test {
     SignetAccount account;
     address entryPoint;
 
+    bytes constant GROUP_PUB_KEY = hex"023f7604a1c4b0d0d27fa514d44e641e13ccb8f24598e4e702e502026a9ea5c92e";
     bytes32 constant MSG_HASH = 0x0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20;
-    address constant SIGNER = 0x61C17C5Be88fa04d59464e49999DbA73f94771f6;
-    bytes32 constant SIG_RX = 0x1ad760891f617cd8f0b8185f2ffaf09270bacd83a0bbad19fefcddef901bdfce;
-    bytes32 constant SIG_Z = 0xf9c96d5b895e5c3a0502cd70b817240425b843689d8f45ceaf8e7e87a2fafe65;
+    address constant SIGNER = 0xaAF830452688305749D3e306eB54095C7411d276;
+    bytes32 constant SIG_RX = 0x7d02f48940f10854f148a07fbb86b7af2b6764318772c648fbd37452c290ffd5;
+    bytes32 constant SIG_Z = 0x56cc68b7bf192683e1015431da5884788f9280846270c10b00ed7b493b34e790;
     uint8 constant SIG_V = 0;
 
     function setUp() public {
         entryPoint = makeAddr("entryPoint");
-        account = new SignetAccount(entryPoint, SIGNER);
+        account = new SignetAccount(entryPoint, GROUP_PUB_KEY, SIGNER);
         vm.deal(address(account), 1 ether);
     }
 
@@ -142,12 +153,13 @@ contract SignetAccountFROSTTest is Test {
 
     function testRotateSigner() public {
         address newSigner = makeAddr("newSigner");
+        bytes memory newKey = hex"02deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbe01";
 
         vm.prank(entryPoint);
         account.execute(
             address(account),
             0,
-            abi.encodeCall(SignetAccount.rotateSigner, (newSigner))
+            abi.encodeCall(SignetAccount.rotateSigner, (newKey, newSigner))
         );
         assertEq(account.signer(), newSigner);
     }

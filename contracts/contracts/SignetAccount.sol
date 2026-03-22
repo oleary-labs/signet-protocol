@@ -6,29 +6,28 @@ import {FROSTVerifier} from "./FROSTVerifier.sol";
 
 /// @title SignetAccount
 /// @notice ERC-4337 smart account that validates operations using FROST threshold Schnorr
-/// signatures. The account's signer is the group public key, represented as an Ethereum address.
+/// signatures (RFC 9591). The account stores the 33-byte compressed group public key and
+/// derives the signer address from it.
 ///
 /// Usage with ERC-4337:
-/// 1. Deploy via factory with entryPoint and signer address
+/// 1. Deploy via factory with entryPoint and groupPublicKey
 /// 2. The FROST signing group produces a Schnorr signature on the userOpHash
 /// 3. The signature (65 bytes: R.x || z || v) is placed in userOp.signature
-/// 4. EntryPoint calls validateUserOp, which verifies via ecrecover trick
+/// 4. EntryPoint calls validateUserOp, which verifies via RFC 9591 challenge + ecrecover
 ///
-/// @dev This is a minimal reference implementation. Production accounts should add:
-/// - Execute/batch-execute functions
-/// - Signer rotation (via LSS reshare — same public key, new shares)
-/// - Fallback/receive handlers
-/// - ERC-1271 isValidSignature support
+/// @dev Minimal reference implementation for research.
 contract SignetAccount is IAccount {
-    /// @dev ERC-4337 signature validation failed sentinel.
     uint256 internal constant SIG_VALIDATION_FAILED = 1;
 
     /// @notice The ERC-4337 EntryPoint that may call validateUserOp.
     address public immutable entryPoint;
 
     /// @notice The signer address: keccak256(uncompressed group public key)[12:].
-    /// Updated via signer rotation (not by reshare — reshare preserves the same key).
     address public signer;
+
+    /// @notice The 33-byte compressed secp256k1 group public key.
+    /// Required for RFC 9591 challenge computation.
+    bytes public groupPublicKey;
 
     error OnlyEntryPoint();
     error OnlySelf();
@@ -43,8 +42,9 @@ contract SignetAccount is IAccount {
         _;
     }
 
-    constructor(address _entryPoint, address _signer) {
+    constructor(address _entryPoint, bytes memory _groupPublicKey, address _signer) {
         entryPoint = _entryPoint;
+        groupPublicKey = _groupPublicKey;
         signer = _signer;
     }
 
@@ -58,7 +58,7 @@ contract SignetAccount is IAccount {
         _payPrefund(missingAccountFunds);
     }
 
-    /// @notice Execute a call. Only callable by EntryPoint or the account itself.
+    /// @notice Execute a call. Only callable by EntryPoint.
     function execute(address dest, uint256 value, bytes calldata data) external onlyEntryPoint {
         (bool ok, bytes memory result) = dest.call{value: value}(data);
         if (!ok) {
@@ -69,7 +69,8 @@ contract SignetAccount is IAccount {
     }
 
     /// @notice Rotate the signer. Only callable by the account itself (via execute).
-    function rotateSigner(address newSigner) external onlySelf {
+    function rotateSigner(bytes memory newGroupPublicKey, address newSigner) external onlySelf {
+        groupPublicKey = newGroupPublicKey;
         signer = newSigner;
     }
 
@@ -78,7 +79,8 @@ contract SignetAccount is IAccount {
         PackedUserOperation calldata userOp,
         bytes32 userOpHash
     ) internal view returns (uint256) {
-        if (FROSTVerifier.verify(userOpHash, userOp.signature, signer)) {
+        // FROST signs the raw message bytes (the 32-byte userOpHash).
+        if (FROSTVerifier.verify(abi.encodePacked(userOpHash), userOp.signature, groupPublicKey, signer)) {
             return 0;
         }
         return SIG_VALIDATION_FAILED;
@@ -88,7 +90,7 @@ contract SignetAccount is IAccount {
     function _payPrefund(uint256 missingAccountFunds) internal {
         if (missingAccountFunds > 0) {
             (bool ok,) = payable(msg.sender).call{value: missingAccountFunds}("");
-            (ok); // ignore failure (EntryPoint will catch it)
+            (ok);
         }
     }
 

@@ -5,6 +5,10 @@ go 1.24.6
 toolchain go1.24.10
 
 require (
+	github.com/bytemare/dkg v0.0.0-20241007182121-23ea4d549880
+	github.com/bytemare/ecc v0.8.2
+	github.com/bytemare/frost v0.0.0-20241019112700-8c6db5b04145
+	github.com/bytemare/secret-sharing v0.7.0
 	github.com/decred/dcrd/dcrec/secp256k1/v4 v4.4.0
 	github.com/ethereum/go-ethereum v1.17.1
 	github.com/fxamacker/cbor/v2 v2.4.0
@@ -20,12 +24,17 @@ require (
 )
 
 require (
+	filippo.io/edwards25519 v1.1.0 // indirect
+	filippo.io/nistec v0.0.3 // indirect
 	github.com/Microsoft/go-winio v0.6.2 // indirect
 	github.com/ProjectZKM/Ziren/crates/go-runtime/zkvm_runtime v0.0.0-20251001021608-1fe7b43fc4d6 // indirect
 	github.com/StackExchange/wmi v1.2.1 // indirect
 	github.com/benbjohnson/clock v1.3.5 // indirect
 	github.com/beorn7/perks v1.0.1 // indirect
 	github.com/bits-and-blooms/bitset v1.20.0 // indirect
+	github.com/bytemare/hash v0.3.0 // indirect
+	github.com/bytemare/hash2curve v0.3.0 // indirect
+	github.com/bytemare/secp256k1 v0.1.6 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/consensys/gnark-crypto v0.18.1 // indirect
 	github.com/crate-crypto/go-eth-kzg v1.4.0 // indirect
@@ -43,6 +52,7 @@ require (
 	github.com/google/gopacket v1.1.19 // indirect
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/gorilla/websocket v1.5.3 // indirect
+	github.com/gtank/ristretto255 v0.1.2 // indirect
 	github.com/hashicorp/golang-lru v1.0.2 // indirect
 	github.com/holiman/uint256 v1.3.2 // indirect
 	github.com/huin/goupnp v1.3.0 // indirect

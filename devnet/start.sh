@@ -154,7 +154,7 @@ CREATE_RECEIPT=$(cast send \
     --rpc-url "$RPC" \
     "$FACTORY" \
     "createGroup(address[],uint256,uint256,uint256,uint256,(string,string[])[])" \
-    "[$ADDR_1,$ADDR_2,$ADDR_3]" 1 86400 86400 86400 "[]" \
+    "[$ADDR_1,$ADDR_2,$ADDR_3]" 2 86400 86400 86400 "[]" \
     --json)
 
 # topics[1] is the group address zero-padded to 32 bytes; take the last 40 hex chars.
@@ -251,7 +251,7 @@ echo ""
 echo "  Chain RPC : $RPC"
 echo "  Factory   : $FACTORY"
 echo "  Beacon    : $BEACON"
-echo "  Group     : $GROUP  (threshold=1, nodes=3)"
+echo "  Group     : $GROUP  (threshold=2, nodes=3)"
 echo ""
 echo "  node1  eth=${ADDR_1}  api=:8080  p2p=:9000"
 echo "  node2  eth=${ADDR_2}  api=:8081  p2p=:9001"

@@ -115,7 +115,7 @@ func (c *ChainClient) loadGroups(ctx context.Context) error {
 			continue
 		}
 		c.n.groupsMu.Lock()
-		c.n.groups[grpAddr.Hex()] = info
+		c.n.groups[strings.ToLower(grpAddr.Hex())] = info
 		c.n.groupsMu.Unlock()
 		c.log.Info("chain: loaded group",
 			zap.String("group", grpAddr.Hex()),
@@ -154,7 +154,7 @@ func (c *ChainClient) buildGroupInfo(ctx context.Context, grpAddr common.Address
 	if err != nil {
 		c.log.Warn("chain: getIssuers", zap.String("group", grpAddr.Hex()), zap.Error(err))
 	} else if len(rawIssuers) > 0 {
-		hexGrp := grpAddr.Hex()
+		hexGrp := strings.ToLower(grpAddr.Hex())
 		infos := make([]IssuerInfo, 0, len(rawIssuers))
 		for _, ri := range rawIssuers {
 			jwksURI, err := discoverJWKSURI(ctx, ri.Issuer)
@@ -279,8 +279,9 @@ func (c *ChainClient) pollFactoryEvents(ctx context.Context, from, to uint64) er
 		grpAddr := common.BytesToAddress(lg.Topics[2].Bytes())
 		switch lg.Topics[0] {
 		case activatedID:
+			key := strings.ToLower(grpAddr.Hex())
 			c.n.groupsMu.RLock()
-			_, exists := c.n.groups[grpAddr.Hex()]
+			_, exists := c.n.groups[key]
 			c.n.groupsMu.RUnlock()
 			if exists {
 				continue
@@ -292,14 +293,15 @@ func (c *ChainClient) pollFactoryEvents(ctx context.Context, from, to uint64) er
 				continue
 			}
 			c.n.groupsMu.Lock()
-			c.n.groups[grpAddr.Hex()] = info
+			c.n.groups[key] = info
 			c.n.groupsMu.Unlock()
 			c.log.Info("chain: joined group", zap.String("group", grpAddr.Hex()),
 				zap.Int("members", len(info.Members)))
 
 		case deactivatedID:
+			key := strings.ToLower(grpAddr.Hex())
 			c.n.groupsMu.Lock()
-			delete(c.n.groups, grpAddr.Hex())
+			delete(c.n.groups, key)
 			c.n.groupsMu.Unlock()
 			c.log.Info("chain: left group", zap.String("group", grpAddr.Hex()))
 		}
@@ -324,7 +326,7 @@ func (c *ChainClient) pollGroupEvents(ctx context.Context, grpAddr common.Addres
 		return fmt.Errorf("filter group logs: %w", err)
 	}
 
-	hexGrp := grpAddr.Hex()
+	hexGrp := strings.ToLower(grpAddr.Hex())
 
 	for _, lg := range logs {
 		if len(lg.Topics) < 1 {

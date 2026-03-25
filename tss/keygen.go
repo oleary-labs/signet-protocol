@@ -45,6 +45,14 @@ type keygenRound1 struct {
 // Keygen returns the starting Round for distributed key generation using bytemare/dkg.
 func Keygen(selfID PartyID, participants []PartyID, threshold int) Round {
 	parties := NewPartyIDSlice(participants)
+
+	// threshold=1 with n>1 produces a degree-0 polynomial, meaning every party
+	// receives the same secret share (and therefore the same public key).
+	// FROST rejects duplicate public keys; use threshold >= 2 for multi-party groups.
+	if threshold < 2 && len(parties) > 1 {
+		return &errRound{err: fmt.Errorf("keygen: threshold must be >= 2 for multi-party groups (got threshold=%d, n=%d)", threshold, len(parties))}
+	}
+
 	pm := BuildPartyMap([]PartyID(parties))
 
 	selfNum, ok := pm[selfID]

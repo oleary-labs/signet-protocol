@@ -53,6 +53,8 @@ type Node struct {
 	auth     *GroupAuth    // per-group OAuth trust store
 	sessions *SessionStore // ephemeral session key cache
 	chain    *ChainClient  // nil if no eth_rpc configured
+
+	bootstrapPeers []peer.AddrInfo // parsed bootstrap peer addresses for reconnect
 }
 
 // NodeInfo is returned by the /v1/info endpoint.
@@ -90,7 +92,8 @@ func New(cfg *Config, log *zap.Logger) (*Node, error) {
 		return nil, fmt.Errorf("open key shard store: %w", err)
 	}
 
-	// Dial each bootstrap peer; connection failures are non-fatal.
+	// Parse bootstrap peer addresses; bail out on malformed entries.
+	var bootstrapPeers []peer.AddrInfo
 	for _, bpStr := range cfg.BootstrapPeers {
 		maddr, err := ma.NewMultiaddr(bpStr)
 		if err != nil {
@@ -106,12 +109,32 @@ func New(cfg *Config, log *zap.Logger) (*Node, error) {
 			cancel()
 			return nil, fmt.Errorf("addr info from %q: %w", bpStr, err)
 		}
-		if err := h.LibP2PHost().Connect(ctx, *pi); err != nil {
-			log.Warn("bootstrap peer unreachable", zap.String("peer", pi.ID.String()), zap.Error(err))
-			continue
+		bootstrapPeers = append(bootstrapPeers, *pi)
+	}
+
+	// Dial each bootstrap peer with a small number of retries to survive
+	// simultaneous-dial TLS races that occur when all nodes start at once.
+	const bootstrapRetries = 5
+	for _, pi := range bootstrapPeers {
+		pi := pi
+		var lastErr error
+		for i := 0; i < bootstrapRetries; i++ {
+			if i > 0 {
+				time.Sleep(500 * time.Millisecond)
+			}
+			if err := h.LibP2PHost().Connect(ctx, pi); err != nil {
+				lastErr = err
+				continue
+			}
+			h.RegisterPeer(tss.PartyID(pi.ID.String()), pi.ID)
+			log.Info("connected to bootstrap peer", zap.String("peer", pi.ID.String()))
+			lastErr = nil
+			break
 		}
-		h.RegisterPeer(tss.PartyID(pi.ID.String()), pi.ID)
-		log.Info("connected to bootstrap peer", zap.String("peer", pi.ID.String()))
+		if lastErr != nil {
+			log.Warn("bootstrap peer unreachable after retries",
+				zap.String("peer", pi.ID.String()), zap.Error(lastErr))
+		}
 	}
 
 	// Load circuit verification key if configured (required for production ZK auth).
@@ -129,18 +152,20 @@ func New(cfg *Config, log *zap.Logger) (*Node, error) {
 	}
 
 	n := &Node{
-		cfg:     cfg,
-		host:    h,
-		log:     log,
-		ctx:     ctx,
-		cancel:  cancel,
-		store:   store,
-		configs: make(map[shardKey]*tss.Config),
-		groups:   make(map[string]*GroupInfo),
-		auth:     newGroupAuth(ctx, cfg.TestMode, circuitVK, log),
-		sessions: newSessionStore(),
+		cfg:            cfg,
+		host:           h,
+		log:            log,
+		ctx:            ctx,
+		cancel:         cancel,
+		store:          store,
+		configs:        make(map[shardKey]*tss.Config),
+		groups:         make(map[string]*GroupInfo),
+		auth:           newGroupAuth(ctx, cfg.TestMode, circuitVK, log),
+		sessions:       newSessionStore(),
+		bootstrapPeers: bootstrapPeers,
 	}
 	n.sessions.startCleanupLoop(ctx)
+	go n.reconnectLoop(ctx)
 
 	// Wire the chain client when eth_rpc and factory_address are configured.
 	if cfg.EthRPC != "" && cfg.FactoryAddress != "" {
@@ -368,6 +393,7 @@ func (n *Node) handleAuth(w http.ResponseWriter, r *http.Request) {
 		httpError(w, http.StatusBadRequest, "group_id and session_pub are required")
 		return
 	}
+	req.GroupID = strings.ToLower(req.GroupID)
 
 	sessionPubBytes, err := hex.DecodeString(strings.TrimPrefix(req.SessionPub, "0x"))
 	if err != nil || len(sessionPubBytes) != 33 {
@@ -503,6 +529,7 @@ func (n *Node) handleKeygen(w http.ResponseWriter, r *http.Request) {
 		httpError(w, http.StatusBadRequest, "group_id is required")
 		return
 	}
+	req.GroupID = strings.ToLower(req.GroupID)
 
 	n.groupsMu.RLock()
 	grp, ok := n.groups[req.GroupID]
@@ -652,6 +679,7 @@ func (n *Node) handleSign(w http.ResponseWriter, r *http.Request) {
 		httpError(w, http.StatusBadRequest, "group_id and message_hash are required")
 		return
 	}
+	req.GroupID = strings.ToLower(req.GroupID)
 
 	msgHash, err := hex.DecodeString(strings.TrimPrefix(req.MessageHash, "0x"))
 	if err != nil {
@@ -880,6 +908,33 @@ func httpError(w http.ResponseWriter, code int, msg string) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
 	json.NewEncoder(w).Encode(map[string]string{"error": msg})
+}
+
+// reconnectLoop periodically re-dials any bootstrap peer that is not currently
+// connected. This recovers from simultaneous-dial TLS races at startup and from
+// peers that restart after the node comes up.
+func (n *Node) reconnectLoop(ctx context.Context) {
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			for _, pi := range n.bootstrapPeers {
+				if len(n.host.LibP2PHost().Network().ConnsToPeer(pi.ID)) > 0 {
+					continue // already connected
+				}
+				if err := n.host.LibP2PHost().Connect(ctx, pi); err != nil {
+					n.log.Debug("reconnect bootstrap peer failed",
+						zap.String("peer", pi.ID.String()), zap.Error(err))
+					continue
+				}
+				n.host.RegisterPeer(tss.PartyID(pi.ID.String()), pi.ID)
+				n.log.Info("reconnected to bootstrap peer", zap.String("peer", pi.ID.String()))
+			}
+		}
+	}
 }
 
 // extractBearer returns the token from an "Authorization: Bearer <token>" header,

@@ -26,6 +26,12 @@ func printSummaryTo(w io.Writer, s Summary) {
 	fmt.Fprintf(w, "  latency p50: %s\n", fmtDur(s.P50))
 	fmt.Fprintf(w, "  latency p95: %s\n", fmtDur(s.P95))
 	fmt.Fprintf(w, "  latency p99: %s\n", fmtDur(s.P99))
+	if len(s.TopErrors) > 0 {
+		fmt.Fprintf(w, "  top errors :\n")
+		for _, e := range s.TopErrors {
+			fmt.Fprintf(w, "    [%d] %s\n", e.Count, e.Msg)
+		}
+	}
 }
 
 // PrintScaleTable writes a concurrency-sweep result table to stdout.

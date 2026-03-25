@@ -47,6 +47,12 @@ type Node struct {
 	mu      sync.RWMutex
 	configs map[shardKey]*tss.Config // in-memory cache: (group_id, key_id) → key config
 
+	// keygenReady tracks in-flight keygen operations so that sign handlers
+	// arriving before the keygen has persisted its config can wait instead of
+	// immediately failing with "key not found".
+	keygenReadyMu sync.Mutex
+	keygenReady   map[shardKey]chan struct{}
+
 	groupsMu sync.RWMutex
 	groups   map[string]*GroupInfo // group contract address → resolved membership
 
@@ -159,6 +165,7 @@ func New(cfg *Config, log *zap.Logger) (*Node, error) {
 		cancel:         cancel,
 		store:          store,
 		configs:        make(map[shardKey]*tss.Config),
+		keygenReady:    make(map[shardKey]chan struct{}),
 		groups:         make(map[string]*GroupInfo),
 		auth:           newGroupAuth(ctx, cfg.TestMode, circuitVK, log),
 		sessions:       newSessionStore(),
@@ -274,6 +281,64 @@ func (n *Node) cachedConfig(groupID, keyID string) (*tss.Config, error) {
 	n.configs[k] = cfg
 	n.mu.Unlock()
 	return cfg, nil
+}
+
+// markKeygenPending registers a pending keygen for (groupID, keyID). The sign
+// coord handler can call awaitConfig to wait for it.
+func (n *Node) markKeygenPending(groupID, keyID string) {
+	k := shardKey{groupID, keyID}
+	n.keygenReadyMu.Lock()
+	if _, exists := n.keygenReady[k]; !exists {
+		n.keygenReady[k] = make(chan struct{})
+	}
+	n.keygenReadyMu.Unlock()
+}
+
+// markKeygenDone signals that keygen for (groupID, keyID) has completed and the
+// config is now available in the cache/store.
+func (n *Node) markKeygenDone(groupID, keyID string) {
+	k := shardKey{groupID, keyID}
+	n.keygenReadyMu.Lock()
+	ch, exists := n.keygenReady[k]
+	if exists {
+		close(ch)
+		delete(n.keygenReady, k)
+	}
+	n.keygenReadyMu.Unlock()
+}
+
+// awaitConfig loads the config for (groupID, keyID), waiting up to timeout for a
+// concurrent keygen to finish storing it. Returns (nil, nil) only if the key is
+// genuinely absent (no pending keygen and not in store).
+func (n *Node) awaitConfig(groupID, keyID string, timeout time.Duration) (*tss.Config, error) {
+	cfg, err := n.cachedConfig(groupID, keyID)
+	if err != nil || cfg != nil {
+		return cfg, err
+	}
+
+	// Check if a keygen is in progress.
+	k := shardKey{groupID, keyID}
+	n.keygenReadyMu.Lock()
+	ch, pending := n.keygenReady[k]
+	n.keygenReadyMu.Unlock()
+
+	if !pending {
+		return nil, nil // no keygen in flight — key genuinely missing
+	}
+
+	n.log.Debug("coord: waiting for pending keygen",
+		zap.String("group_id", groupID),
+		zap.String("key_id", keyID))
+
+	select {
+	case <-ch:
+		// Keygen completed — config should now be available.
+		return n.cachedConfig(groupID, keyID)
+	case <-time.After(timeout):
+		return nil, fmt.Errorf("timeout waiting for keygen to complete for key %s", keyID)
+	case <-n.ctx.Done():
+		return nil, n.ctx.Err()
+	}
 }
 
 // randomNonce returns a short random hex string for sign session disambiguation.

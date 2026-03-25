@@ -169,6 +169,11 @@ func (n *Node) handleCoordStream(s libp2pnet.Stream) {
 				zap.Error(err))
 			return
 		}
+
+		// Register pending keygen BEFORE ACK so a racing sign coord handler
+		// will see the pending flag and wait rather than returning "key not found".
+		n.markKeygenPending(msg.GroupID, msg.KeyID)
+
 		// ACK only after subscribing to the GossipSub topic, so the initiator
 		// knows all parties are ready before starting the protocol.
 		s.Write([]byte{1})
@@ -184,6 +189,7 @@ func (n *Node) handleCoordStream(s libp2pnet.Stream) {
 					zap.String("group_id", msg.GroupID),
 					zap.String("key_id", msg.KeyID),
 					zap.Error(err))
+				n.markKeygenDone(msg.GroupID, msg.KeyID)
 				return
 			}
 			if err := n.store.Put(msg.GroupID, msg.KeyID, cfg); err != nil {
@@ -195,6 +201,7 @@ func (n *Node) handleCoordStream(s libp2pnet.Stream) {
 			n.mu.Lock()
 			n.configs[shardKey{msg.GroupID, msg.KeyID}] = cfg
 			n.mu.Unlock()
+			n.markKeygenDone(msg.GroupID, msg.KeyID)
 			n.log.Info("coord: keygen complete",
 				zap.String("group_id", msg.GroupID),
 				zap.String("key_id", msg.KeyID))
@@ -218,7 +225,7 @@ func (n *Node) handleCoordStream(s libp2pnet.Stream) {
 				zap.String("group_id", msg.GroupID),
 				zap.String("key_id", msg.KeyID))
 
-			cfg, err := n.cachedConfig(msg.GroupID, msg.KeyID)
+			cfg, err := n.awaitConfig(msg.GroupID, msg.KeyID, 10*time.Second)
 			if err != nil {
 				n.log.Error("coord: load config",
 					zap.String("group_id", msg.GroupID),

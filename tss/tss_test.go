@@ -3,7 +3,9 @@ package tss
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"encoding/json"
+	"fmt"
 	"testing"
 
 	"github.com/bytemare/frost"
@@ -288,5 +290,343 @@ func TestConfigJSON(t *testing.T) {
 	}
 	if len(cfg2.PublicKeyShares) != len(cfg.PublicKeyShares) {
 		t.Errorf("PublicKeyShares length: got %d, want %d", len(cfg2.PublicKeyShares), len(cfg.PublicKeyShares))
+	}
+}
+
+// serializingNetwork wraps routingNetwork and round-trips every message through
+// MarshalBinary/UnmarshalBinary, simulating what happens over the wire.
+type serializingNetwork struct {
+	inner *routingNetwork
+}
+
+func (s *serializingNetwork) Send(msg *Message) {
+	data, err := msg.MarshalBinary()
+	if err != nil {
+		panic("MarshalBinary: " + err.Error())
+	}
+	msg2 := &Message{}
+	if err := msg2.UnmarshalBinary(data); err != nil {
+		panic("UnmarshalBinary: " + err.Error())
+	}
+	s.inner.Send(msg2)
+}
+
+func (s *serializingNetwork) Incoming() <-chan *Message {
+	return s.inner.Incoming()
+}
+
+// TestSignStress runs keygen once and then signs many times to reproduce
+// intermittent "invalid signature share" errors seen in the devnet harness.
+// Runs in-process with no networking to isolate crypto-layer bugs.
+func TestSignStress(t *testing.T) {
+	parties := []PartyID{"alice", "bob", "carol"}
+	threshold := 2
+	iterations := 200
+
+	// --- Keygen ---
+	nets := map[PartyID]*inMemNetwork{}
+	for _, p := range parties {
+		nets[p] = newInMemNetwork(1000)
+	}
+	type kresult struct {
+		id  PartyID
+		cfg *Config
+		err error
+	}
+	kresults := make(chan kresult, len(parties))
+	for _, p := range parties {
+		p := p
+		net := &routingNetwork{self: p, nets: nets, parties: parties}
+		go func() {
+			round := Keygen(p, parties, threshold)
+			res, err := Run(context.Background(), round, net)
+			if err != nil {
+				kresults <- kresult{id: p, err: err}
+				return
+			}
+			kresults <- kresult{id: p, cfg: res.(*Config)}
+		}()
+	}
+	configs := map[PartyID]*Config{}
+	for i := 0; i < len(parties); i++ {
+		r := <-kresults
+		if r.err != nil {
+			t.Fatalf("keygen %s: %v", r.id, r.err)
+		}
+		configs[r.id] = r.cfg
+	}
+	t.Logf("keygen complete, group key: %x", configs["alice"].GroupKey)
+
+	// --- Repeated signing with ALL 3 parties (matches devnet behavior) ---
+	var failures int
+	for iter := 0; iter < iterations; iter++ {
+		msg := make([]byte, 32)
+		if _, err := rand.Read(msg); err != nil {
+			t.Fatalf("rand: %v", err)
+		}
+
+		signers := parties // all 3, same as devnet
+		signNets := map[PartyID]*inMemNetwork{}
+		for _, p := range signers {
+			signNets[p] = newInMemNetwork(1000)
+		}
+		type sresult struct {
+			id  PartyID
+			sig *Signature
+			err error
+		}
+		sresults := make(chan sresult, len(signers))
+		for _, p := range signers {
+			p := p
+			net := &routingNetwork{self: p, nets: signNets, parties: signers}
+			go func() {
+				round := Sign(configs[p], signers, msg)
+				res, err := Run(context.Background(), round, net)
+				if err != nil {
+					sresults <- sresult{id: p, err: err}
+					return
+				}
+				sresults <- sresult{id: p, sig: res.(*Signature)}
+			}()
+		}
+
+		var iterErr error
+		for i := 0; i < len(signers); i++ {
+			r := <-sresults
+			if r.err != nil {
+				iterErr = fmt.Errorf("sign iter=%d party=%s: %v", iter, r.id, r.err)
+			}
+		}
+		if iterErr != nil {
+			t.Error(iterErr)
+			failures++
+		}
+	}
+	t.Logf("sign stress: %d/%d succeeded, %d failures (%.1f%%)",
+		iterations-failures, iterations, failures, float64(failures)/float64(iterations)*100)
+	if failures > 0 {
+		t.Errorf("sign stress had %d failures out of %d iterations", failures, iterations)
+	}
+}
+
+// TestSignStressSerialized is like TestSignStress but round-trips every message
+// through MarshalBinary/UnmarshalBinary to test the serialization path.
+func TestSignStressSerialized(t *testing.T) {
+	parties := []PartyID{"alice", "bob", "carol"}
+	threshold := 2
+	iterations := 200
+
+	// --- Keygen (with serialization) ---
+	nets := map[PartyID]*inMemNetwork{}
+	for _, p := range parties {
+		nets[p] = newInMemNetwork(1000)
+	}
+	type kresult struct {
+		id  PartyID
+		cfg *Config
+		err error
+	}
+	kresults := make(chan kresult, len(parties))
+	for _, p := range parties {
+		p := p
+		rn := &routingNetwork{self: p, nets: nets, parties: parties}
+		net := &serializingNetwork{inner: rn}
+		go func() {
+			round := Keygen(p, parties, threshold)
+			res, err := Run(context.Background(), round, net)
+			if err != nil {
+				kresults <- kresult{id: p, err: err}
+				return
+			}
+			kresults <- kresult{id: p, cfg: res.(*Config)}
+		}()
+	}
+	configs := map[PartyID]*Config{}
+	for i := 0; i < len(parties); i++ {
+		r := <-kresults
+		if r.err != nil {
+			t.Fatalf("keygen %s: %v", r.id, r.err)
+		}
+		configs[r.id] = r.cfg
+	}
+
+	// Simulate what the node does: JSON round-trip each config (like bbolt storage).
+	for pid, cfg := range configs {
+		data, err := json.Marshal(cfg)
+		if err != nil {
+			t.Fatalf("marshal config %s: %v", pid, err)
+		}
+		cfg2 := new(Config)
+		if err := json.Unmarshal(data, cfg2); err != nil {
+			t.Fatalf("unmarshal config %s: %v", pid, err)
+		}
+		configs[pid] = cfg2
+	}
+	t.Logf("keygen complete (with JSON round-trip)")
+
+	// --- Repeated signing with serialization ---
+	var failures int
+	for iter := 0; iter < iterations; iter++ {
+		msg := make([]byte, 32)
+		if _, err := rand.Read(msg); err != nil {
+			t.Fatalf("rand: %v", err)
+		}
+
+		signers := parties
+		signNets := map[PartyID]*inMemNetwork{}
+		for _, p := range signers {
+			signNets[p] = newInMemNetwork(1000)
+		}
+		type sresult struct {
+			id  PartyID
+			sig *Signature
+			err error
+		}
+		sresults := make(chan sresult, len(signers))
+		for _, p := range signers {
+			p := p
+			rn := &routingNetwork{self: p, nets: signNets, parties: signers}
+			net := &serializingNetwork{inner: rn}
+			go func() {
+				round := Sign(configs[p], signers, msg)
+				res, err := Run(context.Background(), round, net)
+				if err != nil {
+					sresults <- sresult{id: p, err: err}
+					return
+				}
+				sresults <- sresult{id: p, sig: res.(*Signature)}
+			}()
+		}
+
+		var iterErr error
+		for i := 0; i < len(signers); i++ {
+			r := <-sresults
+			if r.err != nil {
+				iterErr = fmt.Errorf("sign iter=%d party=%s: %v", iter, r.id, r.err)
+			}
+		}
+		if iterErr != nil {
+			t.Error(iterErr)
+			failures++
+		}
+	}
+	t.Logf("sign stress (serialized): %d/%d succeeded, %d failures (%.1f%%)",
+		iterations-failures, iterations, failures, float64(failures)/float64(iterations)*100)
+	if failures > 0 {
+		t.Errorf("sign stress (serialized) had %d failures out of %d iterations", failures, iterations)
+	}
+}
+
+// TestSignStressConcurrent runs multiple signing sessions in parallel within
+// the same process, sharing the frostMu. This simulates what happens in devnet
+// when participant nodes handle overlapping sessions.
+func TestSignStressConcurrent(t *testing.T) {
+	parties := []PartyID{"alice", "bob", "carol"}
+	threshold := 2
+	concurrency := 4
+	iterationsPerWorker := 50
+
+	// --- Keygen ---
+	nets := map[PartyID]*inMemNetwork{}
+	for _, p := range parties {
+		nets[p] = newInMemNetwork(1000)
+	}
+	type kresult struct {
+		id  PartyID
+		cfg *Config
+		err error
+	}
+	kresults := make(chan kresult, len(parties))
+	for _, p := range parties {
+		p := p
+		rn := &routingNetwork{self: p, nets: nets, parties: parties}
+		net := &serializingNetwork{inner: rn}
+		go func() {
+			round := Keygen(p, parties, threshold)
+			res, err := Run(context.Background(), round, net)
+			if err != nil {
+				kresults <- kresult{id: p, err: err}
+				return
+			}
+			kresults <- kresult{id: p, cfg: res.(*Config)}
+		}()
+	}
+	configs := map[PartyID]*Config{}
+	for i := 0; i < len(parties); i++ {
+		r := <-kresults
+		if r.err != nil {
+			t.Fatalf("keygen %s: %v", r.id, r.err)
+		}
+		configs[r.id] = r.cfg
+	}
+
+	// JSON round-trip configs (like bbolt storage).
+	for pid, cfg := range configs {
+		data, err := json.Marshal(cfg)
+		if err != nil {
+			t.Fatalf("marshal config %s: %v", pid, err)
+		}
+		cfg2 := new(Config)
+		if err := json.Unmarshal(data, cfg2); err != nil {
+			t.Fatalf("unmarshal config %s: %v", pid, err)
+		}
+		configs[pid] = cfg2
+	}
+
+	// --- Concurrent signing sessions ---
+	type sresult struct {
+		iter int
+		err  error
+	}
+	results := make(chan sresult, concurrency*iterationsPerWorker)
+
+	for w := 0; w < concurrency; w++ {
+		go func(workerID int) {
+			for iter := 0; iter < iterationsPerWorker; iter++ {
+				msg := make([]byte, 32)
+				rand.Read(msg)
+
+				signers := parties
+				signNets := map[PartyID]*inMemNetwork{}
+				for _, p := range signers {
+					signNets[p] = newInMemNetwork(1000)
+				}
+
+				done := make(chan error, len(signers))
+				for _, p := range signers {
+					p := p
+					rn := &routingNetwork{self: p, nets: signNets, parties: signers}
+					net := &serializingNetwork{inner: rn}
+					go func() {
+						round := Sign(configs[p], signers, msg)
+						_, err := Run(context.Background(), round, net)
+						done <- err
+					}()
+				}
+
+				var firstErr error
+				for i := 0; i < len(signers); i++ {
+					if err := <-done; err != nil && firstErr == nil {
+						firstErr = err
+					}
+				}
+				results <- sresult{iter: workerID*iterationsPerWorker + iter, err: firstErr}
+			}
+		}(w)
+	}
+
+	total := concurrency * iterationsPerWorker
+	var failures int
+	for i := 0; i < total; i++ {
+		r := <-results
+		if r.err != nil {
+			t.Errorf("concurrent sign iter=%d: %v", r.iter, r.err)
+			failures++
+		}
+	}
+	t.Logf("concurrent sign stress: %d/%d succeeded, %d failures (%.1f%%)",
+		total-failures, total, failures, float64(failures)/float64(total)*100)
+	if failures > 0 {
+		t.Errorf("concurrent sign stress had %d failures out of %d", failures, total)
 	}
 }

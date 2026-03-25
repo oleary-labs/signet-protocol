@@ -50,6 +50,13 @@ type Summary struct {
 	P95        time.Duration
 	P99        time.Duration
 	Duration   time.Duration
+	TopErrors  []ErrorCount // up to 5 most frequent error messages
+}
+
+// ErrorCount holds a distinct error message and how many times it occurred.
+type ErrorCount struct {
+	Msg   string
+	Count int
 }
 
 // Summarise computes a Summary for ops matching scenario and operation.
@@ -58,7 +65,7 @@ func (c *Collector) Summarise(scenario, operation string, elapsed time.Duration)
 	defer c.mu.Unlock()
 
 	var latencies []time.Duration
-	var errs int
+	errCounts := make(map[string]int)
 	for _, op := range c.ops {
 		if op.Scenario != scenario || op.Operation != operation {
 			continue
@@ -66,8 +73,30 @@ func (c *Collector) Summarise(scenario, operation string, elapsed time.Duration)
 		if op.OK {
 			latencies = append(latencies, op.Latency)
 		} else {
-			errs++
+			errCounts[op.ErrMsg]++
 		}
+	}
+	errs := 0
+	for _, n := range errCounts {
+		errs += n
+	}
+
+	// Build sorted top-errors list (up to 5).
+	type kv struct {
+		k string
+		v int
+	}
+	var pairs []kv
+	for k, v := range errCounts {
+		pairs = append(pairs, kv{k, v})
+	}
+	sort.Slice(pairs, func(i, j int) bool { return pairs[i].v > pairs[j].v })
+	var topErrors []ErrorCount
+	for i, p := range pairs {
+		if i >= 5 {
+			break
+		}
+		topErrors = append(topErrors, ErrorCount{Msg: p.k, Count: p.v})
 	}
 
 	total := len(latencies) + errs
@@ -78,6 +107,7 @@ func (c *Collector) Summarise(scenario, operation string, elapsed time.Duration)
 		Successes: len(latencies),
 		Errors:    errs,
 		Duration:  elapsed,
+		TopErrors: topErrors,
 	}
 	if elapsed > 0 {
 		s.Throughput = float64(total) / elapsed.Seconds()

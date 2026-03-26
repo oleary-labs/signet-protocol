@@ -18,13 +18,15 @@ type ScaleConfig struct {
 }
 
 // RunScale sweeps concurrency from Step to MaxConcurrency and prints a table.
-func RunScale(ctx context.Context, c *Client, newKeyID func() string, cfg ScaleConfig, outPath string) error {
-	fmt.Printf("\n=== Scalability  max-concurrency=%d  step=%d  duration-per-level=%s ===\n",
-		cfg.MaxConcurrency, cfg.Step, cfg.Duration)
+func RunScale(ctx context.Context, clients []*Client, newKeyID func() string, cfg ScaleConfig, outPath string) error {
+	ring := NewClientRing(clients)
+
+	fmt.Printf("\n=== Scalability  max-concurrency=%d  step=%d  duration-per-level=%s  nodes=%d ===\n",
+		cfg.MaxConcurrency, cfg.Step, cfg.Duration, ring.Len())
 
 	const signMsg = "0x0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20"
 
-	pool, err := BuildKeyPool(ctx, c, cfg.PoolSize, newKeyID)
+	pool, err := BuildKeyPool(ctx, ring, cfg.PoolSize, newKeyID)
 	if err != nil {
 		return fmt.Errorf("build key pool: %w", err)
 	}
@@ -49,6 +51,7 @@ func RunScale(ctx context.Context, c *Client, newKeyID func() string, cfg ScaleC
 						return
 					default:
 					}
+					c := ring.Next()
 					e := pool.Next()
 					recordOp(coll, "concurrency-sweep", "sign", func() error {
 						_, err := c.Sign(ctx, e.KeyID, signMsg)

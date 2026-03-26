@@ -122,7 +122,7 @@ func run() error {
 			Duration:       *scaleDur,
 			PoolSize:       *scalePool,
 		}
-		if err := RunScale(ctx, clients[0], newKeyID, cfg, *outFile); err != nil {
+		if err := RunScale(ctx, clients, newKeyID, cfg, *outFile); err != nil {
 			return err
 		}
 

@@ -18,20 +18,22 @@ type PerfConfig struct {
 
 // RunPerf runs all performance scenarios and prints summaries.
 func RunPerf(ctx context.Context, clients []*Client, newKeyID func() string, cfg PerfConfig, coll *metrics.Collector) error {
-	c0 := clients[0]
+	ring := NewClientRing(clients)
 
-	fmt.Printf("\n=== Performance  concurrency=%d  duration=%s ===\n", cfg.Concurrency, cfg.Duration)
+	fmt.Printf("\n=== Performance  concurrency=%d  duration=%s  nodes=%d ===\n",
+		cfg.Concurrency, cfg.Duration, ring.Len())
 
-	// 1. Sequential baseline.
+	// 1. Sequential baseline (round-robins initiator across nodes).
 	fmt.Println("\n  [sequential-baseline]")
-	if err := runSequentialBaseline(ctx, c0, newKeyID, cfg.Duration, coll); err != nil {
+	if err := runSequentialBaseline(ctx, ring, newKeyID, cfg.Duration, coll); err != nil {
 		return err
 	}
 
 	// 2. Concurrent keygen.
 	fmt.Println("\n  [concurrent-keygen]")
-	if err := runConcurrentOp(ctx, c0, cfg, coll, "concurrent-keygen", "keygen", func() error {
-		_, err := c0.Keygen(ctx, newKeyID())
+	if err := runConcurrentOp(ctx, cfg, coll, "concurrent-keygen", "keygen", func() error {
+		c := ring.Next()
+		_, err := c.Keygen(ctx, newKeyID())
 		return err
 	}); err != nil {
 		return err
@@ -39,14 +41,15 @@ func RunPerf(ctx context.Context, clients []*Client, newKeyID func() string, cfg
 
 	// 3. Concurrent sign — pre-build key pool.
 	fmt.Println("\n  [concurrent-sign]")
-	pool, err := BuildKeyPool(ctx, c0, cfg.PoolSize, newKeyID)
+	pool, err := BuildKeyPool(ctx, ring, cfg.PoolSize, newKeyID)
 	if err != nil {
 		return fmt.Errorf("build key pool: %w", err)
 	}
 	const signMsg = "0x0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20"
-	if err := runConcurrentOp(ctx, c0, cfg, coll, "concurrent-sign", "sign", func() error {
+	if err := runConcurrentOp(ctx, cfg, coll, "concurrent-sign", "sign", func() error {
+		c := ring.Next()
 		e := pool.Next()
-		_, err := c0.Sign(ctx, e.KeyID, signMsg)
+		_, err := c.Sign(ctx, e.KeyID, signMsg)
 		return err
 	}); err != nil {
 		return err
@@ -54,24 +57,26 @@ func RunPerf(ctx context.Context, clients []*Client, newKeyID func() string, cfg
 
 	// 4. Mixed load.
 	fmt.Println("\n  [mixed-load]")
-	if err := runMixedLoad(ctx, c0, cfg, newKeyID, pool, signMsg, coll); err != nil {
+	if err := runMixedLoad(ctx, ring, cfg, newKeyID, pool, signMsg, coll); err != nil {
 		return err
 	}
 
 	return nil
 }
 
-func runSequentialBaseline(ctx context.Context, c *Client, newKeyID func() string, dur time.Duration, coll *metrics.Collector) error {
+func runSequentialBaseline(ctx context.Context, ring *ClientRing, newKeyID func() string, dur time.Duration, coll *metrics.Collector) error {
 	deadline := time.Now().Add(dur)
 	start := time.Now()
 	for time.Now().Before(deadline) {
 		kid := newKeyID()
+		c := ring.Next()
 		recordOp(coll, "sequential-baseline", "keygen", func() error {
 			_, err := c.Keygen(ctx, kid)
 			return err
 		})
+		c2 := ring.Next()
 		recordOp(coll, "sequential-baseline", "sign", func() error {
-			_, err := c.Sign(ctx, kid,
+			_, err := c2.Sign(ctx, kid,
 				"0x0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20")
 			return err
 		})
@@ -82,7 +87,7 @@ func runSequentialBaseline(ctx context.Context, c *Client, newKeyID func() strin
 	return nil
 }
 
-func runConcurrentOp(ctx context.Context, _ *Client, cfg PerfConfig, coll *metrics.Collector, scenario, op string, fn func() error) error {
+func runConcurrentOp(ctx context.Context, cfg PerfConfig, coll *metrics.Collector, scenario, op string, fn func() error) error {
 	var wg sync.WaitGroup
 	stop := make(chan struct{})
 	start := time.Now()
@@ -110,7 +115,7 @@ func runConcurrentOp(ctx context.Context, _ *Client, cfg PerfConfig, coll *metri
 	return nil
 }
 
-func runMixedLoad(ctx context.Context, c *Client, cfg PerfConfig, newKeyID func() string, pool *KeyPool, signMsg string, coll *metrics.Collector) error {
+func runMixedLoad(ctx context.Context, ring *ClientRing, cfg PerfConfig, newKeyID func() string, pool *KeyPool, signMsg string, coll *metrics.Collector) error {
 	const scenario = "mixed-load"
 	var wg sync.WaitGroup
 	stop := make(chan struct{})
@@ -132,6 +137,7 @@ func runMixedLoad(ctx context.Context, c *Client, cfg PerfConfig, newKeyID func(
 					return
 				default:
 				}
+				c := ring.Next()
 				recordOp(coll, scenario, "keygen", func() error {
 					_, err := c.Keygen(ctx, newKeyID())
 					return err
@@ -150,6 +156,7 @@ func runMixedLoad(ctx context.Context, c *Client, cfg PerfConfig, newKeyID func(
 					return
 				default:
 				}
+				c := ring.Next()
 				e := pool.Next()
 				recordOp(coll, scenario, "sign", func() error {
 					_, err := c.Sign(ctx, e.KeyID, signMsg)

@@ -230,11 +230,12 @@ func (p *KeyPool) Next() KeyPoolEntry {
 	return e
 }
 
-// BuildKeyPool pre-generates n keys via client.
-func BuildKeyPool(ctx context.Context, c *Client, n int, newKeyID func() string) (*KeyPool, error) {
+// BuildKeyPool pre-generates n keys, distributing keygen requests across the ring.
+func BuildKeyPool(ctx context.Context, ring *ClientRing, n int, newKeyID func() string) (*KeyPool, error) {
 	pool := &KeyPool{}
-	fmt.Printf("  building key pool (%d keys)...", n)
+	fmt.Printf("  building key pool (%d keys, %d nodes)...", n, ring.Len())
 	for i := 0; i < n; i++ {
+		c := ring.Next()
 		resp, err := c.Keygen(ctx, newKeyID())
 		if err != nil {
 			return nil, fmt.Errorf("keygen pool[%d]: %w", i, err)

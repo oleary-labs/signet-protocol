@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sync/atomic"
 	"time"
 )
 
@@ -131,4 +132,26 @@ func IsHTTPError(err error) *HTTPError {
 		return e
 	}
 	return nil
+}
+
+// ClientRing distributes requests across multiple clients in round-robin order.
+type ClientRing struct {
+	clients []*Client
+	counter atomic.Uint64
+}
+
+// NewClientRing creates a ring from the given clients.
+func NewClientRing(clients []*Client) *ClientRing {
+	return &ClientRing{clients: clients}
+}
+
+// Next returns the next client in round-robin order.
+func (r *ClientRing) Next() *Client {
+	idx := r.counter.Add(1) - 1
+	return r.clients[idx%uint64(len(r.clients))]
+}
+
+// Len returns the number of clients in the ring.
+func (r *ClientRing) Len() int {
+	return len(r.clients)
 }

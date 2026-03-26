@@ -160,6 +160,13 @@ func (n *Node) handleCoordStream(s libp2pnet.Stream) {
 
 	switch msg.Type {
 	case msgKeygen:
+		if cfg, _ := n.cachedConfig(msg.GroupID, msg.KeyID); cfg != nil {
+			n.log.Warn("coord: keygen rejected, key already exists",
+				zap.String("group_id", msg.GroupID),
+				zap.String("key_id", msg.KeyID))
+			return
+		}
+
 		sessID := keygenSessionID(msg.GroupID, msg.KeyID)
 		sn, err := network.NewSessionNetwork(n.ctx, n.host, sessID, msg.Parties)
 		if err != nil {

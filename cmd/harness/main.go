@@ -79,10 +79,11 @@ func run() error {
 	}
 	fmt.Println("ok")
 
-	// Key ID generator — unique within this run.
+	// Key ID generator — unique across runs via millisecond timestamp prefix.
 	var keySeq atomic.Uint64
+	keyPrefix := time.Now().UnixMilli()
 	newKeyID := func() string {
-		return fmt.Sprintf("harness-%d", keySeq.Add(1))
+		return fmt.Sprintf("harness-%d-%d", keyPrefix, keySeq.Add(1))
 	}
 
 	coll := &metrics.Collector{}

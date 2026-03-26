@@ -644,6 +644,11 @@ func (n *Node) handleKeygen(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if cfg, _ := n.cachedConfig(req.GroupID, keyID); cfg != nil {
+		httpError(w, http.StatusConflict, fmt.Sprintf("key already exists: group=%s key=%s", req.GroupID, keyID))
+		return
+	}
+
 	sortedParties := tss.NewPartyIDSlice(grp.Members)
 	sessID := keygenSessionID(req.GroupID, keyID)
 

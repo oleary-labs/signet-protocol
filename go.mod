@@ -7,7 +7,7 @@ toolchain go1.24.10
 require (
 	github.com/bytemare/dkg v0.0.0-20241007182121-23ea4d549880
 	github.com/bytemare/ecc v0.8.2
-	github.com/bytemare/frost v0.0.0-20241019112700-8c6db5b04145
+	github.com/bytemare/frost v0.0.0-20260326110248-5128efc25b2f
 	github.com/bytemare/secret-sharing v0.7.0
 	github.com/decred/dcrd/dcrec/secp256k1/v4 v4.4.0
 	github.com/ethereum/go-ethereum v1.17.1
@@ -159,3 +159,5 @@ require (
 	google.golang.org/protobuf v1.36.11 // indirect
 	lukechampine.com/blake3 v1.4.1 // indirect
 )
+
+replace github.com/bytemare/frost => github.com/oleary-labs/frost v0.0.0-20260326110248-5128efc25b2f

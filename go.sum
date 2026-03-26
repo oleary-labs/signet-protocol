@@ -23,8 +23,6 @@ github.com/bytemare/dkg v0.0.0-20241007182121-23ea4d549880 h1:KoEDglTZoJx0EaWdmY
 github.com/bytemare/dkg v0.0.0-20241007182121-23ea4d549880/go.mod h1:szhmKyIBs11r5IPo/jGqwxfmnpELmbj8okgdKxA+QVs=
 github.com/bytemare/ecc v0.8.2 h1:MN+Ah48hApFpzJgIMa1xOrK7/R5uwCV06dtJyuHAi3Y=
 github.com/bytemare/ecc v0.8.2/go.mod h1:dvkSikSCejw8YaTdJs6lZSN4qz9B4PC5PtGq+CRDmHk=
-github.com/bytemare/frost v0.0.0-20241019112700-8c6db5b04145 h1:l9EW+NGLeOrDSl7UA6OHJFLVRnFWbMM6bGMLfOrAGKA=
-github.com/bytemare/frost v0.0.0-20241019112700-8c6db5b04145/go.mod h1:WDSt6nC6QyLLrb181aQF2Niuqtxb4+MpCa9TylmmfLQ=
 github.com/bytemare/hash v0.3.0 h1:RqFMt3mqpF7UxLdjBrsOZm/2cz0cQiAOnYc9gDLopWE=
 github.com/bytemare/hash v0.3.0/go.mod h1:YKOBchL0l8hRLFinVCL8YUKokGNIMhrWEHPHo3EV7/M=
 github.com/bytemare/hash2curve v0.3.0 h1:41Npcbc+u/E252A5aCMtxDcz7JPkkX1QzShneTFm4eg=
@@ -273,6 +271,8 @@ github.com/multiformats/go-varint v0.1.0 h1:i2wqFp4sdl3IcIxfAonHQV9qU5OsZ4Ts9IOo
 github.com/multiformats/go-varint v0.1.0/go.mod h1:5KVAVXegtfmNQQm/lCY+ATvDzvJJhSkUlGQV9wgObdI=
 github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822 h1:C3w9PqII01/Oq1c1nUAm88MOHcQC9l5mIlSMApZMrHA=
 github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822/go.mod h1:+n7T8mK8HuQTcFwEeznm/DIxMOiR9yIdICNftLE1DvQ=
+github.com/oleary-labs/frost v0.0.0-20260326110248-5128efc25b2f h1:kyBbu4Dzlx5+WZTMQ/pcAXqGQpZoDYUi9GbEcYr6hfQ=
+github.com/oleary-labs/frost v0.0.0-20260326110248-5128efc25b2f/go.mod h1:WDSt6nC6QyLLrb181aQF2Niuqtxb4+MpCa9TylmmfLQ=
 github.com/pbnjay/memory v0.0.0-20210728143218-7b4eea64cf58 h1:onHthvaw9LFnH4t2DcNVpwGmV9E1BkGknEliJkfwQj0=
 github.com/pbnjay/memory v0.0.0-20210728143218-7b4eea64cf58/go.mod h1:DXv8WO4yhMYhSNPKjeNKa5WY9YCIEBRbNzFFPJbWO6Y=
 github.com/pion/datachannel v1.5.10 h1:ly0Q26K1i6ZkGf42W7D4hQYR90pZwzFOjTq5AuCKk4o=

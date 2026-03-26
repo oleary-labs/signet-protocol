@@ -259,7 +259,9 @@ func (n *Node) handleCoordStream(s libp2pnet.Stream) {
 }
 
 // broadcastCoord sends msg to each party in targets (excluding self) over a
-// direct libp2p stream, and waits for a ready ACK from each.
+// direct libp2p stream, and waits for a ready ACK from each. Peer streams are
+// opened in parallel so the total latency is bounded by the slowest peer rather
+// than the sum of all peers.
 func (n *Node) broadcastCoord(ctx context.Context, targets []tss.PartyID, msg coordMsg) error {
 	self := n.host.Self()
 
@@ -268,29 +270,51 @@ func (n *Node) broadcastCoord(ctx context.Context, targets []tss.PartyID, msg co
 		return fmt.Errorf("marshal coord msg: %w", err)
 	}
 
+	type result struct {
+		party tss.PartyID
+		err   error
+	}
+
+	var peers []tss.PartyID
 	for _, pid := range targets {
-		if pid == self {
-			continue
+		if pid != self {
+			peers = append(peers, pid)
 		}
+	}
+
+	ch := make(chan result, len(peers))
+	for _, pid := range peers {
+		pid := pid
 		peerID, ok := n.host.PeerForParty(pid)
 		if !ok {
 			return fmt.Errorf("no connected peer for party %s", pid)
 		}
-		s, err := n.host.LibP2PHost().NewStream(ctx, peerID, coordProtocol)
-		if err != nil {
-			return fmt.Errorf("coord stream to %s: %w", pid, err)
+		go func() {
+			s, err := n.host.LibP2PHost().NewStream(ctx, peerID, coordProtocol)
+			if err != nil {
+				ch <- result{pid, fmt.Errorf("coord stream to %s: %w", pid, err)}
+				return
+			}
+			defer s.Close()
+			if _, err := s.Write(payload); err != nil {
+				ch <- result{pid, fmt.Errorf("write coord to %s: %w", pid, err)}
+				return
+			}
+			ack := make([]byte, 1)
+			if _, err := io.ReadFull(s, ack); err != nil {
+				ch <- result{pid, fmt.Errorf("ack from %s: %w", pid, err)}
+				return
+			}
+			ch <- result{pid, nil}
+		}()
+	}
+
+	for range peers {
+		r := <-ch
+		if r.err != nil {
+			return r.err
 		}
-		if _, err := s.Write(payload); err != nil {
-			s.Close()
-			return fmt.Errorf("write coord to %s: %w", pid, err)
-		}
-		ack := make([]byte, 1)
-		if _, err := io.ReadFull(s, ack); err != nil {
-			s.Close()
-			return fmt.Errorf("ack from %s: %w", pid, err)
-		}
-		s.Close()
-		n.log.Debug("coord: party ready", zap.String("party", string(pid)))
+		n.log.Debug("coord: party ready", zap.String("party", string(r.party)))
 	}
 
 	return nil

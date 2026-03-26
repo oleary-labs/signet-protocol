@@ -8,13 +8,6 @@ import (
 	"github.com/fxamacker/cbor/v2"
 )
 
-// frostMu serializes all calls into bytemare/frost that touch the shared Ciphersuite
-// hasher. frost.Secp256k1 stores a hash.Fixed that is not goroutine-safe; Sign,
-// AggregateSignatures, and VerifySignature all use it. In production each signer runs
-// in its own OS process so this is only a concern when running multiple sessions
-// concurrently in the same process (e.g., tests).
-var frostMu sync.Mutex
-
 // signCommitPayload is the round-1 broadcast payload (nonce commitment).
 type signCommitPayload struct {
 	Commitment []byte `cbor:"c"` // frost.Commitment.Encode()
@@ -137,11 +130,7 @@ func (r *signCommitRound) Finalize() ([]*Message, Round, interface{}, error) {
 	}
 	commitList.Sort()
 
-	// Sign with our signer. Serialize via frostMu because bytemare/frost's
-	// Ciphersuite contains a shared hasher that is not goroutine-safe.
-	frostMu.Lock()
 	sigShare, err := r.signer.Sign(r.message, commitList)
-	frostMu.Unlock()
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("sign round1: sign: %w", err)
 	}
@@ -220,10 +209,7 @@ func (r *signAggregateRound) Finalize() ([]*Message, Round, interface{}, error) 
 		sigShares = append(sigShares, ss)
 	}
 
-	// Aggregate and verify. Serialize via frostMu (shared ciphersuite hasher).
-	frostMu.Lock()
 	frostSig, err := r.frostCfg.AggregateSignatures(r.message, sigShares, r.commitList, true)
-	frostMu.Unlock()
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("sign round2: aggregate: %w", err)
 	}

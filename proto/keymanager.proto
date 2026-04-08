@@ -1,0 +1,128 @@
+syntax = "proto3";
+
+package signet.kms.v1;
+
+option go_package = "signet/kms/kmspb";
+
+// KeyManager is the gRPC interface between the signet node (Go) and the KMS
+// process (Rust). The node acts as a message router; the KMS holds key material
+// and executes FROST protocol rounds.
+service KeyManager {
+  // Session lifecycle --------------------------------------------------------
+
+  // StartSession initialises a new keygen, signing, or reshare session inside
+  // the KMS. The KMS allocates internal state and returns any first-round
+  // messages the node should broadcast.
+  rpc StartSession(StartSessionRequest) returns (StartSessionResponse);
+
+  // ProcessMessage is a bidirectional stream for the duration of a session.
+  // The node feeds incoming peer messages and reads back outgoing messages to
+  // forward. The KMS drives the FROST round loop internally.
+  rpc ProcessMessage(stream SessionMessage) returns (stream SessionMessage);
+
+  // AbortSession tears down a session, releasing all associated state.
+  rpc AbortSession(AbortSessionRequest) returns (AbortSessionResponse);
+
+  // Key queries (no key material crosses the boundary) -----------------------
+
+  // GetPublicKey returns the group public key and this node's verifying share.
+  rpc GetPublicKey(KeyRef) returns (PublicKeyResponse);
+
+  // ListKeys returns all key IDs stored for a group.
+  rpc ListKeys(GroupRef) returns (KeyListResponse);
+}
+
+// ---------------------------------------------------------------------------
+// Enums
+// ---------------------------------------------------------------------------
+
+enum SessionType {
+  SESSION_TYPE_UNSPECIFIED = 0;
+  SESSION_TYPE_KEYGEN      = 1;
+  SESSION_TYPE_SIGN        = 2;
+  SESSION_TYPE_RESHARE     = 3;
+}
+
+// ---------------------------------------------------------------------------
+// Session lifecycle
+// ---------------------------------------------------------------------------
+
+message StartSessionRequest {
+  string       session_id = 1;
+  SessionType  type       = 2;
+  bytes        params     = 3; // session-type-specific params (see below)
+}
+
+// KeygenParams are CBOR-encoded inside StartSessionRequest.params when
+// type == SESSION_TYPE_KEYGEN.
+//
+// Fields (documented here for reference; actual encoding is CBOR):
+//   group_id       bytes   — 32-byte group identifier
+//   key_id         string  — human-readable key name
+//   party_id       uint16  — this node's FROST identifier (1-based)
+//   party_ids      []uint16— all participant identifiers
+//   threshold      uint16  — minimum signers required (t of n)
+
+// SignParams are CBOR-encoded inside StartSessionRequest.params when
+// type == SESSION_TYPE_SIGN.
+//
+// Fields:
+//   group_id       bytes
+//   key_id         string
+//   party_id       uint16
+//   party_ids      []uint16
+//   message        bytes   — the message hash to sign (32 bytes)
+
+// ReshareParams are CBOR-encoded inside StartSessionRequest.params when
+// type == SESSION_TYPE_RESHARE.
+//
+// Fields:
+//   group_id       bytes
+//   key_id         string
+//   old_party_id   uint16  — 0 if this node is new-only
+//   new_party_id   uint16  — 0 if this node is old-only
+//   old_party_ids  []uint16
+//   new_party_ids  []uint16
+//   old_threshold  uint16
+//   new_threshold  uint16
+
+message StartSessionResponse {
+  // First-round outgoing messages the node should broadcast to peers.
+  repeated SessionMessage outgoing = 1;
+}
+
+message SessionMessage {
+  string session_id = 1;
+  string from       = 2; // sender PartyID
+  string to         = 3; // recipient PartyID; empty = broadcast
+  bytes  payload    = 4; // opaque FROST round message bytes
+}
+
+message AbortSessionRequest {
+  string session_id = 1;
+}
+
+message AbortSessionResponse {}
+
+// ---------------------------------------------------------------------------
+// Key queries
+// ---------------------------------------------------------------------------
+
+message KeyRef {
+  bytes  group_id = 1; // 32-byte group identifier
+  string key_id   = 2;
+}
+
+message GroupRef {
+  bytes group_id = 1;
+}
+
+message PublicKeyResponse {
+  bytes  group_key       = 1; // 33-byte compressed secp256k1 point
+  bytes  verifying_share = 2; // this node's public key share
+  uint64 generation      = 3;
+}
+
+message KeyListResponse {
+  repeated string key_ids = 1;
+}

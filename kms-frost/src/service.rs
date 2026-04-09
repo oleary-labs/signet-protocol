@@ -110,7 +110,16 @@ impl KeyManager for KmsService {
         let (tx, rx) = tokio::sync::mpsc::channel(64);
 
         tokio::spawn(async move {
-            while let Ok(Some(msg)) = in_stream.message().await {
+            loop {
+                let msg_result = in_stream.message().await;
+                let msg = match msg_result {
+                    Ok(Some(msg)) => msg,
+                    Ok(None) => return,
+                    Err(e) => {
+                        warn!(error = %e, "process_message stream error");
+                        return;
+                    }
+                };
                 let session_id = msg.session_id.clone();
 
                 let mut sessions_guard = sessions.lock().await;

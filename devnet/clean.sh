@@ -24,7 +24,16 @@ for n in 1 2 3; do
     fi
 done
 
-# Generated config files and logs.
+# KMS data directories.
+for n in 1 2 3; do
+    dir="$DEVNET/data/kms${n}"
+    if [[ -d "$dir" ]]; then
+        rm -rf "$dir"
+        echo "  removed $dir"
+    fi
+done
+
+# Generated config files, logs, and sockets.
 for f in \
     "$DEVNET/node1.yaml" \
     "$DEVNET/node2.yaml" \
@@ -33,6 +42,12 @@ for f in \
     "$DEVNET/node1.log" \
     "$DEVNET/node2.log" \
     "$DEVNET/node3.log" \
+    "$DEVNET/kms1.log" \
+    "$DEVNET/kms2.log" \
+    "$DEVNET/kms3.log" \
+    "$DEVNET/kms1.sock" \
+    "$DEVNET/kms2.sock" \
+    "$DEVNET/kms3.sock" \
     "$DEVNET/.env"
 do
     if [[ -f "$f" ]]; then

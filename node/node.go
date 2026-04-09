@@ -93,7 +93,7 @@ func New(cfg *Config, log *zap.Logger) (*Node, error) {
 	// configured, LocalKeyManager (in-process tss) otherwise.
 	var km KeyManager
 	if cfg.KMSSocket != "" {
-		rkm, err := NewRemoteKeyManager(ctx, cfg.KMSSocket)
+		rkm, err := NewRemoteKeyManager(ctx, cfg.KMSSocket, tss.PartyID(h.Self()))
 		if err != nil {
 			h.Close()
 			cancel()

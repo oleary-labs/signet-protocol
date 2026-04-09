@@ -3,9 +3,23 @@
 #   • anvil  (local EVM, port 8545)
 #   • SignetFactory deployed and all three nodes registered on-chain
 #   • A SignetGroup created with all three nodes as members
+#   • kms-frost instances (one per node, unless --no-kms)
 #   • signetd node{1,2,3} with p2p + HTTP APIs
+#
+# Usage:
+#   devnet/start.sh          # default: nodes use external Rust KMS
+#   devnet/start.sh --no-kms # nodes use in-process Go TSS (no KMS)
 
 set -euo pipefail
+
+# Parse flags.
+USE_KMS=true
+for arg in "$@"; do
+    case "$arg" in
+        --no-kms) USE_KMS=false ;;
+        *) echo "Unknown flag: $arg" >&2; exit 1 ;;
+    esac
+done
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 DEVNET="$REPO/devnet"
@@ -45,6 +59,13 @@ cd "$REPO"
 mkdir -p "$BUILD"
 go build -o "$BUILD/signetd"     ./cmd/signetd
 go build -o "$BUILD/devnet-init" ./cmd/devnet-init
+
+if $USE_KMS; then
+    info "Building kms-frost..."
+    command -v cargo >/dev/null 2>&1 || die "'cargo' not found — install Rust (https://rustup.rs)"
+    (cd "$REPO/kms-frost" && cargo build --release --quiet)
+    cp "$REPO/kms-frost/target/release/kms-frost" "$BUILD/kms-frost"
+fi
 
 # --------------------------------------------------------------------------
 # 2. Generate (or load) node identity keys
@@ -192,6 +213,10 @@ node_type: public
 eth_rpc: ${RPC}
 factory_address: ${FACTORY}
 EOF
+
+    if $USE_KMS; then
+        echo "kms_socket: ${DEVNET}/kms${n}.sock" >> "$DEVNET/node${n}.yaml"
+    fi
 }
 
 write_config 1 9000 8080
@@ -199,7 +224,38 @@ write_config 2 9001 8081
 write_config 3 9002 8082
 
 # --------------------------------------------------------------------------
-# 8. Start signet nodes
+# 8. Start KMS instances (if enabled)
+# --------------------------------------------------------------------------
+if $USE_KMS; then
+    info "Starting KMS instances..."
+
+    for i in 1 2 3; do
+        KMS_SOCK="$DEVNET/kms${i}.sock"
+        KMS_DATA="$DEVNET/data/kms${i}"
+        mkdir -p "$KMS_DATA"
+
+        # Remove stale socket.
+        rm -f "$KMS_SOCK"
+
+        RUST_LOG=kms_frost=info "$BUILD/kms-frost" "$KMS_SOCK" "$KMS_DATA" \
+            > "$DEVNET/kms${i}.log" 2>&1 &
+        echo "KMS${i}_PID=$!" >> "$PIDS_FILE"
+    done
+
+    # Wait for KMS sockets to appear (up to 5 s).
+    for i in 1 2 3; do
+        KMS_SOCK="$DEVNET/kms${i}.sock"
+        for attempt in $(seq 1 20); do
+            [[ -S "$KMS_SOCK" ]] && break
+            sleep 0.25
+            [[ $attempt -eq 20 ]] && die "kms${i} socket did not appear — see devnet/kms${i}.log"
+        done
+        echo "    kms${i} ready: $KMS_SOCK"
+    done
+fi
+
+# --------------------------------------------------------------------------
+# 9. Start signet nodes
 # --------------------------------------------------------------------------
 info "Starting signet nodes..."
 
@@ -226,7 +282,7 @@ wait_http "http://localhost:8081/v1/health" "node2"
 wait_http "http://localhost:8082/v1/health" "node3"
 
 # --------------------------------------------------------------------------
-# 9. Write .env summary and print status
+# 10. Write .env summary and print status
 # --------------------------------------------------------------------------
 cat > "$ENV_FILE" <<EOF
 RPC_URL=${RPC}
@@ -243,6 +299,7 @@ NODE3_ETH=${ADDR_3}
 NODE1_API=http://localhost:8080
 NODE2_API=http://localhost:8081
 NODE3_API=http://localhost:8082
+USE_KMS=${USE_KMS}
 EOF
 
 echo ""
@@ -252,13 +309,22 @@ echo "  Chain RPC : $RPC"
 echo "  Factory   : $FACTORY"
 echo "  Beacon    : $BEACON"
 echo "  Group     : $GROUP  (threshold=2, nodes=3)"
+if $USE_KMS; then
+echo "  KMS       : Rust kms-frost (devnet/kms{1,2,3}.sock)"
+else
+echo "  KMS       : disabled (in-process Go TSS)"
+fi
 echo ""
 echo "  node1  eth=${ADDR_1}  api=:8080  p2p=:9000"
 echo "  node2  eth=${ADDR_2}  api=:8081  p2p=:9001"
 echo "  node3  eth=${ADDR_3}  api=:8082  p2p=:9002"
 echo ""
 echo "  Env file  : devnet/.env"
-echo "  Logs      : devnet/{anvil,node1,node2,node3}.log"
+if $USE_KMS; then
+echo "  Logs      : devnet/{anvil,kms{1,2,3},node{1,2,3}}.log"
+else
+echo "  Logs      : devnet/{anvil,node{1,2,3}}.log"
+fi
 echo "  Stop      : devnet/stop.sh"
 echo ""
 echo "Quick test:"

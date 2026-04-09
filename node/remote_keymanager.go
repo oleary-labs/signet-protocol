@@ -5,11 +5,14 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
+	"strings"
 	"sync"
 
 	"github.com/fxamacker/cbor/v2"
 	"google.golang.org/grpc"
+	codes "google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
+	grpcstatus "google.golang.org/grpc/status"
 
 	"signet/kms/kmspb"
 	"signet/tss"
@@ -21,11 +24,12 @@ type RemoteKeyManager struct {
 	socket string
 	conn   *grpc.ClientConn
 	client kmspb.KeyManagerClient
+	selfID tss.PartyID // this node's party ID (peer ID)
 }
 
 // NewRemoteKeyManager creates a RemoteKeyManager that connects to the KMS at
 // the given Unix socket path.
-func NewRemoteKeyManager(ctx context.Context, socket string) (*RemoteKeyManager, error) {
+func NewRemoteKeyManager(ctx context.Context, socket string, selfID tss.PartyID) (*RemoteKeyManager, error) {
 	conn, err := grpc.NewClient(
 		"unix://"+socket,
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
@@ -38,6 +42,7 @@ func NewRemoteKeyManager(ctx context.Context, socket string) (*RemoteKeyManager,
 		socket: socket,
 		conn:   conn,
 		client: kmspb.NewKeyManagerClient(conn),
+		selfID: selfID,
 	}, nil
 }
 
@@ -112,23 +117,28 @@ func (rkm *RemoteKeyManager) RunSign(ctx context.Context, p SignParams) (*tss.Si
 }
 
 // GetKeyInfo returns public metadata for a stored key.
+// Returns (nil, nil) if the key does not exist (matching KeyManager contract).
 func (rkm *RemoteKeyManager) GetKeyInfo(groupID, keyID string) (*KeyInfo, error) {
-	gid, _ := hex.DecodeString(groupID)
+	gid, _ := hex.DecodeString(strings.TrimPrefix(groupID, "0x"))
 	resp, err := rkm.client.GetPublicKey(context.Background(), &kmspb.KeyRef{
 		GroupId: gid,
 		KeyId:   keyID,
 	})
 	if err != nil {
+		if st, ok := grpcstatus.FromError(err); ok && st.Code() == codes.NotFound {
+			return nil, nil
+		}
 		return nil, err
 	}
 	return &KeyInfo{
 		GroupKey: resp.GroupKey,
+		PartyID:  rkm.selfID,
 	}, nil
 }
 
 // ListKeys returns all key IDs stored under groupID.
 func (rkm *RemoteKeyManager) ListKeys(groupID string) ([]string, error) {
-	gid, _ := hex.DecodeString(groupID)
+	gid, _ := hex.DecodeString(strings.TrimPrefix(groupID, "0x"))
 	resp, err := rkm.client.ListKeys(context.Background(), &kmspb.GroupRef{
 		GroupId: gid,
 	})
@@ -163,6 +173,11 @@ func (rkm *RemoteKeyManager) bridgeSession(ctx context.Context, sessionID string
 		return nil, fmt.Errorf("open process_message stream: %w", err)
 	}
 
+	// bridgeCtx is cancelled when the KMS stream ends, unblocking the
+	// peer→KMS goroutine that may be waiting on sn.Incoming().
+	bridgeCtx, bridgeCancel := context.WithCancel(ctx)
+	defer bridgeCancel()
+
 	var (
 		bridgeErr error
 		result    *kmspb.SessionResult
@@ -184,24 +199,18 @@ func (rkm *RemoteKeyManager) bridgeSession(ctx context.Context, sessionID string
 					stream.CloseSend()
 					return
 				}
-				data, err := msg.MarshalBinary()
-				if err != nil {
-					setErr(fmt.Errorf("marshal tss message: %w", err))
-					stream.CloseSend()
-					return
-				}
 				if err := stream.Send(&kmspb.SessionMessage{
 					SessionId: sessionID,
 					From:      string(msg.From),
 					To:        string(msg.To),
-					Payload:   data,
+					Payload:   msg.Data,
 				}); err != nil {
 					if err != io.EOF {
 						setErr(fmt.Errorf("send to kms: %w", err))
 					}
 					return
 				}
-			case <-ctx.Done():
+			case <-bridgeCtx.Done():
 				stream.CloseSend()
 				return
 			}
@@ -228,6 +237,8 @@ func (rkm *RemoteKeyManager) bridgeSession(ctx context.Context, sessionID string
 		}
 	}
 
+	// Cancel the bridge context to unblock the peer→KMS goroutine.
+	bridgeCancel()
 	wg.Wait()
 	if bridgeErr != nil {
 		return nil, bridgeErr

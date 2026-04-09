@@ -29,9 +29,19 @@ impl Storage {
         Ok(Storage { db })
     }
 
+    /// Normalize a group_id to lowercase hex without "0x" prefix.
+    fn normalize_group_id(group_id: &str) -> String {
+        group_id
+            .strip_prefix("0x")
+            .or_else(|| group_id.strip_prefix("0X"))
+            .unwrap_or(group_id)
+            .to_ascii_lowercase()
+    }
+
     /// Tree name for a group's keys.
     fn tree_name(group_id: &str) -> String {
-        format!("keys/{group_id}")
+        let normalized = Self::normalize_group_id(group_id);
+        format!("keys/{normalized}")
     }
 
     /// Store a key under (group_id, key_id).

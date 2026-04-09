@@ -3,7 +3,7 @@
 use serde::Deserialize;
 
 /// Parameters for a keygen (DKG) session.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct KeygenParams {
     pub group_id: String,
     pub key_id: String,
@@ -13,7 +13,7 @@ pub struct KeygenParams {
 }
 
 /// Parameters for a signing session.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct SignParams {
     pub group_id: String,
     pub key_id: String,

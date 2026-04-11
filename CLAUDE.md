@@ -100,7 +100,7 @@ When finishing a task, always provide a brief summary of:
 ## Architecture & Key Dependencies
 
 ### Go Dependencies
-- `signet/lss` (internal) — LSS keygen/sign/reshare, secp256k1 math via `github.com/decred/dcrd/dcrec/secp256k1/v4`
+- `signet/tss` (internal) — FROST keygen/sign adapter over `github.com/bytemare/frost` + `github.com/bytemare/dkg`; reshare planned
 - `github.com/ethereum/go-ethereum v1.17.1` — chain client, ABI, crypto
 - `github.com/lestrrat-go/jwx/v2` — JWT parsing/verification, JWKS caching (jwk, jwt, jwa)
 - `github.com/fxamacker/cbor/v2` — CBOR encoding for coord messages
@@ -113,35 +113,17 @@ When finishing a task, always provide a brief summary of:
 
 ---
 
-## LSS Protocol Design (`signet/lss`)
+## TSS Protocol Design (`signet/tss`)
 
 ### Session Runner
-- `lss.Run(ctx, startRound, network)` drives the round loop: call `Finalize()`, send outgoing messages, receive until all arrive, advance to next round
+- `tss.Run(ctx, startRound, network)` drives the round loop: call `Finalize()`, send outgoing messages, receive until all arrive, advance to next round
 - `Round` interface: `Receive(*Message) error` + `Finalize() (msgs []*Message, next Round, result interface{}, err error)`
 - Returning `self` from Finalize = stay in round (not all messages arrived yet); returning `nil` next = done
 
-### Round Pattern: "Send once, return self until all arrive"
-Used in sign/round1, sign/round2, keygen/round1:
-1. Generate/compute values ONCE (idempotent, checked via nil guard)
-2. Send broadcast ONCE (guarded by `broadcastSent bool`)
-3. Return self if count < N (use sync.Map for thread-safe counting)
-4. Return next round with fully-populated map when all N arrive
-
-### CBOR Serialization: Message uses msgWire alias
-`*Message` implements `encoding.BinaryMarshaler` — calling `cbor.Marshal(m)` directly causes infinite recursion.
-Always cast to `(*msgWire)(m)` in MarshalBinary/UnmarshalBinary.
-
-### Threshold Signing Math
-LSS uses additive secret sharing (NOT standard ECDSA):
-- Partial sig: `s_i = k_i + r · λ_i · x_i · m`
-- Combined: `s = Σs_i`
-- Verification (Schnorr-style): `s·G = R + r·m·X`
-- Done INLINE in `lss/sign.go` round3 — NOT via standard ecdsa.Verify
-
-### secp256k1/v4 API
-- `secp256k1.ModNScalar` for scalar arithmetic (SetByteSlice, Add, Mul, etc.)
-- `secp256k1.JacobianPoint` for point operations (ScalarBaseMultNonConst, ScalarMultNonConst, AddNonConst)
-- Point → bytes: `secp256k1.NewPublicKey` from Jacobian coords + `SerializeCompressed()`
+### FROST (RFC 9591) on secp256k1
+- Keygen: thin adapter over `github.com/bytemare/dkg` (Feldman VSS-based DKG)
+- Sign: thin adapter over `github.com/bytemare/frost` (two-round Schnorr threshold signing)
+- Reshare: stub — planned using standard Lagrange-weighting on top of FROST-compatible shares
 
 ---
 
@@ -179,7 +161,7 @@ LSS uses additive secret sharing (NOT standard ECDSA):
 - `reflect.ValueOf(results[0]).FieldByName("Issuer")` pattern for go-ethereum tuple[] unpacking
 
 ### Storage (`node/keystore.go`)
-- bbolt nested buckets: `keyshards` → `<groupID>` → `<keyID>` → JSON lss.Config
+- bbolt nested buckets: `keyshards` → `<groupID>` → `<keyID>` → JSON tss.Config
 
 ---
 

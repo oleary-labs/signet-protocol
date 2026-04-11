@@ -510,11 +510,12 @@ of which auth policy produced them.
 
 ### Status
 
-This is a planned extension. The current OAuth/ZK path is sufficient for the
-initial use cases. Authorization keys will be implemented when agentic or
-machine-to-machine use cases require it. The design is intentionally simple —
-it reuses the session key infrastructure and the same request phase, differing
-only in how the initial session is established.
+Implemented. The group contract supports time-delayed add/remove of
+authorization keys alongside OAuth issuers. The Go node loads auth keys
+from on-chain, handles `AuthKeyAdded`/`AuthKeyRemoved` events, and accepts
+certificate-based session establishment via `POST /v1/auth` with a
+`certificate` field. The request phase (session key signing, nonce,
+timestamp) is identical to the OAuth path.
 
 ---
 

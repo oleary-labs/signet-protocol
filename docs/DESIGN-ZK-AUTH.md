@@ -369,11 +369,11 @@ The session private key stays client-side. The app backend generates the proof b
 - Nodes accept either `AuthToken` (legacy) or `AuthProof` (new) during transition.
 - Groups can opt in to ZK-only auth via an on-chain flag.
 
-### Phase 2: Deprecate raw JWT forwarding
+### Phase 2: Deprecate raw JWT forwarding ✅
 
-- Remove `AuthToken` from the coord message.
-- All authenticated groups require ZK proofs.
-- Remove `TestMode` JWT bypass.
+- Remove `AuthToken` from the coord message. ✅
+- All authenticated groups require ZK proofs or auth key certificates. ✅
+- Remove `TestMode` JWT bypass. ✅
 
 ### Phase 3: On-chain proof verification (optional)
 

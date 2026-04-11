@@ -97,7 +97,6 @@ factory_address:  ""                           # SignetFactory contract address 
 kms_socket:       ""                           # Unix socket path to kms-frost; empty = in-process Go FROST
 
 # Auth options
-test_mode:        false                        # skip JWT sig/expiry checks; accept raw JWTs at /v1/auth
 vk_path:          ""                           # path to circuit verification key (required for ZK auth)
 ```
 
@@ -228,22 +227,27 @@ GET /v1/keys?group_id=0xGroupAddr  — one group
 
 ### `POST /v1/auth`
 
-Registers an ephemeral session key bound to a verified identity. Required before keygen/sign on groups that have OAuth issuers configured.
+Registers an ephemeral session key bound to a verified identity. Required before keygen/sign on groups that have auth policies (OAuth issuers or auth keys) configured.
 
-**Test mode** (`test_mode: true` in config):
+**Auth key certificate**:
 
 ```json
 {
   "group_id":    "0x...",
-  "token":       "eyJ...",
-  "session_pub": "02abc..."
+  "session_pub": "02abc...",
+  "certificate": {
+    "auth_key_pub": "02...",
+    "signature":    "hex64",
+    "identity":     "user1",
+    "expiry":       1709900000
+  }
 }
 ```
 
-- `token` — a raw JWT; signature and expiry are verified against the group's trusted issuers
-- `session_pub` — 33-byte compressed secp256k1 public key (hex)
+- `auth_key_pub` — compressed secp256k1 public key of a trusted auth key registered on-chain
+- `signature` — 64-byte [R||S] ECDSA signature over `SHA256(identity:group_id:session_pub_hex:expiry_8bytes_BE)`
 
-**Production mode**:
+**OAuth/ZK proof**:
 
 ```json
 {
@@ -268,7 +272,7 @@ Response:
 ```json
 {
   "status":     "ok",
-  "sub":        "user@example.com",
+  "identity":   "user@example.com",
   "expires_at": 1709900000
 }
 ```

@@ -165,12 +165,11 @@ LSS uses additive secret sharing (NOT standard ECDSA):
 ### Config (`node/config.go`)
 - `DataDir`, `ListenAddr`, `APIAddr`, `AnnounceAddr`, `BootstrapPeers`, `NodeType`
 - `EthRPC`, `FactoryAddress` — blockchain integration
-- `TestMode` — skip JWT signature/expiry checks, trust initiator attestation for ZK auth
 - `VKPath` — path to circuit verification key (bb format, required for production ZK auth)
 
 ### HTTP API
 - `GET /v1/health`, `GET /v1/info`, `GET /v1/keys[?group_id=0x...]`
-- `POST /v1/auth` — register session key (test mode: JWT; production: ZK proof + claims)
+- `POST /v1/auth` — register session key (auth key certificate or ZK proof + claims)
 - `POST /v1/keygen` — distributed key generation
 - `POST /v1/sign` — threshold signing
 
@@ -221,7 +220,8 @@ Total: 568 elements × 32 bytes = 18,176 bytes
 - JWKS modulus verification is critical: prevents fake RSA key attacks
 - Canonical request hash: `SHA256(groupID:keyID:nonce:timestamp_8bytes_BE[:messageHash])`
 - Request sig: secp256k1 ECDSA, 64-byte [R||S]
-- TestMode: `/v1/auth` validates JWT directly; coord msg carries `TestMode:true`; participants skip ZK proof only if their own testMode is also true
+- Two auth paths: auth key certificates (app-managed secp256k1 keys on-chain) and OAuth/ZK proofs
+- Auth key certificate canonical hash: `SHA256(identity ":" group_id ":" session_pub_hex ":" expiry_8bytes_BE)`
 - Nonce: client-generated random hex, 5min retention for replay check
 - Timestamp: 30-second freshness window
 

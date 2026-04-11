@@ -16,7 +16,6 @@ type Config struct {
 	NodeType       string   `yaml:"node_type"`
 	EthRPC         string   `yaml:"eth_rpc"`
 	FactoryAddress string   `yaml:"factory_address"`
-	TestMode       bool     `yaml:"test_mode"`   // skip JWT signature + expiry checks
 	VKPath         string   `yaml:"vk_path"`     // path to circuit verification key (bb format)
 	KMSSocket      string   `yaml:"kms_socket"`  // Unix socket path to external KMS; empty = in-process tss
 }

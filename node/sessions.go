@@ -26,16 +26,22 @@ const (
 
 // SessionInfo holds the cached identity claims from a verified auth session.
 type SessionInfo struct {
-	Sub string    // JWT subject (user ID)
-	Iss string    // JWT issuer
-	Exp time.Time // JWT expiry
+	Sub string    // JWT subject (user ID) or auth key identity
+	Iss string    // JWT issuer (empty for auth key sessions)
+	Exp time.Time // session expiry
 	Aud string    // JWT audience
 	Azp string    // JWT authorized party / client_id
 
-	// Production mode: stored so coord messages can carry the proof for
+	// OAuth/ZK path: stored so coord messages can carry the proof for
 	// other participants to verify independently.
-	Proof       []byte // ZK proof bytes (nil in test mode)
+	Proof       []byte // ZK proof bytes
 	JWKSModulus []byte // RSA modulus used in the proof
+
+	// Auth key certificate path: stored so coord messages can carry the
+	// certificate for other participants to verify independently.
+	AuthKeyPub    []byte // 33-byte compressed pubkey of the signing auth key
+	CertSignature []byte // 64-byte [R || S] certificate signature
+	Identity      string // application-defined identity
 }
 
 // SessionStore is a thread-safe in-memory cache mapping compressed session

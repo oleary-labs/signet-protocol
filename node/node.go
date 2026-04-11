@@ -178,7 +178,7 @@ func New(cfg *Config, log *zap.Logger) (*Node, error) {
 		km:             km,
 		keygenReady:    make(map[shardKey]chan struct{}),
 		groups:         make(map[string]*GroupInfo),
-		auth:           newGroupAuth(ctx, cfg.TestMode, circuitVK, log),
+		auth:           newGroupAuth(ctx, circuitVK, log),
 		sessions:       newSessionStore(),
 		bootstrapPeers: bootstrapPeers,
 	}
@@ -405,11 +405,12 @@ func (n *Node) handleListKeys(w http.ResponseWriter, r *http.Request) {
 //
 // POST /v1/auth
 //
-// Test mode:
+// Auth key certificate:
 //
-//	{"group_id":"0x...","token":"eyJ...","session_pub":"02abc..."}
+//	{"group_id":"0x...","session_pub":"02abc...",
+//	 "certificate":{"auth_key_pub":"02...","signature":"hex64","identity":"user1","expiry":1709900000}}
 //
-// Production mode:
+// OAuth/ZK proof:
 //
 //	{"group_id":"0x...","proof":"hex...","session_pub":"02abc...",
 //	 "sub":"user123","iss":"https://...","exp":1709900000,
@@ -417,15 +418,14 @@ func (n *Node) handleListKeys(w http.ResponseWriter, r *http.Request) {
 func (n *Node) handleAuth(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		GroupID     string `json:"group_id"`
-		Token       string `json:"token"`        // test mode: raw JWT
-		Proof       string `json:"proof"`         // production: ZK proof hex
+		Proof       string `json:"proof"`         // ZK proof hex
 		SessionPub  string `json:"session_pub"`   // hex, 33-byte compressed secp256k1
-		Sub         string `json:"sub"`           // production: JWT subject
-		Iss         string `json:"iss"`           // production: JWT issuer
-		Exp         uint64 `json:"exp"`           // production: JWT expiry unix timestamp
-		Aud         string `json:"aud"`           // production: JWT audience
-		Azp         string `json:"azp"`           // production: JWT authorized party
-		JWKSModulus string `json:"jwks_modulus"`  // production: RSA modulus hex
+		Sub         string `json:"sub"`           // JWT subject
+		Iss         string `json:"iss"`           // JWT issuer
+		Exp         uint64 `json:"exp"`           // JWT expiry unix timestamp
+		Aud         string `json:"aud"`           // JWT audience
+		Azp         string `json:"azp"`           // JWT authorized party
+		JWKSModulus string `json:"jwks_modulus"`  // RSA modulus hex
 
 		// Authorization key certificate fields
 		Certificate *AuthCertificate `json:"certificate,omitempty"`
@@ -458,10 +458,16 @@ func (n *Node) handleAuth(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
+		authKeyBytes, _ := hex.DecodeString(strings.TrimPrefix(cert.AuthKeyPub, "0x"))
+		sigBytes, _ := hex.DecodeString(strings.TrimPrefix(cert.Signature, "0x"))
+
 		pubHex := sessionPubToHex(sessionPubBytes)
 		n.sessions.Put(pubHex, &SessionInfo{
-			Sub: identity,
-			Exp: time.Unix(int64(cert.Expiry), 0),
+			Sub:           identity,
+			Exp:           time.Unix(int64(cert.Expiry), 0),
+			Identity:      identity,
+			AuthKeyPub:    authKeyBytes,
+			CertSignature: sigBytes,
 		})
 		n.log.Info("auth: session registered (auth key certificate)",
 			zap.String("group_id", req.GroupID),
@@ -477,101 +483,69 @@ func (n *Node) handleAuth(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if n.cfg.TestMode {
-		// Test mode: validate JWT directly, cache session binding.
-		if req.Token == "" {
-			httpError(w, http.StatusBadRequest, "token is required in test mode")
-			return
-		}
-		claims, err := n.auth.ValidateJWTForSession(r.Context(), req.GroupID, []byte(req.Token))
-		if err != nil {
-			httpError(w, http.StatusUnauthorized, "invalid token: "+err.Error())
-			return
-		}
-		pubHex := sessionPubToHex(sessionPubBytes)
-		n.sessions.Put(pubHex, &SessionInfo{
-			Sub: claims.Sub,
-			Iss: claims.Iss,
-			Exp: claims.Exp,
-			Aud: claims.Aud,
-			Azp: claims.Azp,
-		})
-		n.log.Info("auth: session registered (test mode)",
-			zap.String("group_id", req.GroupID),
-			zap.String("sub", claims.Sub),
-			zap.String("session_pub", pubHex))
-
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]any{
-			"status":     "ok",
-			"sub":        claims.Sub,
-			"expires_at": claims.Exp.Unix(),
-		})
-	} else {
-		// Production mode: verify ZK proof and cache session.
-		if req.Proof == "" {
-			httpError(w, http.StatusBadRequest, "proof is required in production mode")
-			return
-		}
-		if req.Sub == "" || req.Iss == "" || req.Exp == 0 {
-			httpError(w, http.StatusBadRequest, "sub, iss, and exp are required in production mode")
-			return
-		}
-		if req.JWKSModulus == "" {
-			httpError(w, http.StatusBadRequest, "jwks_modulus is required in production mode")
-			return
-		}
-
-		proofBytes, err := hex.DecodeString(strings.TrimPrefix(req.Proof, "0x"))
-		if err != nil || len(proofBytes) == 0 {
-			httpError(w, http.StatusBadRequest, "invalid proof hex")
-			return
-		}
-		modulusBytes, err := hex.DecodeString(strings.TrimPrefix(req.JWKSModulus, "0x"))
-		if err != nil || len(modulusBytes) == 0 {
-			httpError(w, http.StatusBadRequest, "invalid jwks_modulus hex")
-			return
-		}
-
-		ap := &AuthProof{
-			Proof:       proofBytes,
-			Sub:         req.Sub,
-			Iss:         req.Iss,
-			Exp:         req.Exp,
-			Aud:         req.Aud,
-			Azp:         req.Azp,
-			JWKSModulus: modulusBytes,
-			SessionPub:  sessionPubBytes,
-		}
-
-		sub, err := n.auth.ValidateAuthProof(r.Context(), req.GroupID, ap)
-		if err != nil {
-			httpError(w, http.StatusUnauthorized, "proof verification failed: "+err.Error())
-			return
-		}
-
-		pubHex := sessionPubToHex(sessionPubBytes)
-		n.sessions.Put(pubHex, &SessionInfo{
-			Sub:         sub,
-			Iss:         req.Iss,
-			Exp:         time.Unix(int64(req.Exp), 0),
-			Aud:         req.Aud,
-			Azp:         req.Azp,
-			Proof:       proofBytes,
-			JWKSModulus: modulusBytes,
-		})
-		n.log.Info("auth: session registered (production)",
-			zap.String("group_id", req.GroupID),
-			zap.String("sub", sub),
-			zap.String("session_pub", pubHex))
-
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]any{
-			"status":     "ok",
-			"sub":        sub,
-			"expires_at": int64(req.Exp),
-		})
+	// OAuth/ZK proof path.
+	if req.Proof == "" {
+		httpError(w, http.StatusBadRequest, "proof or certificate is required")
+		return
 	}
+	if req.Sub == "" || req.Iss == "" || req.Exp == 0 {
+		httpError(w, http.StatusBadRequest, "sub, iss, and exp are required with ZK proof")
+		return
+	}
+	if req.JWKSModulus == "" {
+		httpError(w, http.StatusBadRequest, "jwks_modulus is required with ZK proof")
+		return
+	}
+
+	proofBytes, err := hex.DecodeString(strings.TrimPrefix(req.Proof, "0x"))
+	if err != nil || len(proofBytes) == 0 {
+		httpError(w, http.StatusBadRequest, "invalid proof hex")
+		return
+	}
+	modulusBytes, err := hex.DecodeString(strings.TrimPrefix(req.JWKSModulus, "0x"))
+	if err != nil || len(modulusBytes) == 0 {
+		httpError(w, http.StatusBadRequest, "invalid jwks_modulus hex")
+		return
+	}
+
+	ap := &AuthProof{
+		Proof:       proofBytes,
+		Sub:         req.Sub,
+		Iss:         req.Iss,
+		Exp:         req.Exp,
+		Aud:         req.Aud,
+		Azp:         req.Azp,
+		JWKSModulus: modulusBytes,
+		SessionPub:  sessionPubBytes,
+	}
+
+	sub, err := n.auth.ValidateAuthProof(r.Context(), req.GroupID, ap)
+	if err != nil {
+		httpError(w, http.StatusUnauthorized, "proof verification failed: "+err.Error())
+		return
+	}
+
+	pubHex := sessionPubToHex(sessionPubBytes)
+	n.sessions.Put(pubHex, &SessionInfo{
+		Sub:         sub,
+		Iss:         req.Iss,
+		Exp:         time.Unix(int64(req.Exp), 0),
+		Aud:         req.Aud,
+		Azp:         req.Azp,
+		Proof:       proofBytes,
+		JWKSModulus: modulusBytes,
+	})
+	n.log.Info("auth: session registered (ZK proof)",
+		zap.String("group_id", req.GroupID),
+		zap.String("sub", sub),
+		zap.String("session_pub", pubHex))
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{
+		"status":     "ok",
+		"sub":        sub,
+		"expires_at": int64(req.Exp),
+	})
 }
 
 // handleKeygen runs a distributed key generation session.
@@ -616,40 +590,25 @@ func (n *Node) handleKeygen(w http.ResponseWriter, r *http.Request) {
 	}
 
 	keyID := req.KeyID
-	var authToken []byte
 	var authProof *AuthProof
 
 	if n.auth.HasAuthPolicy(req.GroupID) {
-		if req.SessionPub != "" {
-			// New path: session-based auth.
-			ap, resolvedKeyID, err := n.validateSessionRequest(
-				req.SessionPub, req.RequestSig,
-				req.GroupID, req.KeyID, req.KeySuffix,
-				req.Nonce, req.Timestamp,
-				nil, // no message_hash for keygen
-			)
-			if err != nil {
-				httpError(w, err.code, err.msg)
-				return
-			}
-			keyID = resolvedKeyID
-			authProof = ap
-		} else if token := extractBearer(r); token != "" {
-			// Legacy path: raw JWT in Authorization header.
-			issAndSub, err := n.auth.ValidateJWT(r.Context(), req.GroupID, []byte(token))
-			if err != nil {
-				httpError(w, http.StatusUnauthorized, "invalid token: "+err.Error())
-				return
-			}
-			keyID = issAndSub
-			if req.KeySuffix != "" {
-				keyID = issAndSub + ":" + req.KeySuffix
-			}
-			authToken = []byte(token)
-		} else {
-			httpError(w, http.StatusUnauthorized, "authorization required")
+		if req.SessionPub == "" {
+			httpError(w, http.StatusUnauthorized, "authorization required (session_pub)")
 			return
 		}
+		ap, resolvedKeyID, err := n.validateSessionRequest(
+			req.SessionPub, req.RequestSig,
+			req.GroupID, req.KeyID, req.KeySuffix,
+			req.Nonce, req.Timestamp,
+			nil, // no message_hash for keygen
+		)
+		if err != nil {
+			httpError(w, err.code, err.msg)
+			return
+		}
+		keyID = resolvedKeyID
+		authProof = ap
 	} else if keyID == "" {
 		httpError(w, http.StatusBadRequest, "key_id is required")
 		return
@@ -683,7 +642,6 @@ func (n *Node) handleKeygen(w http.ResponseWriter, r *http.Request) {
 		KeyID:     keyID,
 		Parties:   sortedParties,
 		Threshold: grp.Threshold,
-		AuthToken: authToken,
 		Auth:      authProof,
 	}); err != nil {
 		httpError(w, http.StatusInternalServerError, "coordinate: "+err.Error())
@@ -779,40 +737,25 @@ func (n *Node) handleSign(w http.ResponseWriter, r *http.Request) {
 	}
 
 	keyID := req.KeyID
-	var authToken []byte
 	var authProof *AuthProof
 
 	if n.auth.HasAuthPolicy(req.GroupID) {
-		if req.SessionPub != "" {
-			// New path: session-based auth.
-			ap, resolvedKeyID, err := n.validateSessionRequest(
-				req.SessionPub, req.RequestSig,
-				req.GroupID, req.KeyID, req.KeySuffix,
-				req.Nonce, req.Timestamp,
-				msgHash,
-			)
-			if err != nil {
-				httpError(w, err.code, err.msg)
-				return
-			}
-			keyID = resolvedKeyID
-			authProof = ap
-		} else if token := extractBearer(r); token != "" {
-			// Legacy path: raw JWT in Authorization header.
-			issAndSub, err := n.auth.ValidateJWT(r.Context(), req.GroupID, []byte(token))
-			if err != nil {
-				httpError(w, http.StatusUnauthorized, "invalid token: "+err.Error())
-				return
-			}
-			keyID = issAndSub
-			if req.KeySuffix != "" {
-				keyID = issAndSub + ":" + req.KeySuffix
-			}
-			authToken = []byte(token)
-		} else {
-			httpError(w, http.StatusUnauthorized, "authorization required")
+		if req.SessionPub == "" {
+			httpError(w, http.StatusUnauthorized, "authorization required (session_pub)")
 			return
 		}
+		ap, resolvedKeyID, err := n.validateSessionRequest(
+			req.SessionPub, req.RequestSig,
+			req.GroupID, req.KeyID, req.KeySuffix,
+			req.Nonce, req.Timestamp,
+			msgHash,
+		)
+		if err != nil {
+			httpError(w, err.code, err.msg)
+			return
+		}
+		keyID = resolvedKeyID
+		authProof = ap
 	} else if keyID == "" {
 		httpError(w, http.StatusBadRequest, "key_id is required")
 		return
@@ -861,7 +804,6 @@ func (n *Node) handleSign(w http.ResponseWriter, r *http.Request) {
 		SignNonce:   nonce,
 		Signers:     sortedSigners,
 		MessageHash: msgHash,
-		AuthToken:   authToken,
 		Auth:        authProof,
 	}); err != nil {
 		httpError(w, http.StatusInternalServerError, "coordinate: "+err.Error())
@@ -947,10 +889,20 @@ func (n *Node) validateSessionRequest(
 		return nil, "", &httpErr{http.StatusUnauthorized, "session expired; re-authenticate"}
 	}
 
-	// Derive key_id from session iss+sub (globally unique pair).
-	resolvedKeyID := info.Iss + ":" + info.Sub
-	if keySuffix != "" {
-		resolvedKeyID = info.Iss + ":" + info.Sub + ":" + keySuffix
+	// Derive key_id. For OAuth sessions: iss:sub. For auth key sessions: identity.
+	var resolvedKeyID string
+	if info.Identity != "" {
+		// Auth key certificate session.
+		resolvedKeyID = info.Identity
+		if keySuffix != "" {
+			resolvedKeyID = info.Identity + ":" + keySuffix
+		}
+	} else {
+		// OAuth session.
+		resolvedKeyID = info.Iss + ":" + info.Sub
+		if keySuffix != "" {
+			resolvedKeyID = info.Iss + ":" + info.Sub + ":" + keySuffix
+		}
 	}
 
 	// Verify request signature. The signature must cover the resolved keyID
@@ -975,18 +927,20 @@ func (n *Node) validateSessionRequest(
 	}
 
 	ap := &AuthProof{
-		Proof:       info.Proof,
-		Sub:         info.Sub,
-		Iss:         info.Iss,
-		Exp:         uint64(info.Exp.Unix()),
-		Aud:         info.Aud,
-		Azp:         info.Azp,
-		JWKSModulus: info.JWKSModulus,
-		SessionPub:  sessionPubBytes,
-		RequestSig:  reqSigBytes,
-		Nonce:       nonce,
-		Timestamp:   timestamp,
-		TestMode:    n.cfg.TestMode,
+		Proof:         info.Proof,
+		Sub:           info.Sub,
+		Iss:           info.Iss,
+		Exp:           uint64(info.Exp.Unix()),
+		Aud:           info.Aud,
+		Azp:           info.Azp,
+		JWKSModulus:   info.JWKSModulus,
+		SessionPub:    sessionPubBytes,
+		RequestSig:    reqSigBytes,
+		Nonce:         nonce,
+		Timestamp:     timestamp,
+		AuthKeyPub:    info.AuthKeyPub,
+		CertSignature: info.CertSignature,
+		Identity:      info.Identity,
 	}
 	return ap, resolvedKeyID, nil
 }
@@ -1024,12 +978,3 @@ func (n *Node) reconnectLoop(ctx context.Context) {
 	}
 }
 
-// extractBearer returns the token from an "Authorization: Bearer <token>" header,
-// or an empty string if the header is absent or malformed.
-func extractBearer(r *http.Request) string {
-	auth := r.Header.Get("Authorization")
-	if !strings.HasPrefix(auth, "Bearer ") {
-		return ""
-	}
-	return strings.TrimPrefix(auth, "Bearer ")
-}

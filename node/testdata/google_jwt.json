@@ -16,5 +16,5 @@
     "key_id": "https://accounts.google.com:114810956681671373980",
     "client_id": "838237305140-bahhknj5sj8bir4sh8aenk4os6eua11j.apps.googleusercontent.com"
   },
-  "notes": "Token is expired (1h window). Use with testMode=true or as a fixture for claim parsing tests. Signature uses RS256 with Google key kid=c41f141aa19df0ac97daa55e600766c4c5364c42."
+  "notes": "Token is expired (1h window). Useful as a fixture for claim parsing tests. Signature uses RS256 with Google key kid=c41f141aa19df0ac97daa55e600766c4c5364c42."
 }

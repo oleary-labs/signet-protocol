@@ -47,13 +47,8 @@ type coordMsg struct {
 	Signers     []tss.PartyID `cbor:"7,keyasint,omitempty"`
 	MessageHash []byte     `cbor:"8,keyasint,omitempty"`
 
-	// Legacy auth: raw JWT bearer token forwarded by the initiator so every
-	// participant can independently validate the caller's identity and key
-	// scoping. Kept for backward compatibility during migration.
-	AuthToken []byte `cbor:"9,keyasint,omitempty"`
-
-	// New auth: structured auth proof with ZK proof (production) or
-	// initiator attestation (test mode), plus session key binding.
+	// Auth: structured auth proof with ZK proof or auth key certificate,
+	// plus session key binding.
 	Auth *AuthProof `cbor:"10,keyasint,omitempty"`
 }
 
@@ -88,69 +83,54 @@ func (n *Node) handleCoordStream(s libp2pnet.Stream) {
 
 	// Validate auth if the group has any auth policy configured.
 	if n.auth.HasAuthPolicy(msg.GroupID) {
-		var keyPrefix string
-		if msg.Auth != nil {
-			// New path: AuthProof (ZK proof or test-mode attestation).
-			var err error
-			keyPrefix, err = n.auth.ValidateAuthProof(n.ctx, msg.GroupID, msg.Auth)
-			if err != nil {
-				n.log.Warn("coord: invalid auth proof",
-					zap.String("group_id", msg.GroupID),
-					zap.String("key_id", msg.KeyID),
-					zap.Error(err))
-				return
-			}
-			// Verify request signature against session public key.
-			var msgHash []byte
-			if msg.Type == msgSign {
-				msgHash = msg.MessageHash
-			}
-			if err := verifyRequestSignature(
-				msg.Auth.SessionPub, msg.Auth.RequestSig,
-				msg.GroupID, msg.KeyID, msg.Auth.Nonce, msg.Auth.Timestamp,
-				msgHash,
-			); err != nil {
-				n.log.Warn("coord: invalid request signature",
-					zap.String("group_id", msg.GroupID),
-					zap.String("key_id", msg.KeyID),
-					zap.Error(err))
-				return
-			}
-			// Check nonce uniqueness.
-			if err := n.sessions.CheckNonce(msg.Auth.Nonce); err != nil {
-				n.log.Warn("coord: nonce replay",
-					zap.String("group_id", msg.GroupID),
-					zap.String("nonce", msg.Auth.Nonce))
-				return
-			}
-			// Check timestamp freshness.
-			ts := time.Unix(int64(msg.Auth.Timestamp), 0)
-			if time.Since(ts).Abs() > timestampWindow {
-				n.log.Warn("coord: timestamp out of range",
-					zap.String("group_id", msg.GroupID),
-					zap.Uint64("timestamp", msg.Auth.Timestamp))
-				return
-			}
-		} else if len(msg.AuthToken) > 0 {
-			// Legacy path: raw JWT forwarding.
-			var err error
-			keyPrefix, err = n.auth.ValidateJWT(n.ctx, msg.GroupID, msg.AuthToken)
-			if err != nil {
-				n.log.Warn("coord: invalid auth token",
-					zap.String("group_id", msg.GroupID),
-					zap.String("key_id", msg.KeyID),
-					zap.Error(err))
-				return
-			}
-		} else {
+		if msg.Auth == nil {
 			n.log.Warn("coord: missing auth",
 				zap.String("group_id", msg.GroupID),
 				zap.String("key_id", msg.KeyID))
 			return
 		}
-		// KeyID must equal iss:sub or start with iss:sub+":"
+		keyPrefix, err := n.auth.ValidateAuthProof(n.ctx, msg.GroupID, msg.Auth)
+		if err != nil {
+			n.log.Warn("coord: invalid auth proof",
+				zap.String("group_id", msg.GroupID),
+				zap.String("key_id", msg.KeyID),
+				zap.Error(err))
+			return
+		}
+		// Verify request signature against session public key.
+		var msgHash []byte
+		if msg.Type == msgSign {
+			msgHash = msg.MessageHash
+		}
+		if err := verifyRequestSignature(
+			msg.Auth.SessionPub, msg.Auth.RequestSig,
+			msg.GroupID, msg.KeyID, msg.Auth.Nonce, msg.Auth.Timestamp,
+			msgHash,
+		); err != nil {
+			n.log.Warn("coord: invalid request signature",
+				zap.String("group_id", msg.GroupID),
+				zap.String("key_id", msg.KeyID),
+				zap.Error(err))
+			return
+		}
+		// Check nonce uniqueness.
+		if err := n.sessions.CheckNonce(msg.Auth.Nonce); err != nil {
+			n.log.Warn("coord: nonce replay",
+				zap.String("group_id", msg.GroupID),
+				zap.String("nonce", msg.Auth.Nonce))
+			return
+		}
+		// Check timestamp freshness.
+		ts := time.Unix(int64(msg.Auth.Timestamp), 0)
+		if time.Since(ts).Abs() > timestampWindow {
+			n.log.Warn("coord: timestamp out of range",
+				zap.String("group_id", msg.GroupID),
+				zap.Uint64("timestamp", msg.Auth.Timestamp))
+			return
+		}
+		// KeyID must match auth identity prefix.
 		if msg.KeyID != keyPrefix && !strings.HasPrefix(msg.KeyID, keyPrefix+":") {
-			n.log.Warn("coord: key_id does not match token identity",
+			n.log.Warn("coord: key_id does not match auth identity",
 				zap.String("group_id", msg.GroupID),
 				zap.String("key_id", msg.KeyID),
 				zap.String("key_prefix", keyPrefix))

@@ -42,18 +42,16 @@ type GroupAuth struct {
 	groups    map[string][]IssuerInfo // groupID hex → trusted issuers
 	authKeys  map[string][][]byte    // groupID hex → trusted auth key pubkeys (33-byte compressed)
 	cache     *jwk.Cache
-	testMode  bool
 	circuitVK []byte // verification key for the jwt_auth circuit (bb format)
 	log       *zap.Logger
 }
 
-func newGroupAuth(ctx context.Context, testMode bool, circuitVK []byte, log *zap.Logger) *GroupAuth {
+func newGroupAuth(ctx context.Context, circuitVK []byte, log *zap.Logger) *GroupAuth {
 	cache := jwk.NewCache(ctx)
 	return &GroupAuth{
 		groups:    make(map[string][]IssuerInfo),
 		authKeys:  make(map[string][][]byte),
 		cache:     cache,
-		testMode:  testMode,
 		circuitVK: circuitVK,
 		log:       log,
 	}
@@ -233,16 +231,17 @@ func (g *GroupAuth) ValidateAuthCertificate(groupID string, cert *AuthCertificat
 }
 
 // AuthProof is the authentication block carried in coord messages.
-// In production mode, Proof contains a serialized ZK proof that each
-// participant verifies independently. In test mode, Proof is nil and
-// participants trust the initiator's claim attestation.
+// Supports two verification paths:
+//   - OAuth/ZK: Proof + JWKS modulus + JWT claims (verified via ZK proof)
+//   - Auth key certificate: AuthKeyPub + CertSignature + Identity (verified
+//     against on-chain auth keys)
 type AuthProof struct {
-	// ZK proof (nil in test mode).
+	// ZK proof (OAuth path only).
 	Proof []byte `cbor:"1,keyasint,omitempty"`
 
 	// Claims extracted from the JWT (public inputs to the ZK circuit).
 	Sub        string   `cbor:"2,keyasint"`
-	Iss        string   `cbor:"3,keyasint"`
+	Iss        string   `cbor:"3,keyasint,omitempty"`
 	Exp        uint64   `cbor:"4,keyasint"`
 	Aud        string   `cbor:"5,keyasint,omitempty"`
 	Azp        string   `cbor:"6,keyasint,omitempty"`
@@ -255,10 +254,12 @@ type AuthProof struct {
 	Nonce      string `cbor:"11,keyasint"`
 	Timestamp  uint64 `cbor:"12,keyasint"`
 
-	// TestMode flag — set by the initiator so participants know to skip
-	// ZK proof verification. Participants only honor this when their own
-	// config.TestMode is also true.
-	TestMode bool `cbor:"13,keyasint,omitempty"`
+	// Authorization key certificate fields (auth key path only).
+	// When AuthKeyPub is set, participants verify CertSignature against
+	// the group's on-chain auth keys instead of verifying a ZK proof.
+	AuthKeyPub    []byte `cbor:"14,keyasint,omitempty"` // 33-byte compressed secp256k1
+	CertSignature []byte `cbor:"15,keyasint,omitempty"` // 64-byte [R || S]
+	Identity      string `cbor:"16,keyasint,omitempty"` // application-defined identity
 }
 
 // SessionClaims holds the full set of claims extracted from a JWT, used to
@@ -288,10 +289,9 @@ func (g *GroupAuth) ValidateJWT(ctx context.Context, groupID string, tokenBytes 
 //  1. Parse without verification to extract iss.
 //  2. Locate matching IssuerInfo in the group's trust list.
 //  3. Fetch JWKS from cache for issuerInfo.JwksURI.
-//  4. Re-parse and verify signature (skipped in testMode).
-//  5. Check token expiry (skipped in testMode).
-//  6. Verify azp (or client_id) is in issuerInfo.ClientIds.
-//  7. Return full claims.
+//  4. Re-parse and verify signature + expiry.
+//  5. Verify azp (or client_id) is in issuerInfo.ClientIds.
+//  6. Return full claims.
 func (g *GroupAuth) ValidateJWTForSession(ctx context.Context, groupID string, tokenBytes []byte) (*SessionClaims, error) {
 	// Step 1: parse without verification to get iss claim.
 	insecure, err := jwt.Parse(tokenBytes, jwt.WithVerify(false), jwt.WithValidate(false))
@@ -319,25 +319,20 @@ func (g *GroupAuth) ValidateJWTForSession(ctx context.Context, groupID string, t
 		return nil, fmt.Errorf("untrusted issuer: %s", iss)
 	}
 
-	// Steps 3–5: signature + expiry verification.
-	var verified jwt.Token
-	if g.testMode {
-		verified = insecure
-	} else {
-		if matched.JwksURI == "" {
-			return nil, fmt.Errorf("no JWKS URI for issuer %s", iss)
-		}
-		keySet, err := g.cache.Get(ctx, matched.JwksURI)
-		if err != nil {
-			return nil, fmt.Errorf("fetch JWKS: %w", err)
-		}
-		verified, err = jwt.Parse(tokenBytes,
-			jwt.WithKeySet(keySet),
-			jwt.WithValidate(true),
-		)
-		if err != nil {
-			return nil, fmt.Errorf("verify token: %w", err)
-		}
+	// Steps 3–4: signature + expiry verification.
+	if matched.JwksURI == "" {
+		return nil, fmt.Errorf("no JWKS URI for issuer %s", iss)
+	}
+	keySet, err := g.cache.Get(ctx, matched.JwksURI)
+	if err != nil {
+		return nil, fmt.Errorf("fetch JWKS: %w", err)
+	}
+	verified, err := jwt.Parse(tokenBytes,
+		jwt.WithKeySet(keySet),
+		jwt.WithValidate(true),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("verify token: %w", err)
 	}
 
 	// Extract audience (first value if multiple) before the client check so it
@@ -391,16 +386,38 @@ func (g *GroupAuth) ValidateJWTForSession(ctx context.Context, groupID string, t
 }
 
 // ValidateAuthProof verifies an AuthProof received in a coord message.
-// In test mode (both msg.TestMode and g.testMode), it trusts the initiator's
-// claim attestation and only checks session/request binding.
-// In production mode, it verifies the ZK proof against the public inputs.
+// Two paths:
+//   - Auth key certificate: AuthKeyPub is set → verify cert signature against
+//     on-chain auth keys. Returns the certificate Identity as the key prefix.
+//   - OAuth/ZK: Proof is set → verify ZK proof against public inputs.
+//     Returns iss:sub as the key prefix.
 func (g *GroupAuth) ValidateAuthProof(ctx context.Context, groupID string, proof *AuthProof) (string, error) {
 	// Check expiry.
 	if time.Now().After(time.Unix(int64(proof.Exp), 0)) {
 		return "", fmt.Errorf("auth proof expired")
 	}
 
-	// Check issuer is trusted for this group.
+	// Auth key certificate path.
+	if len(proof.AuthKeyPub) > 0 {
+		if proof.Identity == "" {
+			return "", fmt.Errorf("auth proof missing identity")
+		}
+		if !g.IsAuthKeyTrusted(groupID, proof.AuthKeyPub) {
+			return "", fmt.Errorf("untrusted authorization key")
+		}
+		if len(proof.CertSignature) != 64 {
+			return "", fmt.Errorf("invalid cert signature length")
+		}
+
+		sessionPubHex := hex.EncodeToString(proof.SessionPub)
+		hash := authCertHash(proof.Identity, groupID, sessionPubHex, proof.Exp)
+		if !crypto.VerifySignature(proof.AuthKeyPub, hash[:], proof.CertSignature) {
+			return "", fmt.Errorf("certificate signature verification failed")
+		}
+		return proof.Identity, nil
+	}
+
+	// OAuth/ZK path.
 	g.mu.RLock()
 	issuers := g.groups[groupID]
 	g.mu.RUnlock()
@@ -420,38 +437,25 @@ func (g *GroupAuth) ValidateAuthProof(ctx context.Context, groupID string, proof
 		return "", fmt.Errorf("auth proof missing sub")
 	}
 
-	// Verify ZK proof or trust attestation in test mode.
-	if proof.TestMode {
-		if !g.testMode {
-			return "", fmt.Errorf("received test-mode auth proof but this node is not in test mode")
-		}
-		// In test mode: trust the initiator's claim attestation.
-		// The initiator validated the JWT directly before building the proof.
-	} else {
-		if g.testMode {
-			return "", fmt.Errorf("received production auth proof but this node is in test mode")
-		}
-		// Production mode: verify the ZK proof.
-		if len(proof.Proof) == 0 {
-			return "", fmt.Errorf("auth proof missing ZK proof bytes")
-		}
-		if len(g.circuitVK) == 0 {
-			return "", fmt.Errorf("no circuit verification key configured (set vk_path)")
-		}
+	if len(proof.Proof) == 0 {
+		return "", fmt.Errorf("auth proof missing ZK proof bytes")
+	}
+	if len(g.circuitVK) == 0 {
+		return "", fmt.Errorf("no circuit verification key configured (set vk_path)")
+	}
 
-		// Verify the JWKS modulus matches a real RSA key from the issuer's OIDC JWKS.
-		if err := g.verifyJWKSModulus(ctx, groupID, proof.Iss, proof.JWKSModulus); err != nil {
-			return "", fmt.Errorf("modulus check: %w", err)
-		}
+	// Verify the JWKS modulus matches a real RSA key from the issuer's OIDC JWKS.
+	if err := g.verifyJWKSModulus(ctx, groupID, proof.Iss, proof.JWKSModulus); err != nil {
+		return "", fmt.Errorf("modulus check: %w", err)
+	}
 
-		// Encode public inputs from the proof's claim fields and run bb verify.
-		publicInputs, err := encodePublicInputs(proof)
-		if err != nil {
-			return "", fmt.Errorf("encode public inputs: %w", err)
-		}
-		if err := verifyBBProof(proof.Proof, publicInputs, g.circuitVK); err != nil {
-			return "", fmt.Errorf("ZK proof invalid: %w", err)
-		}
+	// Encode public inputs from the proof's claim fields and run bb verify.
+	publicInputs, err := encodePublicInputs(proof)
+	if err != nil {
+		return "", fmt.Errorf("encode public inputs: %w", err)
+	}
+	if err := verifyBBProof(proof.Proof, publicInputs, g.circuitVK); err != nil {
+		return "", fmt.Errorf("ZK proof invalid: %w", err)
 	}
 
 	return proof.Iss + ":" + proof.Sub, nil

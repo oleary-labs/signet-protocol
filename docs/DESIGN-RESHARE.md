@@ -56,7 +56,7 @@ Let:
 - `aᵢ` = old party `i`'s secret share, such that `Σᵢ λᵢ · aᵢ = a` (Lagrange reconstruction identity)
 - `xⱼ` = numerical identifier of new party `j` (its `uint16` index in the new `PartyMap`)
 
-### Round 1 — old parties: VSS distribution
+### Round 1 — old parties: broadcast commitments
 
 Each old party `i`:
 
@@ -72,17 +72,25 @@ Each old party `i`:
 
 3. Create a VSS polynomial `fᵢ(x)` of degree `(t_new - 1)` with constant term `wᵢ`:
    ```
-   poly, commits = secret_sharing.ShardAndCommit(secp256k1, wᵢ, t_new, n_new)
+   _, poly = secret_sharing.ShardReturnPolynomial(secp256k1, wᵢ, t_new, n_new)
+   commits = secret_sharing.Commit(secp256k1, poly)
    ```
-   `commits[k] = fᵢ(k) · G` for `k ∈ [0, t_new-1]` (Feldman commitments)
+   `commits[k] = fᵢ_k · G` for `k ∈ [0, t_new-1]` (Feldman commitments)
 
-4. Broadcast `commits` to all participants (old ∪ new).
+4. Broadcast `commits`, chain key contribution (random 32 bytes), current `Generation`,
+   and group verification key to all participants (old ∪ new).
 
-5. For each new party `j`: send `fᵢ(xⱼ)` as a unicast P2P message.
+New-only parties receive and collect all old party broadcasts. All parties verify:
+```
+Σᵢ commits[i][0] == groupPubKey     (group key unchanged — fail fast)
+```
 
-### Round 2 — new parties: aggregate and publish
+At the end of Round 1, old parties compute and unicast sub-shares `fᵢ(xⱼ)` to each
+new party `j` (tagged as Round 2 messages).
 
-Each new party `j`, after receiving commits and evaluations from all `n_old` old parties:
+### Round 2 — new parties: verify, aggregate, and publish
+
+Each new party `j`, after receiving sub-share unicasts from all `n_old` old parties:
 
 1. Verify each received evaluation against its Feldman commitment:
    ```
@@ -96,27 +104,34 @@ Each new party `j`, after receiving commits and evaluations from all `n_old` old
    newSecretⱼ = Σᵢ fᵢ(xⱼ)
    ```
 
-3. Broadcast new public key share:
-   ```
-   newPubShareⱼ = newSecretⱼ · G
-   ```
+3. Broadcast new public key share (tagged as Round 3 message).
 
-### Round 3 — all parties: collect and verify
+Old-only parties (not in `newParties`) exit after Round 2 with a sentinel Config
+(`KeyShareBytes = nil`, `Generation = old + 1`). They have already verified the group
+key invariant in Round 1 and have no role in Rounds 2–3.
 
-All participants (old ∪ new) collect all `n_new` public key shares and verify:
+### Round 3 — new parties: collect and build Config
 
-```
-Σᵢ commits[i][0] == groupPubKey·G     (group key unchanged)
-```
+New parties collect all `n_new` public key shares and construct the new `tss.Config`:
 
-Each new party constructs its new `tss.Config`:
 ```go
-newKeyShare = frost.NewKeyShare(frost.Secp256k1, selfNewNum, newSecretⱼ.Bytes(),
-                                newPubShareⱼ.Encode(), groupKey)
+newConfig = &Config{
+    ID:              selfID,
+    Threshold:       newThreshold,
+    MaxSigners:      len(newParties),
+    Generation:      oldGeneration + 1,   // propagated from old parties' Round 1 broadcast
+    KeyShareBytes:   newKeyShare.Encode(),
+    GroupKey:        groupKey,             // unchanged
+    Parties:         newParties,
+    PartyMap:        BuildPartyMap(newParties),
+    PublicKeyShares: <collected from Round 3 in party order>,
+    ChainKey:        SHA256(ck_1 || ... || ck_N),  // from old parties' chain key contributions
+    RID:             SHA256(ChainKey),
+}
 ```
 
-`Config.Generation` is incremented by 1. Old-only parties (removed nodes) do not produce
-a new Config; their participation ends after Round 1.
+Generation is propagated from old parties (not hardcoded), ensuring correctness across
+chained reshares (e.g., generation 0 → 1 → 2).
 
 ### Correctness sketch
 
@@ -138,18 +153,19 @@ For any threshold-sized subset `S` of new parties, their Lagrange reconstruction
 
 A party's role depends on its membership in old and new committees:
 
-| Role         | Condition                              | Round 1     | Round 2     | Round 3     |
-|--------------|----------------------------------------|-------------|-------------|-------------|
-| Old-only     | in `oldParties`, not in `newParties`   | Send VSS    | Collect     | Collect + verify |
-| New-only     | in `newParties`, not in `oldParties`   | Receive VSS | Send pubshare | Collect + build Config |
-| Both         | in both                                | Send VSS    | Send pubshare | Collect + build Config |
+| Role         | Condition                              | Round 1          | Round 2          | Round 3              |
+|--------------|----------------------------------------|------------------|------------------|----------------------|
+| Old-only     | in `oldParties`, not in `newParties`   | Broadcast commits| Exit (done)      | —                    |
+| New-only     | in `newParties`, not in `oldParties`   | Receive commits  | Receive + verify | Broadcast + build Config |
+| Both         | in both                                | Broadcast commits| Receive + verify | Broadcast + build Config |
 
-All parties (old ∪ new) participate in the session and receive Round 1 broadcasts. This
-ensures every participant can verify the group key invariant in Round 3.
+All parties verify the group key invariant at the end of Round 1 (fail fast). Old parties
+also send sub-share unicasts to new parties at the Round 1→2 transition.
 
-Old-only parties do not produce a new `tss.Config`. Their local ReshareJob entry for the
-key is marked done with a sentinel indicating "no new share" — they will not be signers
-after reshare.
+Old-only parties exit after Round 2 with a sentinel `*Config` (`KeyShareBytes = nil`,
+`Generation` incremented). They have already verified group key preservation and have
+no role in the new committee. Their local ReshareJob entry is marked done with this
+sentinel — they will not be signers after reshare.
 
 ---
 
@@ -585,150 +601,84 @@ case msgReshare:
 
 ---
 
-## 9. tss layer design
+## 9. tss layer design ✅ Implemented
 
 ### 9.1 `Reshare` function signature
 
 ```go
-// ReshareParams holds the inputs to a reshare session.
-type ReshareParams struct {
-    SelfID       PartyID
-    OldParties   []PartyID   // sorted; must contain at least threshold+1 parties
-    NewParties   []PartyID   // sorted
-    OldThreshold int
-    NewThreshold int
-    // OldConfig is this party's current key share. Nil if SelfID is new-only
-    // (joining the group and has no prior share).
-    OldConfig    *Config
-}
-
 // Reshare returns the starting Round for a key reshare session.
-// The result value returned by Run is a *Config (new key share), or nil
-// if SelfID is old-only (not in NewParties).
-func Reshare(params ReshareParams) Round
+// The result value returned by Run is a *Config:
+//   - New parties: fully populated Config with new key share
+//   - Old-only parties: sentinel Config with KeyShareBytes = nil, Generation incremented
+func Reshare(cfg *Config, selfID PartyID, oldParties []PartyID, newParties []PartyID, newThreshold int) Round
 ```
+
+Parameters match the style of `Keygen(selfID, participants, threshold)`. `cfg` is the
+caller's existing Config (nil for new-only parties). `OldThreshold` is derived from
+`cfg.Threshold` (only old parties need it, and they always have a config).
 
 ### 9.2 Message payloads
 
+Three payload types, one per round. Broadcasts and unicasts use separate round numbers
+(unlike the original design which bundled both in Round 1). This simplifies `Receive()`
+— each round expects exactly one message type.
+
 ```go
 // reshareCommitPayload is the Round 1 broadcast from each old party.
-// Contains Feldman VSS commitments for the new polynomial.
 type reshareCommitPayload struct {
-    // Commitments[k] = fᵢ(k)·G encoded, for k in [0, newThreshold-1]
-    Commitments [][]byte `cbor:"c"`
+    Commitments [][]byte `cbor:"c"` // Feldman commitments: each Element.Encode()
+    ChainKey    []byte   `cbor:"k"` // 32-byte random chain key contribution
+    Generation  uint64   `cbor:"g"` // current generation (from old config)
+    GroupKey    []byte   `cbor:"v"` // group verification key
 }
 
-// reshareEvalPayload is the Round 1 P2P message from each old party to each new party.
-// Contains the polynomial evaluation for that new party's index.
+// reshareEvalPayload is the Round 2 unicast from each old party to each new party.
 type reshareEvalPayload struct {
-    Evaluation []byte `cbor:"e"` // fᵢ(xⱼ) as scalar bytes
+    SubShare []byte `cbor:"s"` // scalar encoding of f_i(j)
 }
 
-// resharePubSharePayload is the Round 2 broadcast from each new party.
-// Contains the new party's public key share for collection by all parties.
+// resharePubSharePayload is the Round 3 broadcast from each new party.
 type resharePubSharePayload struct {
-    PubShare []byte `cbor:"p"` // newSecretⱼ·G encoded
+    PublicKeyShare []byte `cbor:"p"` // keys.PublicKeyShare.Encode()
 }
 ```
 
 ### 9.3 Round structure
 
-**`reshareRound1`** — all parties participate; old parties send, new-only parties only receive.
-
-State held:
-```go
-type reshareRound1 struct {
-    params      ReshareParams
-    oldPartyMap map[PartyID]uint16  // old party → old numerical ID
-    newPartyMap map[PartyID]uint16  // new party → new numerical ID (1-based, sorted)
-    allParties  PartyIDSlice        // old ∪ new, sorted
-
-    mu            sync.Mutex
-    // Sent by self (if old party):
-    poly          *secretsharing.Polynomial  // fᵢ(x)
-    commitBytes   [][]byte                   // Feldman commitments
-    broadcastSent bool
-    evalsSent     bool
-
-    // Received from old parties:
-    commits   map[PartyID][]byte   // old partyID → encoded commitments
-    myEval    []byte               // fᵢ(xⱼ) received from old party i (if new party)
-    evalsRecv map[PartyID][]byte   // old partyID → my evaluation (indexed by sender)
-}
-```
+**`reshareRound1`** — old parties broadcast commitments; all parties collect and verify.
 
 `Finalize` logic:
-- If old party and not yet computed: compute `wᵢ`, create polynomial, store commits.
-- If not yet broadcast: emit Round 1 broadcast (commits) and Round 1 P2P messages (evals to each new party).
-- Wait until: all old-party broadcasts received AND (if self is new party) own evaluation received from every old party.
+- If old party, first call: decode own key share, compute Lagrange coefficient `λᵢ`,
+  compute weighted secret `λᵢ · sᵢ`, create polynomial via `ShardReturnPolynomial`,
+  compute Feldman commitments via `Commit`, generate random chain key contribution.
+- Broadcast `reshareCommitPayload` (round 1).
+- Wait until all `len(oldParties)` broadcasts received.
+- Verify group key preservation: `Σᵢ commitment_i[0] == groupPubKey` (fail fast).
+- Old parties: emit unicast `reshareEvalPayload` (round 2) to each new party.
 - Advance to `reshareRound2`.
 
-**`reshareRound2`** — new parties compute and broadcast public key shares. Old-only parties only collect.
+**`reshareRound2`** — new parties receive sub-shares, verify, compute, and broadcast.
 
-State held:
-```go
-type reshareRound2 struct {
-    params      ReshareParams
-    newPartyMap map[PartyID]uint16
-    allParties  PartyIDSlice
-
-    // From round 1:
-    commits   map[PartyID][][]byte  // old partyID → []commitment points
-    evalsRecv map[PartyID][]byte    // old partyID → my evaluation scalar bytes
-
-    mu            sync.Mutex
-    newSecret     *ecc.Scalar      // Σᵢ fᵢ(xⱼ) — nil if old-only
-    newPubShare   []byte           // newSecret·G encoded
-    broadcastSent bool
-    pubShares     map[PartyID][]byte  // new partyID → encoded pub share
-}
-```
+`Receive` logic:
+- Decode sub-share scalar from unicast.
+- Verify against Feldman commitments: `secretsharing.Verify(secp256k1, newID, subShare·G, commits)`.
+- Store verified sub-share.
 
 `Finalize` logic:
-- If new party and not yet computed: verify each eval against Feldman commits; sum evals.
-- If new party and not yet broadcast: emit Round 2 broadcast (new pub key share).
-- Wait until: all new-party broadcasts received.
+- If old+new party: compute own sub-share locally (no self-message needed).
+- Wait until sub-shares from all `len(oldParties)` received.
+- Combine: `newSecret = Σᵢ subShares[i]`.
+- Build `keys.KeyShare` with combined VSS commitment (element-wise sum).
+- Broadcast `resharePubSharePayload` (round 3).
 - Advance to `reshareRound3`.
+- **Old-only parties**: exit here, return sentinel `*Config` with `KeyShareBytes = nil`.
 
-**`reshareRound3`** — all parties verify group key invariant; new parties build Config.
-
-```go
-type reshareRound3 struct {
-    params      ReshareParams
-    newPartyMap map[PartyID]uint16
-
-    // From round 1:
-    oldCommits  map[PartyID][][]byte  // for group key verification
-
-    // From round 2:
-    newSecret   *ecc.Scalar   // nil if old-only
-    pubShares   map[PartyID][]byte
-}
-```
+**`reshareRound3`** — new parties collect public key shares and build Config.
 
 `Finalize` logic:
-- Verify: `Σᵢ oldCommits[i][0]·G == groupPubKey` (constant terms of old VSS polynomials sum to group key).
-- If old-only: return `(nil, nil, nil, nil)` — no new Config; Run returns nil result.
-- Build new `tss.Config`:
-  ```go
-  newKeyShare = frost.NewKeyShare(frost.Secp256k1, selfNewNum,
-                                  newSecret.Bytes(),
-                                  newPubShare,
-                                  oldConfig.GroupKey)
-  newConfig = &Config{
-      ID:              params.SelfID,
-      Threshold:       params.NewThreshold,
-      MaxSigners:      len(params.NewParties),
-      Generation:      oldConfig.Generation + 1,  // 0 if new-only with no old config
-      KeyShareBytes:   newKeyShare.Encode(),
-      GroupKey:        oldConfig.GroupKey,         // unchanged
-      Parties:         params.NewParties,
-      PartyMap:        params.newPartyMap,
-      PublicKeyShares: <encoded from pubShares in new party order>,
-      ChainKey:        <SHA256 of sorted new party pubshares>,
-      RID:             <SHA256 of ChainKey>,
-  }
-  ```
+- Wait until all `len(newParties)` pub shares received.
+- Combine chain keys: `SHA256(ck_1 || ... || ck_N)` from old parties (sorted order).
+- Build new `tss.Config` with `Generation = oldGeneration + 1`.
 - Return `(nil, nil, newConfig, nil)`.
 
 ### 9.4 New-party `PartyMap` assignment
@@ -743,19 +693,19 @@ newPartyMap = BuildPartyMap(NewParties)
 Old parties that remain in the new committee keep their new-committee index, not their
 old-committee index. The FROST configuration is entirely defined by the new committee.
 
-### 9.5 `runReshareOn` helper (in `tss/session.go` or a new `tss/reshare_runner.go`)
+### 9.5 `runReshareOn` helper (in node layer)
 
 ```go
-func runReshareOn(ctx context.Context, host *network.Host, sn *network.SessionNetwork,
-                  sessID string, params tss.ReshareParams) (*tss.Config, error) {
-    startRound := tss.Reshare(params)
+func runReshareOn(ctx context.Context, sn network.Network,
+                  cfg *tss.Config, selfID tss.PartyID,
+                  oldParties, newParties []tss.PartyID, newThreshold int) (*tss.Config, error) {
+    startRound := tss.Reshare(cfg, selfID, oldParties, newParties, newThreshold)
     result, err := tss.Run(ctx, startRound, sn)
     if err != nil {
         return nil, err
     }
-    if result == nil {
-        return nil, nil  // old-only party, no new config
-    }
+    // Old-only parties return a sentinel Config with KeyShareBytes = nil.
+    // New parties return a fully populated Config.
     return result.(*tss.Config), nil
 }
 ```
@@ -832,10 +782,12 @@ A newly-added node participates in reshare as a receiver only. It has no entry i
 `keyshards` for the key being reshared.
 
 - `runReshareSession` loads config: `cfg = nil` (not found).
-- `ReshareParams.OldConfig = nil`.
+- `Reshare(nil, selfID, oldParties, newParties, newThreshold)` — nil config is valid for new-only.
 - In `reshareRound1.Finalize`: self is not in `OldParties`, skip send step, only collect.
-- In `reshareRound2.Finalize`: compute new secret from received evals, broadcast pub share.
-- In `reshareRound3.Finalize`: build new Config with `Generation = 1` (no prior generation).
+  Generation and group key are received from old parties' round 1 broadcasts.
+- In `reshareRound2.Finalize`: verify sub-shares, compute new secret, broadcast pub share.
+- In `reshareRound3.Finalize`: build new Config with `Generation = oldGeneration + 1`
+  (propagated from old parties, not hardcoded — correct for chained reshares).
 
 ### 10.6 On-demand race between coordinator and non-coordinator
 

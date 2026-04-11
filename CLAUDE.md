@@ -123,7 +123,7 @@ When finishing a task, always provide a brief summary of:
 ### FROST (RFC 9591) on secp256k1
 - Keygen: thin adapter over `github.com/bytemare/dkg` (Feldman VSS-based DKG)
 - Sign: thin adapter over `github.com/bytemare/frost` (two-round Schnorr threshold signing)
-- Reshare: stub — planned using standard Lagrange-weighting on top of FROST-compatible shares
+- Reshare: Lagrange-weighting + Feldman VSS redistribution (3-round protocol; supports committee and threshold changes)
 
 ---
 

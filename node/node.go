@@ -426,6 +426,9 @@ func (n *Node) handleAuth(w http.ResponseWriter, r *http.Request) {
 		Aud         string `json:"aud"`           // production: JWT audience
 		Azp         string `json:"azp"`           // production: JWT authorized party
 		JWKSModulus string `json:"jwks_modulus"`  // production: RSA modulus hex
+
+		// Authorization key certificate fields
+		Certificate *AuthCertificate `json:"certificate,omitempty"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		httpError(w, http.StatusBadRequest, "decode body: "+err.Error())
@@ -440,6 +443,37 @@ func (n *Node) handleAuth(w http.ResponseWriter, r *http.Request) {
 	sessionPubBytes, err := hex.DecodeString(strings.TrimPrefix(req.SessionPub, "0x"))
 	if err != nil || len(sessionPubBytes) != 33 {
 		httpError(w, http.StatusBadRequest, "session_pub must be 33 hex-encoded bytes")
+		return
+	}
+
+	// Authorization key certificate path.
+	if req.Certificate != nil {
+		cert := req.Certificate
+		cert.GroupID = req.GroupID
+		cert.SessionPub = req.SessionPub
+
+		identity, err := n.auth.ValidateAuthCertificate(req.GroupID, cert)
+		if err != nil {
+			httpError(w, http.StatusUnauthorized, "certificate verification failed: "+err.Error())
+			return
+		}
+
+		pubHex := sessionPubToHex(sessionPubBytes)
+		n.sessions.Put(pubHex, &SessionInfo{
+			Sub: identity,
+			Exp: time.Unix(int64(cert.Expiry), 0),
+		})
+		n.log.Info("auth: session registered (auth key certificate)",
+			zap.String("group_id", req.GroupID),
+			zap.String("identity", identity),
+			zap.String("session_pub", pubHex))
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{
+			"status":     "ok",
+			"identity":   identity,
+			"expires_at": int64(cert.Expiry),
+		})
 		return
 	}
 
@@ -585,7 +619,7 @@ func (n *Node) handleKeygen(w http.ResponseWriter, r *http.Request) {
 	var authToken []byte
 	var authProof *AuthProof
 
-	if n.auth.HasIssuers(req.GroupID) {
+	if n.auth.HasAuthPolicy(req.GroupID) {
 		if req.SessionPub != "" {
 			// New path: session-based auth.
 			ap, resolvedKeyID, err := n.validateSessionRequest(
@@ -748,7 +782,7 @@ func (n *Node) handleSign(w http.ResponseWriter, r *http.Request) {
 	var authToken []byte
 	var authProof *AuthProof
 
-	if n.auth.HasIssuers(req.GroupID) {
+	if n.auth.HasAuthPolicy(req.GroupID) {
 		if req.SessionPub != "" {
 			// New path: session-based auth.
 			ap, resolvedKeyID, err := n.validateSessionRequest(

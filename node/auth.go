@@ -3,6 +3,9 @@ package node
 import (
 	"context"
 	"crypto/rsa"
+	"crypto/sha256"
+	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"math/big"
@@ -31,11 +34,13 @@ func IssuerHash(issuer string) [32]byte {
 	return [32]byte(crypto.Keccak256Hash([]byte(issuer)))
 }
 
-// GroupAuth is a per-group OAuth trust store with a shared JWKS cache.
+// GroupAuth is a per-group auth policy store with a shared JWKS cache.
 // Thread-safe; designed to be populated from chain events.
+// Supports two auth policies: OAuth issuers and authorization keys.
 type GroupAuth struct {
 	mu        sync.RWMutex
 	groups    map[string][]IssuerInfo // groupID hex → trusted issuers
+	authKeys  map[string][][]byte    // groupID hex → trusted auth key pubkeys (33-byte compressed)
 	cache     *jwk.Cache
 	testMode  bool
 	circuitVK []byte // verification key for the jwt_auth circuit (bb format)
@@ -46,6 +51,7 @@ func newGroupAuth(ctx context.Context, testMode bool, circuitVK []byte, log *zap
 	cache := jwk.NewCache(ctx)
 	return &GroupAuth{
 		groups:    make(map[string][]IssuerInfo),
+		authKeys:  make(map[string][][]byte),
 		cache:     cache,
 		testMode:  testMode,
 		circuitVK: circuitVK,
@@ -99,6 +105,131 @@ func (g *GroupAuth) HasIssuers(groupID string) bool {
 	g.mu.RLock()
 	defer g.mu.RUnlock()
 	return len(g.groups[groupID]) > 0
+}
+
+// HasAuthKeys returns true when the group has at least one trusted authorization key.
+func (g *GroupAuth) HasAuthKeys(groupID string) bool {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	return len(g.authKeys[groupID]) > 0
+}
+
+// HasAuthPolicy returns true when the group has any auth policy configured
+// (OAuth issuers or authorization keys).
+func (g *GroupAuth) HasAuthPolicy(groupID string) bool {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	return len(g.groups[groupID]) > 0 || len(g.authKeys[groupID]) > 0
+}
+
+// SetAuthKeys replaces the full authorization key list for a group.
+func (g *GroupAuth) SetAuthKeys(groupID string, keys [][]byte) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.authKeys[groupID] = keys
+}
+
+// AddAuthKey appends one authorization key to a group's trust list.
+func (g *GroupAuth) AddAuthKey(groupID string, pubkey []byte) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.authKeys[groupID] = append(g.authKeys[groupID], pubkey)
+}
+
+// AuthKeyHash returns keccak256(pubkey) matching the on-chain bytes32 key.
+func AuthKeyHash(pubkey []byte) [32]byte {
+	return [32]byte(crypto.Keccak256Hash(pubkey))
+}
+
+// RemoveAuthKey removes an authorization key identified by its on-chain keccak256 hash.
+func (g *GroupAuth) RemoveAuthKey(groupID string, keyHash [32]byte) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	keys := g.authKeys[groupID]
+	for i, k := range keys {
+		if AuthKeyHash(k) == keyHash {
+			g.authKeys[groupID] = append(keys[:i], keys[i+1:]...)
+			return
+		}
+	}
+}
+
+// IsAuthKeyTrusted returns true if the given pubkey is a trusted authorization key for the group.
+func (g *GroupAuth) IsAuthKeyTrusted(groupID string, pubkey []byte) bool {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	hash := AuthKeyHash(pubkey)
+	for _, k := range g.authKeys[groupID] {
+		if AuthKeyHash(k) == hash {
+			return true
+		}
+	}
+	return false
+}
+
+// AuthCertificate is an authorization key certificate: a signed binding
+// of an identity + session key, issued by an application holding a trusted
+// authorization key. The signature covers:
+//   SHA256(identity || ":" || group_id || ":" || session_pub_hex || ":" || expiry_8bytes_BE)
+type AuthCertificate struct {
+	Identity   string `json:"identity"`    // application-defined identity (agent ID, service name, etc.)
+	GroupID    string `json:"group_id"`    // target group
+	SessionPub string `json:"session_pub"` // hex, 33-byte compressed secp256k1
+	Expiry     uint64 `json:"expiry"`      // unix timestamp
+	AuthKeyPub string `json:"auth_key_pub"` // hex, 33-byte compressed — which auth key signed this
+	Signature  string `json:"signature"`   // hex, 64-byte [R || S]
+}
+
+// authCertHash builds the canonical hash that the auth key signs.
+func authCertHash(identity, groupID, sessionPubHex string, expiry uint64) [32]byte {
+	h := sha256.New()
+	h.Write([]byte(identity))
+	h.Write([]byte(":"))
+	h.Write([]byte(groupID))
+	h.Write([]byte(":"))
+	h.Write([]byte(sessionPubHex))
+	h.Write([]byte(":"))
+	var ts [8]byte
+	binary.BigEndian.PutUint64(ts[:], expiry)
+	h.Write(ts[:])
+	var out [32]byte
+	copy(out[:], h.Sum(nil))
+	return out
+}
+
+// ValidateAuthCertificate verifies that the certificate is signed by a trusted
+// authorization key for the group and returns the identity.
+func (g *GroupAuth) ValidateAuthCertificate(groupID string, cert *AuthCertificate) (string, error) {
+	if cert.Identity == "" {
+		return "", fmt.Errorf("certificate missing identity")
+	}
+	if cert.Expiry == 0 {
+		return "", fmt.Errorf("certificate missing expiry")
+	}
+	if time.Now().After(time.Unix(int64(cert.Expiry), 0)) {
+		return "", fmt.Errorf("certificate expired")
+	}
+
+	authKeyBytes, err := hex.DecodeString(strings.TrimPrefix(cert.AuthKeyPub, "0x"))
+	if err != nil || len(authKeyBytes) != 33 {
+		return "", fmt.Errorf("invalid auth_key_pub: must be 33 hex-encoded bytes")
+	}
+
+	if !g.IsAuthKeyTrusted(groupID, authKeyBytes) {
+		return "", fmt.Errorf("untrusted authorization key")
+	}
+
+	sigBytes, err := hex.DecodeString(strings.TrimPrefix(cert.Signature, "0x"))
+	if err != nil || len(sigBytes) != 64 {
+		return "", fmt.Errorf("invalid signature: must be 64 hex-encoded bytes")
+	}
+
+	hash := authCertHash(cert.Identity, cert.GroupID, cert.SessionPub, cert.Expiry)
+	if !crypto.VerifySignature(authKeyBytes, hash[:], sigBytes) {
+		return "", fmt.Errorf("certificate signature verification failed")
+	}
+
+	return cert.Identity, nil
 }
 
 // AuthProof is the authentication block carried in coord messages.

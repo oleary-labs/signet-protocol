@@ -30,10 +30,13 @@ const (
 		{"name":"getActiveNodes","type":"function","inputs":[],"outputs":[{"name":"","type":"address[]"}],"stateMutability":"view"},
 		{"name":"threshold","type":"function","inputs":[],"outputs":[{"name":"","type":"uint256"}],"stateMutability":"view"},
 		{"name":"getIssuers","type":"function","inputs":[],"outputs":[{"name":"","type":"tuple[]","components":[{"name":"issuer","type":"string"},{"name":"clientIds","type":"string[]"}]}],"stateMutability":"view"},
+		{"name":"getAuthKeys","type":"function","inputs":[],"outputs":[{"name":"","type":"bytes[]"}],"stateMutability":"view"},
 		{"name":"NodeJoined","type":"event","inputs":[{"name":"node","type":"address","indexed":true}],"anonymous":false},
 		{"name":"NodeRemoved","type":"event","inputs":[{"name":"node","type":"address","indexed":true}],"anonymous":false},
 		{"name":"IssuerAdded","type":"event","inputs":[{"name":"h","type":"bytes32","indexed":true},{"name":"issuer","type":"string","indexed":false},{"name":"clientIds","type":"string[]","indexed":false}],"anonymous":false},
-		{"name":"IssuerRemoved","type":"event","inputs":[{"name":"h","type":"bytes32","indexed":true},{"name":"issuer","type":"string","indexed":false}],"anonymous":false}
+		{"name":"IssuerRemoved","type":"event","inputs":[{"name":"h","type":"bytes32","indexed":true},{"name":"issuer","type":"string","indexed":false}],"anonymous":false},
+		{"name":"AuthKeyAdded","type":"event","inputs":[{"name":"keyHash","type":"bytes32","indexed":true},{"name":"pubkey","type":"bytes","indexed":false}],"anonymous":false},
+		{"name":"AuthKeyRemoved","type":"event","inputs":[{"name":"keyHash","type":"bytes32","indexed":true},{"name":"pubkey","type":"bytes","indexed":false}],"anonymous":false}
 	]`
 
 	pollInterval = 2 * time.Second
@@ -169,6 +172,15 @@ func (c *ChainClient) buildGroupInfo(ctx context.Context, grpAddr common.Address
 			})
 		}
 		c.n.auth.SetIssuers(ctx, hexGrp, infos)
+	}
+
+	// Load authorization keys and register them with the auth store.
+	rawAuthKeys, err := c.callGetAuthKeys(ctx, grpAddr)
+	if err != nil {
+		c.log.Warn("chain: getAuthKeys", zap.String("group", grpAddr.Hex()), zap.Error(err))
+	} else if len(rawAuthKeys) > 0 {
+		hexGrp := strings.ToLower(grpAddr.Hex())
+		c.n.auth.SetAuthKeys(hexGrp, rawAuthKeys)
 	}
 
 	return &GroupInfo{
@@ -314,12 +326,14 @@ func (c *ChainClient) pollGroupEvents(ctx context.Context, grpAddr common.Addres
 	removedID := c.grpABI.Events["NodeRemoved"].ID
 	issuerAddedID := c.grpABI.Events["IssuerAdded"].ID
 	issuerRemovedID := c.grpABI.Events["IssuerRemoved"].ID
+	authKeyAddedID := c.grpABI.Events["AuthKeyAdded"].ID
+	authKeyRemovedID := c.grpABI.Events["AuthKeyRemoved"].ID
 
 	query := ethereum.FilterQuery{
 		FromBlock: new(big.Int).SetUint64(from),
 		ToBlock:   new(big.Int).SetUint64(to),
 		Addresses: []common.Address{grpAddr},
-		Topics:    [][]common.Hash{{joinedID, removedID, issuerAddedID, issuerRemovedID}},
+		Topics:    [][]common.Hash{{joinedID, removedID, issuerAddedID, issuerRemovedID, authKeyAddedID, authKeyRemovedID}},
 	}
 	logs, err := c.eth.FilterLogs(ctx, query)
 	if err != nil {
@@ -390,6 +404,27 @@ func (c *ChainClient) pollGroupEvents(ctx context.Context, grpAddr common.Addres
 			h := [32]byte(lg.Topics[1])
 			c.n.auth.RemoveIssuer(hexGrp, h)
 			c.log.Info("chain: issuer removed", zap.String("group", hexGrp))
+
+		case authKeyAddedID:
+			if len(lg.Topics) < 2 {
+				continue
+			}
+			out := make(map[string]interface{})
+			if err := c.grpABI.UnpackIntoMap(out, "AuthKeyAdded", lg.Data); err != nil {
+				c.log.Warn("chain: unpack AuthKeyAdded", zap.Error(err))
+				continue
+			}
+			pubkey, _ := out["pubkey"].([]byte)
+			c.n.auth.AddAuthKey(hexGrp, pubkey)
+			c.log.Info("chain: auth key added", zap.String("group", hexGrp))
+
+		case authKeyRemovedID:
+			if len(lg.Topics) < 2 {
+				continue
+			}
+			h := [32]byte(lg.Topics[1])
+			c.n.auth.RemoveAuthKey(hexGrp, h)
+			c.log.Info("chain: auth key removed", zap.String("group", hexGrp))
 		}
 	}
 	return nil
@@ -486,6 +521,30 @@ func (c *ChainClient) callGetIssuers(ctx context.Context, grpAddr common.Address
 		out[i].ClientIds = cids
 	}
 	return out, nil
+}
+
+// callGetAuthKeys calls getAuthKeys() on a group contract and returns the result.
+func (c *ChainClient) callGetAuthKeys(ctx context.Context, grpAddr common.Address) ([][]byte, error) {
+	data, err := c.grpABI.Pack("getAuthKeys")
+	if err != nil {
+		return nil, err
+	}
+	result, err := c.eth.CallContract(ctx, ethereum.CallMsg{To: &grpAddr, Data: data}, nil)
+	if err != nil {
+		return nil, err
+	}
+	results, err := c.grpABI.Unpack("getAuthKeys", result)
+	if err != nil {
+		return nil, err
+	}
+	if len(results) == 0 {
+		return nil, nil
+	}
+	raw, ok := results[0].([][]byte)
+	if !ok {
+		return nil, fmt.Errorf("unexpected type %T for getAuthKeys result", results[0])
+	}
+	return raw, nil
 }
 
 func (c *ChainClient) callThreshold(ctx context.Context, grpAddr common.Address) (*big.Int, error) {

@@ -86,8 +86,8 @@ func (n *Node) handleCoordStream(s libp2pnet.Stream) {
 		return
 	}
 
-	// Validate auth if the group has trusted issuers configured.
-	if n.auth.HasIssuers(msg.GroupID) {
+	// Validate auth if the group has any auth policy configured.
+	if n.auth.HasAuthPolicy(msg.GroupID) {
 		var keyPrefix string
 		if msg.Auth != nil {
 			// New path: AuthProof (ZK proof or test-mode attestation).

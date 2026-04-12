@@ -59,7 +59,7 @@ contract SignetFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable, IS
     // -------------------------------------------------------------------------
 
     /// @inheritdoc ISignetFactory
-    function registerNode(bytes calldata pubkey, bool isOpen) external {
+    function registerNode(bytes calldata pubkey, bool isOpen, address operator) external {
         require(!nodes[msg.sender].registered, "already registered");
         require(_pubkeyToAddress(pubkey) == msg.sender, "pubkey does not match sender");
 
@@ -67,18 +67,20 @@ contract SignetFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable, IS
             pubkey: pubkey,
             isOpen: isOpen,
             registered: true,
-            registeredAt: block.timestamp
+            registeredAt: block.timestamp,
+            operator: operator
         });
         registeredNodes.push(msg.sender);
 
-        emit NodeRegistered(msg.sender, pubkey, isOpen);
+        emit NodeRegistered(msg.sender, pubkey, isOpen, operator);
     }
 
     /// @inheritdoc ISignetFactory
-    function updateOpenStatus(bool isOpen) external {
-        require(nodes[msg.sender].registered, "not registered");
-        nodes[msg.sender].isOpen = isOpen;
-        emit NodeOpenStatusChanged(msg.sender, isOpen);
+    function updateOpenStatus(address node, bool isOpen) external {
+        require(nodes[node].registered, "not registered");
+        require(msg.sender == _effectiveOperator(node), "not operator");
+        nodes[node].isOpen = isOpen;
+        emit NodeOpenStatusChanged(node, isOpen);
     }
 
     /// @inheritdoc ISignetFactory
@@ -87,8 +89,21 @@ contract SignetFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable, IS
     }
 
     /// @inheritdoc ISignetFactory
+    function setOperator(address node, address newOperator) external {
+        require(nodes[node].registered, "not registered");
+        require(msg.sender == _effectiveOperator(node), "not operator");
+        nodes[node].operator = newOperator;
+        emit OperatorChanged(node, newOperator);
+    }
+
+    /// @inheritdoc ISignetFactory
     function getRegisteredNodes() external view returns (address[] memory) {
         return registeredNodes;
+    }
+
+    /// @inheritdoc ISignetFactory
+    function getNodeOperator(address node) external view returns (address) {
+        return _effectiveOperator(node);
     }
 
     // -------------------------------------------------------------------------
@@ -197,6 +212,12 @@ contract SignetFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable, IS
     // -------------------------------------------------------------------------
     // Internal helpers
     // -------------------------------------------------------------------------
+
+    /// @dev Returns the effective operator for a node: stored operator, or node itself if zero.
+    function _effectiveOperator(address node) internal view returns (address) {
+        address op = nodes[node].operator;
+        return op == address(0) ? node : op;
+    }
 
     /// @dev Derives the Ethereum address from an uncompressed secp256k1 public key.
     ///      pubkey must be 65 bytes with a 0x04 prefix.

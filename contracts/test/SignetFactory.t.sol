@@ -65,8 +65,8 @@ contract SignetFactoryTest is PubkeyHelpers {
     function testRegisterNode() public {
         vm.prank(node1);
         vm.expectEmit(true, false, false, true);
-        emit ISignetFactory.NodeRegistered(node1, pubkey1, true);
-        factory.registerNode(pubkey1, true);
+        emit ISignetFactory.NodeRegistered(node1, pubkey1, true, address(0));
+        factory.registerNode(pubkey1, true, address(0));
 
         ISignetFactory.NodeInfo memory info = factory.getNode(node1);
         assertEq(info.registered, true);
@@ -83,7 +83,7 @@ contract SignetFactoryTest is PubkeyHelpers {
         bytes memory bad = new bytes(64);  // missing 0x04 prefix byte
         vm.prank(node1);
         vm.expectRevert("invalid uncompressed pubkey");
-        factory.registerNode(bad, false);
+        factory.registerNode(bad, false, address(0));
     }
 
     function testRegisterNode_BadPrefix() public {
@@ -91,22 +91,22 @@ contract SignetFactoryTest is PubkeyHelpers {
         bad[0] = 0x02;  // compressed prefix
         vm.prank(node1);
         vm.expectRevert("invalid uncompressed pubkey");
-        factory.registerNode(bad, false);
+        factory.registerNode(bad, false, address(0));
     }
 
     function testRegisterNode_WrongAddress() public {
         // node2 tries to register node1's pubkey
         vm.prank(node2);
         vm.expectRevert("pubkey does not match sender");
-        factory.registerNode(pubkey1, false);
+        factory.registerNode(pubkey1, false, address(0));
     }
 
     function testRegisterNode_AlreadyRegistered() public {
         vm.prank(node1);
-        factory.registerNode(pubkey1, true);
+        factory.registerNode(pubkey1, true, address(0));
         vm.prank(node1);
         vm.expectRevert("already registered");
-        factory.registerNode(pubkey1, false);
+        factory.registerNode(pubkey1, false, address(0));
     }
 
     // -------------------------------------------------------------------------
@@ -115,24 +115,24 @@ contract SignetFactoryTest is PubkeyHelpers {
 
     function testUpdateOpenStatus() public {
         vm.prank(node1);
-        factory.registerNode(pubkey1, true);
+        factory.registerNode(pubkey1, true, address(0));
 
         vm.prank(node1);
         vm.expectEmit(true, false, false, true);
         emit ISignetFactory.NodeOpenStatusChanged(node1, false);
-        factory.updateOpenStatus(false);
+        factory.updateOpenStatus(node1, false);
 
         assertEq(factory.getNode(node1).isOpen, false);
 
         vm.prank(node1);
-        factory.updateOpenStatus(true);
+        factory.updateOpenStatus(node1, true);
         assertEq(factory.getNode(node1).isOpen, true);
     }
 
     function testUpdateOpenStatus_NotRegistered() public {
         vm.prank(node1);
         vm.expectRevert("not registered");
-        factory.updateOpenStatus(false);
+        factory.updateOpenStatus(node1, false);
     }
 
     // -------------------------------------------------------------------------
@@ -140,9 +140,9 @@ contract SignetFactoryTest is PubkeyHelpers {
     // -------------------------------------------------------------------------
 
     function _registerAll() internal {
-        vm.prank(node1); factory.registerNode(pubkey1, true);
-        vm.prank(node2); factory.registerNode(pubkey2, true);
-        vm.prank(node3); factory.registerNode(pubkey3, true);
+        vm.prank(node1); factory.registerNode(pubkey1, true, address(0));
+        vm.prank(node2); factory.registerNode(pubkey2, true, address(0));
+        vm.prank(node3); factory.registerNode(pubkey3, true, address(0));
     }
 
     ISignetGroup.InitialIssuer[] internal _noIssuers;
@@ -173,9 +173,9 @@ contract SignetFactoryTest is PubkeyHelpers {
     // -------------------------------------------------------------------------
 
     function testCreateGroup_MixedOpenness() public {
-        vm.prank(node1); factory.registerNode(pubkey1, true);   // open
-        vm.prank(node2); factory.registerNode(pubkey2, false);  // not open
-        vm.prank(node3); factory.registerNode(pubkey3, true);   // open
+        vm.prank(node1); factory.registerNode(pubkey1, true, address(0));   // open
+        vm.prank(node2); factory.registerNode(pubkey2, false, address(0));  // not open
+        vm.prank(node3); factory.registerNode(pubkey3, true, address(0));   // open
 
         address[] memory addrs = new address[](3);
         addrs[0] = node1; addrs[1] = node2; addrs[2] = node3;
@@ -212,7 +212,7 @@ contract SignetFactoryTest is PubkeyHelpers {
     }
 
     function testCreateGroup_UnregisteredNode() public {
-        vm.prank(node1); factory.registerNode(pubkey1, true);
+        vm.prank(node1); factory.registerNode(pubkey1, true, address(0));
         // node2 and node3 not registered
 
         address[] memory addrs = new address[](2);
@@ -262,7 +262,7 @@ contract SignetFactoryTest is PubkeyHelpers {
     }
 
     function testGetNodePubkey() public {
-        vm.prank(node1); factory.registerNode(pubkey1, true);
+        vm.prank(node1); factory.registerNode(pubkey1, true, address(0));
         assertEq(keccak256(factory.getNodePubkey(node1)), keccak256(pubkey1));
     }
 
@@ -340,5 +340,97 @@ contract SignetFactoryTest is PubkeyHelpers {
         }
         assertTrue(foundG1);
         assertTrue(foundG2);
+    }
+
+    // -------------------------------------------------------------------------
+    // Operator key
+    // -------------------------------------------------------------------------
+
+    function testRegisterNode_WithOperator() public {
+        address operator = address(0xDEAD);
+        vm.prank(node1);
+        vm.expectEmit(true, false, false, true);
+        emit ISignetFactory.NodeRegistered(node1, pubkey1, true, operator);
+        factory.registerNode(pubkey1, true, operator);
+
+        ISignetFactory.NodeInfo memory info = factory.getNode(node1);
+        assertEq(info.operator, operator);
+        assertEq(factory.getNodeOperator(node1), operator);
+    }
+
+    function testGetNodeOperator_ZeroDefaultsToNode() public {
+        vm.prank(node1);
+        factory.registerNode(pubkey1, true, address(0));
+
+        assertEq(factory.getNodeOperator(node1), node1);
+    }
+
+    function testSetOperator_ByNode() public {
+        vm.prank(node1);
+        factory.registerNode(pubkey1, true, address(0));
+
+        address newOp = address(0xBEEF);
+        vm.prank(node1);
+        vm.expectEmit(true, true, false, false);
+        emit ISignetFactory.OperatorChanged(node1, newOp);
+        factory.setOperator(node1, newOp);
+
+        assertEq(factory.getNodeOperator(node1), newOp);
+    }
+
+    function testSetOperator_ByCurrentOperator() public {
+        address op1 = address(0xDEAD);
+        vm.prank(node1);
+        factory.registerNode(pubkey1, true, op1);
+
+        address op2 = address(0xBEEF);
+        vm.prank(op1);
+        factory.setOperator(node1, op2);
+
+        assertEq(factory.getNodeOperator(node1), op2);
+    }
+
+    function testSetOperator_NotOperator() public {
+        address op = address(0xDEAD);
+        vm.prank(node1);
+        factory.registerNode(pubkey1, true, op);
+
+        // node1 is no longer the operator — cannot set
+        vm.prank(node1);
+        vm.expectRevert("not operator");
+        factory.setOperator(node1, address(0xBEEF));
+    }
+
+    function testSetOperator_ClearToSelf() public {
+        address op = address(0xDEAD);
+        vm.prank(node1);
+        factory.registerNode(pubkey1, true, op);
+
+        // Operator clears back to zero (node becomes its own operator again)
+        vm.prank(op);
+        factory.setOperator(node1, address(0));
+
+        assertEq(factory.getNodeOperator(node1), node1);
+    }
+
+    function testUpdateOpenStatus_ByOperator() public {
+        address op = address(0xDEAD);
+        vm.prank(node1);
+        factory.registerNode(pubkey1, true, op);
+
+        vm.prank(op);
+        factory.updateOpenStatus(node1, false);
+        assertEq(factory.getNode(node1).isOpen, false);
+    }
+
+    function testUpdateOpenStatus_NotOperator() public {
+        address op = address(0xDEAD);
+        vm.prank(node1);
+        factory.registerNode(pubkey1, true, op);
+
+        // node1 is not the operator
+        vm.prank(node1);
+        vm.expectRevert("not operator");
+        factory.updateOpenStatus(node1, false);
     }
 }

@@ -97,11 +97,13 @@ interface ISignetGroup {
     /// @notice Invite a registered node post-creation.
     function inviteNode(address node) external;
 
-    /// @notice Accept an existing pending invitation (caller must be the pending node).
-    function acceptInvite() external;
+    /// @notice Accept an existing pending invitation.
+    ///         Caller must be the node's effective operator (node itself if no operator set).
+    function acceptInvite(address node) external;
 
-    /// @notice Decline a pending invitation (caller must be the pending node).
-    function declineInvite() external;
+    /// @notice Decline a pending invitation.
+    ///         Caller must be the node's effective operator (node itself if no operator set).
+    function declineInvite(address node) external;
 
     /// @notice Queue a removal for an active node (manager or node itself).
     function queueRemoval(address node) external;

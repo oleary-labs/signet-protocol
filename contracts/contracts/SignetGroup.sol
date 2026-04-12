@@ -147,25 +147,27 @@ contract SignetGroup is Initializable, ISignetGroup {
     }
 
     /// @inheritdoc ISignetGroup
-    function acceptInvite() external {
-        require(nodeStatus[msg.sender] == NodeStatus.Pending, "not pending");
-        _removeFromPending(msg.sender);
-        _addToActive(msg.sender);
-        emit NodeJoined(msg.sender);
+    function acceptInvite(address node) external {
+        require(nodeStatus[node] == NodeStatus.Pending, "not pending");
+        require(msg.sender == ISignetFactory(factory).getNodeOperator(node), "not operator");
+        _removeFromPending(node);
+        _addToActive(node);
+        emit NodeJoined(node);
     }
 
     /// @inheritdoc ISignetGroup
-    function declineInvite() external {
-        require(nodeStatus[msg.sender] == NodeStatus.Pending, "not pending");
-        _removeFromPending(msg.sender);
-        emit NodeDeclined(msg.sender);
+    function declineInvite(address node) external {
+        require(nodeStatus[node] == NodeStatus.Pending, "not pending");
+        require(msg.sender == ISignetFactory(factory).getNodeOperator(node), "not operator");
+        _removeFromPending(node);
+        emit NodeDeclined(node);
     }
 
     /// @inheritdoc ISignetGroup
     function queueRemoval(address node) external {
         require(
-            msg.sender == manager || msg.sender == node,
-            "not manager or self"
+            msg.sender == manager || msg.sender == ISignetFactory(factory).getNodeOperator(node),
+            "not manager or operator"
         );
         require(nodeStatus[node] == NodeStatus.Active, "node not active");
         require(_removalRequests[node].executeAfter == 0, "removal already queued");

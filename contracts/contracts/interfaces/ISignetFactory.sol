@@ -15,14 +15,16 @@ interface ISignetFactory {
         bool isOpen;        // true = any group may add this node without acceptance
         bool registered;
         uint256 registeredAt;
+        address operator;   // cold key for admin ops; address(0) = node is its own operator
     }
 
     // -------------------------------------------------------------------------
     // Events
     // -------------------------------------------------------------------------
 
-    event NodeRegistered(address indexed node, bytes pubkey, bool isOpen);
+    event NodeRegistered(address indexed node, bytes pubkey, bool isOpen, address operator);
     event NodeOpenStatusChanged(address indexed node, bool isOpen);
+    event OperatorChanged(address indexed node, address indexed newOperator);
     event GroupCreated(address indexed group, address indexed creator, uint256 threshold);
     event NodeActivatedInGroup(address indexed node, address indexed group);
     event NodeDeactivatedInGroup(address indexed node, address indexed group);
@@ -34,13 +36,22 @@ interface ISignetFactory {
     /// @notice Register the caller as a signet node.
     /// @param pubkey 65-byte uncompressed secp256k1 public key (0x04 prefix).
     /// @param isOpen Whether this node accepts group invitations automatically.
-    function registerNode(bytes calldata pubkey, bool isOpen) external;
+    /// @param operator Cold key address for admin ops (address(0) = node is its own operator).
+    function registerNode(bytes calldata pubkey, bool isOpen, address operator) external;
 
-    /// @notice Toggle the open/permissioned flag for the caller's node.
-    function updateOpenStatus(bool isOpen) external;
+    /// @notice Toggle the open/permissioned flag for a node.
+    ///         Callable by the node's effective operator.
+    function updateOpenStatus(address node, bool isOpen) external;
+
+    /// @notice Change the operator address for a node.
+    ///         Callable by the current effective operator of the node.
+    function setOperator(address node, address newOperator) external;
 
     /// @notice Return NodeInfo for a given address.
     function getNode(address node) external view returns (NodeInfo memory);
+
+    /// @notice Return the effective operator for a node (node address if operator is zero).
+    function getNodeOperator(address node) external view returns (address);
 
     /// @notice Return the full list of ever-registered node addresses.
     function getRegisteredNodes() external view returns (address[] memory);

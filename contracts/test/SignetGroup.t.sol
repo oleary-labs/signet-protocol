@@ -47,10 +47,10 @@ contract SignetGroupTest is PubkeyHelpersGroup {
         factory = SignetFactory(address(new ERC1967Proxy(address(factoryImpl), initData)));
 
         // Register all nodes as open by default
-        vm.prank(node1); factory.registerNode(pub1, true);
-        vm.prank(node2); factory.registerNode(pub2, true);
-        vm.prank(node3); factory.registerNode(pub3, true);
-        vm.prank(node4); factory.registerNode(pub4, true);
+        vm.prank(node1); factory.registerNode(pub1, true, address(0));
+        vm.prank(node2); factory.registerNode(pub2, true, address(0));
+        vm.prank(node3); factory.registerNode(pub3, true, address(0));
+        vm.prank(node4); factory.registerNode(pub4, true, address(0));
     }
 
     // -------------------------------------------------------------------------
@@ -91,7 +91,7 @@ contract SignetGroupTest is PubkeyHelpersGroup {
 
     function testPermissionedNodePending() public {
         // Make node2 non-open
-        vm.prank(node2); factory.updateOpenStatus(false);
+        vm.prank(node2); factory.updateOpenStatus(node2, false);
 
         address[] memory addrs = new address[](3);
         addrs[0] = node1; addrs[1] = node2; addrs[2] = node3;
@@ -107,7 +107,7 @@ contract SignetGroupTest is PubkeyHelpersGroup {
     // -------------------------------------------------------------------------
 
     function testAcceptInvite() public {
-        vm.prank(node2); factory.updateOpenStatus(false);
+        vm.prank(node2); factory.updateOpenStatus(node2, false);
 
         address[] memory addrs = new address[](3);
         addrs[0] = node1; addrs[1] = node2; addrs[2] = node3;
@@ -116,23 +116,23 @@ contract SignetGroupTest is PubkeyHelpersGroup {
         vm.prank(node2);
         vm.expectEmit(true, false, false, false);
         emit ISignetGroup.NodeJoined(node2);
-        g.acceptInvite();
+        g.acceptInvite(node2);
 
         assertEq(g.getActiveNodes().length, 3);
         assertEq(g.getPendingNodes().length, 0);
         assertEq(uint8(g.nodeStatus(node2)), uint8(ISignetGroup.NodeStatus.Active));
     }
 
-    function testOnlyNodeCanAccept() public {
-        vm.prank(node2); factory.updateOpenStatus(false);
+    function testOnlyOperatorCanAccept() public {
+        vm.prank(node2); factory.updateOpenStatus(node2, false);
         address[] memory addrs = new address[](3);
         addrs[0] = node1; addrs[1] = node2; addrs[2] = node3;
         ISignetGroup g = _createGroup(addrs);
 
-        // node1 is not pending — cannot accept
+        // node1 is not the operator of node2 — cannot accept
         vm.prank(node1);
-        vm.expectRevert("not pending");
-        g.acceptInvite();
+        vm.expectRevert("not operator");
+        g.acceptInvite(node2);
     }
 
     // -------------------------------------------------------------------------
@@ -140,7 +140,7 @@ contract SignetGroupTest is PubkeyHelpersGroup {
     // -------------------------------------------------------------------------
 
     function testDeclineInvite() public {
-        vm.prank(node2); factory.updateOpenStatus(false);
+        vm.prank(node2); factory.updateOpenStatus(node2, false);
         address[] memory addrs = new address[](3);
         addrs[0] = node1; addrs[1] = node2; addrs[2] = node3;
         ISignetGroup g = _createGroup(addrs);
@@ -148,7 +148,7 @@ contract SignetGroupTest is PubkeyHelpersGroup {
         vm.prank(node2);
         vm.expectEmit(true, false, false, false);
         emit ISignetGroup.NodeDeclined(node2);
-        g.declineInvite();
+        g.declineInvite(node2);
 
         assertEq(g.getPendingNodes().length, 0);
         assertEq(uint8(g.nodeStatus(node2)), uint8(ISignetGroup.NodeStatus.None));
@@ -170,7 +170,7 @@ contract SignetGroupTest is PubkeyHelpersGroup {
     }
 
     function testInviteNode_PermissionedNode() public {
-        vm.prank(node4); factory.updateOpenStatus(false);
+        vm.prank(node4); factory.updateOpenStatus(node4, false);
         ISignetGroup g = _threeNodeGroup();
 
         vm.prank(manager);
@@ -409,7 +409,7 @@ contract SignetGroupTest is PubkeyHelpersGroup {
     }
 
     function testAcceptInvite_FiresFactoryCallback() public {
-        vm.prank(node2); factory.updateOpenStatus(false);
+        vm.prank(node2); factory.updateOpenStatus(node2, false);
 
         address[] memory addrs = new address[](3);
         addrs[0] = node1; addrs[1] = node2; addrs[2] = node3;
@@ -419,12 +419,100 @@ contract SignetGroupTest is PubkeyHelpersGroup {
         assertEq(factory.getNodeGroups(node2).length, 0);
 
         vm.prank(node2);
-        g.acceptInvite();
+        g.acceptInvite(node2);
 
         // now active → factory should track it
         address[] memory groups2 = factory.getNodeGroups(node2);
         assertEq(groups2.length, 1);
         assertEq(groups2[0], address(g));
+    }
+
+    // -------------------------------------------------------------------------
+    // Operator key — group membership operations
+    // -------------------------------------------------------------------------
+
+    function testOperator_AcceptInvite() public {
+        address operator2 = address(0xBEEF);
+        vm.prank(node2);
+        factory.setOperator(node2, operator2);
+
+        vm.prank(operator2);
+        factory.updateOpenStatus(node2, false);
+
+        address[] memory addrs = new address[](3);
+        addrs[0] = node1; addrs[1] = node2; addrs[2] = node3;
+        ISignetGroup g = _createGroup(addrs);
+
+        // node2 pending; operator accepts
+        vm.prank(operator2);
+        g.acceptInvite(node2);
+
+        assertEq(uint8(g.nodeStatus(node2)), uint8(ISignetGroup.NodeStatus.Active));
+    }
+
+    function testOperator_DeclineInvite() public {
+        address operator2 = address(0xBEEF);
+        vm.prank(node2);
+        factory.setOperator(node2, operator2);
+
+        vm.prank(operator2);
+        factory.updateOpenStatus(node2, false);
+
+        address[] memory addrs = new address[](3);
+        addrs[0] = node1; addrs[1] = node2; addrs[2] = node3;
+        ISignetGroup g = _createGroup(addrs);
+
+        vm.prank(operator2);
+        g.declineInvite(node2);
+
+        assertEq(uint8(g.nodeStatus(node2)), uint8(ISignetGroup.NodeStatus.None));
+    }
+
+    function testOperator_QueueRemoval() public {
+        address operator1 = address(0xBEEF);
+        vm.prank(node1);
+        factory.setOperator(node1, operator1);
+
+        ISignetGroup g = _threeNodeGroup();
+
+        // Operator queues self-removal
+        vm.prank(operator1);
+        g.queueRemoval(node1);
+
+        ISignetGroup.RemovalRequest memory req = g.removalRequests(node1);
+        assertTrue(req.executeAfter > 0);
+        assertEq(req.initiator, operator1);
+    }
+
+    function testOperator_NodeCannotQueueRemovalIfOperatorSet() public {
+        address operator1 = address(0xBEEF);
+        vm.prank(node1);
+        factory.setOperator(node1, operator1);
+
+        ISignetGroup g = _threeNodeGroup();
+
+        // node1 (hot key) cannot queue its own removal — operator controls that
+        vm.prank(node1);
+        vm.expectRevert("not manager or operator");
+        g.queueRemoval(node1);
+    }
+
+    function testOperator_CancelRemoval() public {
+        address operator1 = address(0xBEEF);
+        vm.prank(node1);
+        factory.setOperator(node1, operator1);
+
+        ISignetGroup g = _threeNodeGroup();
+
+        vm.prank(operator1);
+        g.queueRemoval(node1);
+
+        // Operator (who is the initiator) can cancel
+        vm.prank(operator1);
+        g.cancelRemoval(node1);
+
+        ISignetGroup.RemovalRequest memory req = g.removalRequests(node1);
+        assertEq(req.executeAfter, 0);
     }
 }
 
@@ -467,9 +555,9 @@ contract SignetGroupIssuerTest is PubkeyHelpersGroup {
         );
         factory = SignetFactory(address(new ERC1967Proxy(address(factoryImpl), initData)));
 
-        vm.prank(node1); factory.registerNode(pub1, true);
-        vm.prank(node2); factory.registerNode(pub2, true);
-        vm.prank(node3); factory.registerNode(pub3, true);
+        vm.prank(node1); factory.registerNode(pub1, true, address(0));
+        vm.prank(node2); factory.registerNode(pub2, true, address(0));
+        vm.prank(node3); factory.registerNode(pub3, true, address(0));
     }
 
     ISignetGroup.InitialIssuer[] internal _noIssuers;
@@ -750,9 +838,9 @@ contract SignetGroupAuthKeyTest is PubkeyHelpersGroup {
         );
         factory = SignetFactory(address(new ERC1967Proxy(address(factoryImpl), initData)));
 
-        vm.prank(node1); factory.registerNode(pub1, true);
-        vm.prank(node2); factory.registerNode(pub2, true);
-        vm.prank(node3); factory.registerNode(pub3, true);
+        vm.prank(node1); factory.registerNode(pub1, true, address(0));
+        vm.prank(node2); factory.registerNode(pub2, true, address(0));
+        vm.prank(node3); factory.registerNode(pub3, true, address(0));
     }
 
     ISignetGroup.InitialIssuer[] internal _noIssuers;

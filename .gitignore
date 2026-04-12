@@ -40,3 +40,6 @@ settings.local.json
 
 # Test data
 /data/
+
+# Apalache model checker output
+_apalache-out/

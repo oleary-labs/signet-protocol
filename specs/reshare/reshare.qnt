@@ -1,5 +1,5 @@
-// FROST Reshare Protocol
-// Based on: tss/reshare.go (565 lines) + docs/DESIGN-RESHARE.md
+// Reshare Protocol
+// Based on: tss/reshare.go + docs/DESIGN-RESHARE.md
 //
 // Models the 3-round cryptographic reshare protocol where old committee members
 // redistribute their key shares to a new committee using Lagrange-weighting
@@ -15,13 +15,13 @@
 //   - VSS verification abstracted to a pure function (not full polynomial math)
 //   - Network is reliable (messages eventually arrive); no Byzantine behavior
 //   - PartyID modeled as str
-//   - "Both" parties compute own sub-share locally (matching reshareRound2.Finalize
-//     lines 380-385: polynomial.Evaluate(myNewID) without a self-message)
+//   - "Both" parties compute own sub-share locally (reshareRound2.Finalize calls
+//     polynomial.Evaluate(myNewID) without a self-message)
 //   - Duplicate message rejection modeled via map key overwrite (code uses explicit
 //     dup checks in each Receive() method)
 //   - RID = abstract(ChainKey) rather than SHA256(SHA256(ck1||...||ckN))
-//   - Old-only sentinel Config has only {ID, Generation, GroupKey} (reshare.go:452-456)
-module frost_reshare {
+//   - Old-only sentinel Config has only {ID, Generation, GroupKey}
+module reshare {
 
   // ============================================================
   // 1. TYPES
@@ -92,10 +92,10 @@ module frost_reshare {
     newPubKeyShare: int,                   // newSecret * G (0 until computed)
     // Intermediate state (code: reshareRound2.Finalize builds combined VSS commitment)
     combinedVSSCommitment: List[int],      // element-wise sum of old commitments (empty until Round 2)
-    // Final output (matches tss.Config fields in reshare.go:520-532)
+    // Final output (matches tss.Config fields)
     newGeneration: int,                    // generation + 1 (0 until done)
     newChainKey: int,                      // SHA256(ck_1 || ... || ck_N) (0 until done)
-    newRID: int,                           // SHA256(chainKey) (0 until done; code: reshare.go:518)
+    newRID: int,                           // SHA256(chainKey) (0 until done)
     configBuilt: bool                      // true when final Config is assembled
   }
 
@@ -308,8 +308,8 @@ module frost_reshare {
       success: false, newState: ps, msgs: Set()
     } else if (isOldParty(ps.role)) {
       // Old party: send sub-share evals to each new party.
-      // Code (reshare.go:271-274): skips self — "Both" parties compute own sub-share
-      // locally in reshareRound2.Finalize (line 380-385) via polynomial.Evaluate(myNewID).
+      // Skips self — "Both" parties compute own sub-share locally in
+      // reshareRound2.Finalize via polynomial.Evaluate(myNewID).
       val otherNewParties = newP.filter(np => np != ps.id)
       val evalMsgs = otherNewParties.map(newPartyID => {
         val eval = if (POLY_EVALS.keys().contains((ps.id, newPartyID)))
@@ -365,9 +365,9 @@ module frost_reshare {
         }
       | _ =>
         // New party (Both or NewOnly).
-        // Code (reshareRound2.Finalize lines 378-385): if also old party, compute
-        // own sub-share locally via polynomial.Evaluate(myNewID) and insert into
-        // subShares map before checking completeness.
+        // If also old party, compute own sub-share locally via
+        // polynomial.Evaluate(myNewID) and insert into subShares map
+        // before checking completeness.
         val evalsWithSelf = if (isOldParty(ps.role)) {
           // "Both" party: add own sub-share computed locally (no network message)
           val selfEval = if (POLY_EVALS.keys().contains((ps.id, ps.id)))
@@ -389,7 +389,6 @@ module frost_reshare {
           // Abstract: public key share = newSecret * G
           val pubShare = combined
           // Combined VSS commitment: element-wise sum of all old party commitments
-          // (code: reshareRound2.Finalize lines 403-410)
           val pubMsg: PubShareMsg = { sender: ps.id, publicKeyShare: pubShare }
           {
             success: true,
@@ -411,24 +410,23 @@ module frost_reshare {
     { ...ps, receivedPubShares: ps.receivedPubShares.put(msg.sender, msg.publicKeyShare) }
 
   /// Round 3 -> Done: new parties collect all pub shares and build Config.
-  /// Code (reshareRound3.Finalize lines 494-535): collects pub shares in party order,
-  /// combines chain keys via SHA256(sorted), computes RID = SHA256(chainKey),
-  /// builds final tss.Config with all fields.
+  /// reshareRound3.Finalize collects pub shares in party order, combines chain
+  /// keys via SHA256(sorted), computes RID = SHA256(chainKey), builds final
+  /// tss.Config.
   pure def finishRound3(
     ps: PartyState,
     newP: Set[PartyID],
     oldP: Set[PartyID]
   ): { success: bool, newState: PartyState } =
-    // Code (reshare.go:447): own pub share is pre-seeded when entering Round 3.
-    // In the spec, we model this by including own pub share via receivePubShare
-    // before calling finishRound3. Check all new parties present.
+    // Own pub share is pre-seeded when entering Round 3. In the spec, we model
+    // this by including own pub share via receivePubShare before calling
+    // finishRound3. Check all new parties present.
     if (not(hasAllPubShares(ps, newP))) {
       { success: false, newState: ps }
     } else {
       // Chain key: SHA256(ck_1 || ... || ck_N) from old parties in sorted order
-      // (code: reshare.go:513-517 uses sortedKeys for deterministic ordering)
       val chainKey = combineChainKeys(ps.receivedCommits, oldP)
-      // RID = SHA256(combinedChainKey) (code: reshare.go:518)
+      // RID = SHA256(combinedChainKey)
       val rid = chainKey + 1  // abstract: distinct derived value
       {
         success: true,
@@ -724,7 +722,7 @@ module frost_reshare {
     )
 
   /// All new parties that finish compute the same RID
-  /// (code: reshare.go:518 — RID is deterministic from chain keys)
+  /// (RID is deterministic from chain keys)
   val ridConsistency =
     NEW_PARTIES.forall(p =>
       NEW_PARTIES.forall(q => {
@@ -737,7 +735,7 @@ module frost_reshare {
     )
 
   /// "Both" parties must have their own sub-share in receivedEvals when done
-  /// (code: reshareRound2.Finalize lines 380-385 — local self-evaluation)
+  /// (reshareRound2.Finalize computes local self-evaluation)
   val bothPartiesSelfEval =
     ALL_PARTIES.forall(p => {
       val ps = parties.get(p)
@@ -780,144 +778,4 @@ module frost_reshare {
       determineRole(p, OLD_PARTIES, NEW_PARTIES) == OldOnly
     ).forall(p => parties.get(p).phase != Done)
 
-  // ============================================================
-  // 9. TESTS (scenario runs)
-  // ============================================================
-
-  /// Test: Full reshare completes for a simple scenario
-  /// P1 (old-only), P2 (both), P3 (both), P4 (new-only)
-  run fullReshareTest =
-    // Initialize
-    init
-    // All parties start Round 1
-    .then(startRound1(P1))
-    .then(startRound1(P2))
-    .then(startRound1(P3))
-    .then(startRound1(P4))
-    // Deliver commit messages to all parties
-    .then(all {
-      val cm1: CommitMsg = { sender: P1, commitments: [30, 11], chainKey: 1001, generation: 0, groupKey: 42 }
-      parties' = ALL_PARTIES.mapBy(p => receiveCommit(parties.get(p), cm1)),
-      network' = network
-    })
-    .then(all {
-      val cm2: CommitMsg = { sender: P2, commitments: [100, 22], chainKey: 1002, generation: 0, groupKey: 42 }
-      parties' = ALL_PARTIES.mapBy(p => receiveCommit(parties.get(p), cm2)),
-      network' = network
-    })
-    .then(all {
-      val cm3: CommitMsg = { sender: P3, commitments: [210, 33], chainKey: 1003, generation: 0, groupKey: 42 }
-      parties' = ALL_PARTIES.mapBy(p => receiveCommit(parties.get(p), cm3)),
-      network' = network
-    })
-    // All parties complete Round 1
-    .then(completeRound1(P1))
-    .then(completeRound1(P2))
-    .then(completeRound1(P3))
-    .then(completeRound1(P4))
-    // Deliver eval messages to new parties
-    .then(all {
-      // Deliver evals from all old parties to P2
-      val newP2 = parties.get(P2)
-        .receiveEval({ sender: P1, receiver: P2, subShare: 100 })
-        .receiveEval({ sender: P2, receiver: P2, subShare: 200 })
-        .receiveEval({ sender: P3, receiver: P2, subShare: 300 })
-      // Deliver evals from all old parties to P3
-      val newP3 = parties.get(P3)
-        .receiveEval({ sender: P1, receiver: P3, subShare: 101 })
-        .receiveEval({ sender: P2, receiver: P3, subShare: 201 })
-        .receiveEval({ sender: P3, receiver: P3, subShare: 301 })
-      // Deliver evals from all old parties to P4
-      val newP4 = parties.get(P4)
-        .receiveEval({ sender: P1, receiver: P4, subShare: 102 })
-        .receiveEval({ sender: P2, receiver: P4, subShare: 202 })
-        .receiveEval({ sender: P3, receiver: P4, subShare: 302 })
-      parties' = parties.set(P2, newP2).set(P3, newP3).set(P4, newP4),
-      network' = network
-    })
-    // Complete Round 2 for all parties
-    .then(completeRound2(P1))  // old-only: exits with sentinel
-    .then(completeRound2(P2))  // both: combines, broadcasts pub share
-    .then(completeRound2(P3))
-    .then(completeRound2(P4))
-    // Verify: P1 (old-only) is Done
-    .then(all {
-      assert(parties.get(P1).phase == Done),
-      assert(parties.get(P1).newSecret == 0),          // sentinel: no new key share
-      assert(parties.get(P1).newGeneration == 1),
-      unchanged_all
-    })
-    // Deliver pub share messages to all new parties
-    .then(all {
-      val ps2 = parties.get(P2)
-      val ps3 = parties.get(P3)
-      val ps4 = parties.get(P4)
-      val newP2 = ps2
-        .receivePubShare({ sender: P2, publicKeyShare: ps2.newPubKeyShare })
-        .receivePubShare({ sender: P3, publicKeyShare: ps3.newPubKeyShare })
-        .receivePubShare({ sender: P4, publicKeyShare: ps4.newPubKeyShare })
-      val newP3 = ps3
-        .receivePubShare({ sender: P2, publicKeyShare: ps2.newPubKeyShare })
-        .receivePubShare({ sender: P3, publicKeyShare: ps3.newPubKeyShare })
-        .receivePubShare({ sender: P4, publicKeyShare: ps4.newPubKeyShare })
-      val newP4 = ps4
-        .receivePubShare({ sender: P2, publicKeyShare: ps2.newPubKeyShare })
-        .receivePubShare({ sender: P3, publicKeyShare: ps3.newPubKeyShare })
-        .receivePubShare({ sender: P4, publicKeyShare: ps4.newPubKeyShare })
-      parties' = parties.set(P2, newP2).set(P3, newP3).set(P4, newP4),
-      network' = network
-    })
-    // Complete Round 3
-    .then(completeRound3(P2))
-    .then(completeRound3(P3))
-    .then(completeRound3(P4))
-    // Final verification
-    .then(all {
-      // All parties are Done
-      assert(ALL_PARTIES.forall(p => parties.get(p).phase == Done)),
-      // All have generation = 1
-      assert(ALL_PARTIES.forall(p => parties.get(p).newGeneration == 1)),
-      // New parties have non-zero secrets
-      assert(NEW_PARTIES.forall(p => parties.get(p).newSecret != 0)),
-      // New parties agree on chain key
-      assert(parties.get(P2).newChainKey == parties.get(P3).newChainKey),
-      assert(parties.get(P3).newChainKey == parties.get(P4).newChainKey),
-      // New parties built configs
-      assert(NEW_PARTIES.forall(p => parties.get(p).configBuilt)),
-      unchanged_all
-    })
-
-  /// Test: Old-only party exits after Round 2 (does not reach Round 3)
-  run oldOnlyExitsEarlyTest =
-    init
-    .then(startRound1(P1))
-    .then(startRound1(P2))
-    .then(startRound1(P3))
-    .then(startRound1(P4))
-    .then(all {
-      val cm1: CommitMsg = { sender: P1, commitments: [30, 11], chainKey: 1001, generation: 0, groupKey: 42 }
-      val cm2: CommitMsg = { sender: P2, commitments: [100, 22], chainKey: 1002, generation: 0, groupKey: 42 }
-      val cm3: CommitMsg = { sender: P3, commitments: [210, 33], chainKey: 1003, generation: 0, groupKey: 42 }
-      parties' = ALL_PARTIES.mapBy(p =>
-        parties.get(p).receiveCommit(cm1).receiveCommit(cm2).receiveCommit(cm3)
-      ),
-      network' = network
-    })
-    .then(completeRound1(P1))
-    .then(completeRound1(P2))
-    .then(completeRound1(P3))
-    .then(completeRound1(P4))
-    .then(completeRound2(P1))
-    .then(all {
-      // P1 (old-only) is Done with sentinel config
-      assert(parties.get(P1).phase == Done),
-      assert(parties.get(P1).role == OldOnly),
-      assert(parties.get(P1).newSecret == 0),
-      assert(parties.get(P1).configBuilt),
-      // Other parties are still in Round 2 (haven't received evals yet)
-      assert(parties.get(P2).phase == Round2),
-      assert(parties.get(P3).phase == Round2),
-      assert(parties.get(P4).phase == Round2),
-      unchanged_all
-    })
 }

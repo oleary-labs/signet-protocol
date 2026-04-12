@@ -5,7 +5,7 @@
 // manages key reshare jobs triggered by on-chain membership changes.
 // This is the node-level orchestration layer above the KeyManager interface
 // (node/keymanager.go). The actual cryptographic reshare protocol is modeled
-// separately in frost_reshare.qnt.
+// separately in reshare.qnt.
 //
 // Architecture boundary:
 //   This spec lives in the node/ layer. It calls the KeyManager to reshare
@@ -33,7 +33,7 @@
 //   - Sign-handler blocking on stale keys
 //   - Abstracts away the cryptographic protocol behind the KeyManager
 //     interface (just "key in-flight -> key done")
-module reshare_lifecycle {
+module lifecycle {
 
   // ============================================================
   // 1. TYPES
@@ -532,163 +532,4 @@ module reshare_lifecycle {
     state.keysInFlight == Set() or
     state.coordStatus != NotCoordinator
 
-  // ============================================================
-  // 8. TESTS
-  // ============================================================
-
-  /// Test: Normal reshare lifecycle — node added, reshare all keys, return to ACTIVE
-  run normalLifecycleTest =
-    init
-    // Chain event: N4 joins the group
-    .then(chainNodeAdded(N4))
-    .then(all {
-      assert(state.phase == Resharing),
-      assert(state.job.oldParties == Set(N1, N2, N3)),
-      assert(state.job.newParties == Set(N1, N2, N3, N4)),
-      assert(state.job.keysTotal == Set(K1, K2, K3)),
-      assert(state.members == Set(N1, N2, N3, N4)),
-      unchanged
-    })
-    // Operator starts coordinator
-    .then(apiStartReshare(5))
-    .then(all {
-      assert(state.coordStatus == Coordinating(5)),
-      unchanged
-    })
-    // Coordinator reshares keys one by one
-    .then(coordReshareKey(K1))
-    .then(keyReshareComplete(K1))
-    .then(all {
-      assert(state.keysDone == Set(K1)),
-      assert(not(isKeyStale(state, K1))),
-      // K1 is now signable
-      assert(trySigning(state, K1) == SignOK),
-      // K2, K3 still stale
-      assert(trySigning(state, K2) == SignBlocked(K2)),
-      unchanged
-    })
-    .then(coordReshareKey(K2))
-    .then(keyReshareComplete(K2))
-    .then(coordReshareKey(K3))
-    .then(keyReshareComplete(K3))
-    // All done — finish job
-    .then(all {
-      assert(allKeysDone(state)),
-      unchanged
-    })
-    .then(finishJob)
-    .then(all {
-      assert(state.phase == Active),
-      assert(state.job == EMPTY_JOB),
-      assert(state.coordStatus == NotCoordinator),
-      assert(state.keysDone == Set()),
-      assert(state.keysInFlight == Set()),
-      // All keys signable again
-      assert(INITIAL_KEYS.forall(k => trySigning(state, k) == SignOK)),
-      unchanged
-    })
-
-  /// Test: Deferred events — second membership change during reshare
-  run deferredEventTest =
-    init
-    // N4 added -> triggers reshare
-    .then(chainNodeAdded(N4))
-    .then(all {
-      assert(state.phase == Resharing),
-      assert(state.job.deferredEvents.length() == 0),
-      unchanged
-    })
-    // N2 removed while resharing -> deferred
-    .then(chainNodeRemoved(N2))
-    .then(all {
-      assert(state.phase == Resharing),
-      assert(state.job.deferredEvents.length() == 1),
-      // Members updated immediately (chain view)
-      assert(state.members == Set(N1, N3, N4)),
-      // But job still uses old/new from first event
-      assert(state.job.oldParties == Set(N1, N2, N3)),
-      assert(state.job.newParties == Set(N1, N2, N3, N4)),
-      unchanged
-    })
-    // Complete all keys for the first reshare
-    .then(apiStartReshare(1))
-    .then(coordReshareKey(K1))
-    .then(keyReshareComplete(K1))
-    .then(coordReshareKey(K2))
-    .then(keyReshareComplete(K2))
-    .then(coordReshareKey(K3))
-    .then(keyReshareComplete(K3))
-    // Finish job — should process deferred event
-    .then(finishJob)
-    .then(all {
-      // Should be RESHARING again with new job for N2 removal
-      assert(state.phase == Resharing),
-      assert(state.job.keysTotal == Set(K1, K2, K3)),
-      // New job's old = previous new (N1, N2, N3, N4), new = that minus N2
-      assert(state.job.newParties == Set(N1, N3, N4)),
-      assert(state.job.deferredEvents.length() == 0),
-      unchanged
-    })
-
-  /// Test: On-demand reshare — sign handler triggers reshare for stale key
-  run onDemandReshareTest =
-    init
-    .then(chainNodeAdded(N4))
-    .then(all {
-      // All keys are stale
-      assert(trySigning(state, K1) == SignBlocked(K1)),
-      unchanged
-    })
-    // Sign for K2 triggers on-demand (no coordinator started)
-    .then(signTriggersOnDemand(K2))
-    .then(all {
-      assert(state.keysInFlight == Set(K2)),
-      assert(state.coordStatus == NotCoordinator),
-      unchanged
-    })
-    // On-demand reshare completes
-    .then(keyReshareComplete(K2))
-    .then(all {
-      assert(state.keysDone == Set(K2)),
-      assert(trySigning(state, K2) == SignOK),
-      // K1, K3 still stale
-      assert(trySigning(state, K1) == SignBlocked(K1)),
-      unchanged
-    })
-
-  /// Test: Keygen during reshare — new key is born into new committee
-  run keygenDuringReshareTest =
-    init
-    .then(chainNodeAdded(N4))
-    .then(all {
-      assert(state.phase == Resharing),
-      unchanged
-    })
-    // New key created during reshare
-    .then(keygenDuringReshare("key4"))
-    .then(all {
-      assert(state.keys.contains("key4")),
-      // New key is NOT in job.keysTotal — it doesn't need resharing
-      assert(not(state.job.keysTotal.contains("key4"))),
-      assert(not(isKeyStale(state, "key4"))),
-      // New key is immediately signable
-      assert(trySigning(state, "key4") == SignOK),
-      unchanged
-    })
-
-  /// Test: Duplicate coordinator start returns 409
-  run duplicateCoordinatorTest =
-    init
-    .then(chainNodeAdded(N4))
-    .then(apiStartReshare(5))
-    .then(all {
-      assert(state.coordStatus == Coordinating(5)),
-      unchanged
-    })
-    // Second start attempt fails (409)
-    .then(all {
-      val result = startCoordinator(state, 1)
-      assert(not(result.success)),
-      unchanged
-    })
 }

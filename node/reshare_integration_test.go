@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"os"
 	"sync"
 	"testing"
 	"time"
@@ -231,10 +232,10 @@ func clusterSign(t *testing.T, ctx context.Context, cluster []*testNode, groupID
 	return sigs[0]
 }
 
-// TestReshareIntegration_ShrinkCommittee runs keygen on a 4-node committee,
+// TestReshareIntegration_ShrinkCommittee runs keygen on a 5-node committee,
 // then reshares to remove one node. Verifies that:
-//   - the 3 remaining nodes hold the same group key after reshare
-//   - signing with the new 3-party committee produces a valid signature
+//   - the 4 remaining nodes hold the same group key after reshare
+//   - signing with the new 4-party committee produces a valid signature
 //   - the removed node gets a sentinel config (KeyShareBytes == nil)
 func TestReshareIntegration_ShrinkCommittee(t *testing.T) {
 	if testing.Short() {
@@ -244,19 +245,19 @@ func TestReshareIntegration_ShrinkCommittee(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
-	// Create 4 nodes; keygen uses all 4, then we remove the last one.
-	cluster, cleanup := newTestNodeCluster(t, ctx, 4)
+	// Create 5 nodes; keygen uses all 5, then we remove the last one.
+	cluster, cleanup := newTestNodeCluster(t, ctx, 5)
 	defer cleanup()
 
 	groupID := "0xgroup1"
 	keyID := "k1"
 
-	allParties := make([]tss.PartyID, 4)
-	for i := 0; i < 4; i++ {
+	allParties := make([]tss.PartyID, 5)
+	for i := 0; i < 5; i++ {
 		allParties[i] = cluster[i].host.Self()
 	}
-	newParties := make([]tss.PartyID, 3)
-	copy(newParties, allParties[:3])
+	newParties := make([]tss.PartyID, 4)
+	copy(newParties, allParties[:4])
 
 	// Set group membership (4 nodes) for keygen.
 	setGroupMembership(cluster, groupID, allParties, 2)
@@ -272,7 +273,7 @@ func TestReshareIntegration_ShrinkCommittee(t *testing.T) {
 	}
 	origGroupKey := info0.GroupKey
 
-	// Step 2: Create reshare job (shrink: remove node 3).
+	// Step 2: Create reshare job (shrink: remove node 4).
 	for _, tn := range cluster {
 		if err := tn.n.createReshareJob(groupID, "node_removed", allParties, newParties, 2); err != nil {
 			t.Fatalf("create reshare job: %v", err)
@@ -283,7 +284,7 @@ func TestReshareIntegration_ShrinkCommittee(t *testing.T) {
 	if err := cluster[0].n.runReshareSession(ctx, groupID, keyID); err != nil {
 		t.Fatalf("runReshareSession: %v", err)
 	}
-	t.Log("reshare complete — committee shrank from 4 to 3")
+	t.Log("reshare complete — committee shrank from 5 to 4")
 
 	// Wait for all participants to record done.
 	deadline := time.Now().Add(5 * time.Second)
@@ -302,8 +303,8 @@ func TestReshareIntegration_ShrinkCommittee(t *testing.T) {
 		time.Sleep(50 * time.Millisecond)
 	}
 
-	// Step 4: Verify remaining 3 nodes have the same group key.
-	for i := 0; i < 3; i++ {
+	// Step 4: Verify remaining 4 nodes have the same group key.
+	for i := 0; i < 4; i++ {
 		info, err := cluster[i].km.GetKeyInfo(groupID, keyID)
 		if err != nil {
 			t.Fatalf("party %d get key info: %v", i, err)
@@ -316,8 +317,8 @@ func TestReshareIntegration_ShrinkCommittee(t *testing.T) {
 		}
 	}
 
-	// Step 5: Verify removed node (node 3) got sentinel config.
-	removedInfo, err := cluster[3].km.GetKeyInfo(groupID, keyID)
+	// Step 5: Verify removed node (node 4) got sentinel config.
+	removedInfo, err := cluster[4].km.GetKeyInfo(groupID, keyID)
 	if err != nil {
 		t.Fatalf("removed node get key info: %v", err)
 	}
@@ -329,13 +330,13 @@ func TestReshareIntegration_ShrinkCommittee(t *testing.T) {
 		t.Fatal("removed node: expected sentinel config, got nil")
 	}
 
-	// Step 6: Sign with the new 3-party committee.
-	setGroupMembership(cluster[:3], groupID, newParties, 2)
+	// Step 6: Sign with the new 4-party committee.
+	setGroupMembership(cluster[:4], groupID, newParties, 2)
 	var msgHash [32]byte
 	for i := range msgHash {
 		msgHash[i] = byte(i + 1)
 	}
-	sig := clusterSign(t, ctx, cluster[:3], groupID, keyID, msgHash[:])
+	sig := clusterSign(t, ctx, cluster[:4], groupID, keyID, msgHash[:])
 
 	ethSig, err := sig.SigEthereum()
 	if err != nil {
@@ -344,7 +345,7 @@ func TestReshareIntegration_ShrinkCommittee(t *testing.T) {
 	if len(ethSig) != 65 {
 		t.Fatalf("expected 65-byte ethereum signature, got %d", len(ethSig))
 	}
-	t.Logf("signature produced after shrink reshare: 0x%x", ethSig)
+	t.Logf("signature produced after shrink reshare (5→4): 0x%x", ethSig)
 }
 
 // TestReshareIntegration_GrowCommittee runs keygen on a 3-node committee, then
@@ -564,6 +565,145 @@ func TestReshareIntegration_OnDemandViaSign(t *testing.T) {
 		t.Fatalf("expected 65-byte ethereum signature, got %d", len(ethSig))
 	}
 	t.Logf("signature after on-demand reshare: 0x%x", ethSig)
+}
+
+// TestReshareIntegration_ScaleReshare generates keys on a 5-node committee,
+// removes one node, and reshares all keys via the coordinator loop.
+// Validates group key preservation and signing on the new committee.
+//
+// Default: 1000 keys. Override with RESHARE_SCALE_KEYS=10000.
+func TestReshareIntegration_ScaleReshare(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping scale reshare test in short mode")
+	}
+
+	numKeys := 1000
+	if v := os.Getenv("RESHARE_SCALE_KEYS"); v != "" {
+		if _, err := fmt.Sscanf(v, "%d", &numKeys); err != nil {
+			t.Fatalf("invalid RESHARE_SCALE_KEYS=%q", v)
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer cancel()
+
+	const numNodes = 5
+	cluster, cleanup := newTestNodeCluster(t, ctx, numNodes)
+	defer cleanup()
+
+	groupID := "0xscale"
+
+	allParties := make([]tss.PartyID, numNodes)
+	for i := 0; i < numNodes; i++ {
+		allParties[i] = cluster[i].host.Self()
+	}
+	newParties := make([]tss.PartyID, numNodes-1)
+	copy(newParties, allParties[:numNodes-1])
+
+	setGroupMembership(cluster, groupID, allParties, 2)
+
+	// Phase 1: concurrent keygen.
+	t.Logf("keygen: %d keys on %d nodes...", numKeys, numNodes)
+	keygenStart := time.Now()
+
+	keyIDs := make([]string, numKeys)
+	for i := range keyIDs {
+		keyIDs[i] = fmt.Sprintf("k%d", i)
+	}
+
+	sem := make(chan struct{}, 12)
+	var wg sync.WaitGroup
+	for ki := range keyIDs {
+		sem <- struct{}{}
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			clusterKeygen(t, ctx, cluster, groupID, keyIDs[idx])
+		}(ki)
+	}
+	wg.Wait()
+
+	keygenDur := time.Since(keygenStart)
+	t.Logf("keygen: %d keys in %s (%.1f keys/sec)",
+		numKeys, keygenDur, float64(numKeys)/keygenDur.Seconds())
+
+	// Sample original group keys for verification.
+	sampleSize := 10
+	if sampleSize > numKeys {
+		sampleSize = numKeys
+	}
+	origGroupKeys := make(map[string][]byte, sampleSize)
+	for i := 0; i < sampleSize; i++ {
+		info, err := cluster[0].km.GetKeyInfo(groupID, keyIDs[i])
+		if err != nil || info == nil {
+			t.Fatalf("get key info %s: %v", keyIDs[i], err)
+		}
+		origGroupKeys[keyIDs[i]] = info.GroupKey
+	}
+
+	// Phase 2: create reshare job (remove last node).
+	t.Logf("reshare: removing node %d, resharing %d keys...", numNodes-1, numKeys)
+	reshareStart := time.Now()
+
+	for _, tn := range cluster {
+		if err := tn.n.createReshareJob(groupID, "node_removed", allParties, newParties, 2); err != nil {
+			t.Fatalf("create reshare job: %v", err)
+		}
+	}
+
+	// Phase 3: run coordinator loop from node 0.
+	coordConc := 60 / numNodes
+	if coordConc < 1 {
+		coordConc = 1
+	}
+
+	coordDone := make(chan struct{})
+	go func() {
+		cluster[0].n.coordinatorLoop(groupID, cluster[0].n.reshareJobs[groupID], coordConc)
+		close(coordDone)
+	}()
+
+	select {
+	case <-coordDone:
+	case <-ctx.Done():
+		t.Fatal("coordinator loop timed out")
+	}
+
+	reshareDur := time.Since(reshareStart)
+	t.Logf("reshare: %d keys in %s (%.1f keys/sec)",
+		numKeys, reshareDur, float64(numKeys)/reshareDur.Seconds())
+
+	// Phase 4: verify group keys preserved.
+	for keyID, origKey := range origGroupKeys {
+		for i := 0; i < numNodes-1; i++ {
+			info, err := cluster[i].km.GetKeyInfo(groupID, keyID)
+			if err != nil || info == nil {
+				t.Fatalf("node %d key %s: missing after reshare", i, keyID)
+			}
+			if !bytes.Equal(info.GroupKey, origKey) {
+				t.Errorf("node %d key %s: group key changed", i, keyID)
+			}
+		}
+	}
+
+	// Phase 5: sign with the new committee.
+	setGroupMembership(cluster[:numNodes-1], groupID, newParties, 2)
+	var msgHash [32]byte
+	for i := range msgHash {
+		msgHash[i] = byte(i + 1)
+	}
+	sig := clusterSign(t, ctx, cluster[:numNodes-1], groupID, keyIDs[0], msgHash[:])
+	ethSig, err := sig.SigEthereum()
+	if err != nil {
+		t.Fatalf("sig ethereum: %v", err)
+	}
+	t.Logf("post-reshare signature: 0x%x", ethSig[:8])
+
+	t.Logf("SUMMARY: %d keys — keygen %.1f keys/sec, reshare %.1f keys/sec",
+		numKeys,
+		float64(numKeys)/keygenDur.Seconds(),
+		float64(numKeys)/reshareDur.Seconds())
 }
 
 // TestReshareIntegration_JobLifecycle exercises createReshareJob →

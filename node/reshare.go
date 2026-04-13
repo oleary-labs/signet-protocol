@@ -34,6 +34,9 @@ type reshareKeyID struct {
 // Node.New after the KeyManager and store are created.
 func (n *Node) initReshareState(store *ReshareStore) {
 	n.reshareStore = store
+	if n.host != nil {
+		n.reshareMux = network.NewMuxNetwork(n.ctx, n.host)
+	}
 	n.reshareJobs = make(map[string]*ReshareJob)
 	n.reshareKeys = make(map[reshareKeyID]chan struct{})
 	n.reshareCoord = make(map[string]bool)
@@ -194,10 +197,7 @@ func (n *Node) runReshareSession(ctx context.Context, groupID, keyID string) (er
 	sessCtx, sessCancel := context.WithTimeout(ctx, 30*time.Second)
 	defer sessCancel()
 
-	sn, err := network.NewSessionNetwork(sessCtx, n.host, sessID, allParties)
-	if err != nil {
-		return fmt.Errorf("session network: %w", err)
-	}
+	sn := n.reshareMux.Session(sessID, allParties)
 	defer sn.Close()
 
 	// Broadcast coord message to all parties.
@@ -286,7 +286,8 @@ func (n *Node) startCoordinator(groupID string, concurrency int) error {
 	return nil
 }
 
-// coordinatorLoop iterates through stale keys with bounded concurrency.
+// coordinatorLoop iterates through stale keys with bounded concurrency,
+// retrying failed keys up to maxRetries times with exponential backoff.
 func (n *Node) coordinatorLoop(groupID string, job *ReshareJob, concurrency int) {
 	defer func() {
 		n.reshareCoordMu.Lock()
@@ -294,55 +295,91 @@ func (n *Node) coordinatorLoop(groupID string, job *ReshareJob, concurrency int)
 		n.reshareCoordMu.Unlock()
 	}()
 
-	sem := make(chan struct{}, concurrency)
-	var wg sync.WaitGroup
+	const maxRetries = 3
 
+	// Collect keys that need processing.
+	pending := make([]string, 0, len(job.KeysTotal))
 	for _, keyID := range job.KeysTotal {
-		// Skip if already done.
 		done, _ := n.reshareStore.IsKeyDone(groupID, keyID)
-		if done {
-			continue
+		if !done {
+			pending = append(pending, keyID)
 		}
-
-		// If on-demand already running, wait for it.
-		k := reshareKeyID{groupID, keyID}
-		n.reshareKeysMu.Lock()
-		ch, running := n.reshareKeys[k]
-		n.reshareKeysMu.Unlock()
-		if running {
-			<-ch
-			continue
-		}
-
-		if !n.tryRegisterReshareKey(groupID, keyID) {
-			// Race: wait on the channel that was just registered.
-			n.reshareKeysMu.Lock()
-			ch = n.reshareKeys[k]
-			n.reshareKeysMu.Unlock()
-			if ch != nil {
-				<-ch
-			}
-			continue
-		}
-
-		sem <- struct{}{} // acquire
-		wg.Add(1)
-
-		go func(kid string) {
-			defer wg.Done()
-			defer func() { <-sem }() // release
-
-			err := n.runReshareSession(n.ctx, groupID, kid)
-			if err != nil {
-				n.log.Error("reshare: coordinator key failed",
-					zap.String("group_id", groupID),
-					zap.String("key_id", kid),
-					zap.Error(err))
-			}
-		}(keyID)
 	}
 
-	wg.Wait()
+	for attempt := 0; attempt <= maxRetries && len(pending) > 0; attempt++ {
+		if attempt > 0 {
+			backoff := time.Duration(1<<uint(attempt-1)) * time.Second
+			n.log.Info("reshare: retrying failed keys",
+				zap.String("group_id", groupID),
+				zap.Int("attempt", attempt+1),
+				zap.Int("remaining", len(pending)),
+				zap.Duration("backoff", backoff))
+			time.Sleep(backoff)
+		}
+
+		var failed []string
+		var failedMu sync.Mutex
+
+		sem := make(chan struct{}, concurrency)
+		var wg sync.WaitGroup
+
+		for _, keyID := range pending {
+			// Re-check done (may have completed via on-demand).
+			done, _ := n.reshareStore.IsKeyDone(groupID, keyID)
+			if done {
+				continue
+			}
+
+			// If on-demand already running, wait for it.
+			k := reshareKeyID{groupID, keyID}
+			n.reshareKeysMu.Lock()
+			ch, running := n.reshareKeys[k]
+			n.reshareKeysMu.Unlock()
+			if running {
+				<-ch
+				continue
+			}
+
+			if !n.tryRegisterReshareKey(groupID, keyID) {
+				n.reshareKeysMu.Lock()
+				ch = n.reshareKeys[k]
+				n.reshareKeysMu.Unlock()
+				if ch != nil {
+					<-ch
+				}
+				continue
+			}
+
+			sem <- struct{}{} // acquire
+			wg.Add(1)
+
+			go func(kid string) {
+				defer wg.Done()
+				defer func() { <-sem }()
+
+				err := n.runReshareSession(n.ctx, groupID, kid)
+				if err != nil {
+					n.log.Error("reshare: coordinator key failed",
+						zap.String("group_id", groupID),
+						zap.String("key_id", kid),
+						zap.Error(err))
+					failedMu.Lock()
+					failed = append(failed, kid)
+					failedMu.Unlock()
+				}
+			}(keyID)
+		}
+
+		wg.Wait()
+		pending = failed
+	}
+
+	if len(pending) > 0 {
+		n.log.Error("reshare: coordinator gave up on keys",
+			zap.String("group_id", groupID),
+			zap.Int("failed", len(pending)))
+	}
+
 	n.completeReshareJob(groupID)
 }
 

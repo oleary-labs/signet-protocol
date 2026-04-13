@@ -7,6 +7,11 @@ import (
 	"strings"
 )
 
+// deployerPK returns the DEPLOYER_PK from the OS environment (not the .env file).
+func (e *Env) deployerPK() string {
+	return os.Getenv("DEPLOYER_PK")
+}
+
 // Node represents a single signet node the harness can talk to.
 type Node struct {
 	Name   string

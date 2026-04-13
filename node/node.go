@@ -63,6 +63,7 @@ type Node struct {
 	// Reshare state: per-group job tracking, per-key session channels,
 	// coordinator flags. See reshare.go for methods.
 	reshareStore   *ReshareStore
+	reshareMux     *network.MuxNetwork // multiplexed streams for reshare sessions
 	reshareJobsMu  sync.RWMutex
 	reshareJobs    map[string]*ReshareJob    // groupID → active job (nil = ACTIVE)
 	reshareKeysMu  sync.Mutex

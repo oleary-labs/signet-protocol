@@ -64,7 +64,7 @@ type SignParams struct {
 // ReshareParams holds the inputs for a key reshare session.
 type ReshareParams struct {
 	Host         *network.Host
-	SN           *network.SessionNetwork
+	SN           tss.Network
 	SessionID    string
 	GroupID      string
 	KeyID        string

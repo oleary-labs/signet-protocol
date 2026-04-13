@@ -41,6 +41,12 @@ func run() error {
 	scaleDur := scaleFlags.Duration("duration", 20*time.Second, "duration per concurrency level")
 	scalePool := scaleFlags.Int("pool", 20, "key pool size")
 
+	reshareFlags := flag.NewFlagSet("reshare", flag.ExitOnError)
+	reshareKeys := reshareFlags.Int("keys", 1000, "number of keys to generate before reshare")
+	reshareConc := reshareFlags.Int("concurrency", 10, "keygen concurrency")
+	reshareRemove := reshareFlags.Int("remove", 0, "1-indexed node to remove (default: last)")
+	reshareDevnet := reshareFlags.Bool("devnet", false, "use anvil time-warp to skip removal delay")
+
 	flag.Parse()
 
 	if flag.NArg() < 1 {
@@ -49,6 +55,7 @@ func run() error {
 		fmt.Fprintf(os.Stderr, "  correctness               run correctness tests\n")
 		fmt.Fprintf(os.Stderr, "  perf  [-concurrency N] [-duration D] [-pool N]\n")
 		fmt.Fprintf(os.Stderr, "  scale [-max-concurrency N] [-step N] [-duration D] [-pool N]\n")
+		fmt.Fprintf(os.Stderr, "  reshare [-keys N] [-concurrency N] [-remove N] [-devnet]\n")
 		os.Exit(2)
 	}
 	subcommand := flag.Arg(0)
@@ -124,6 +131,32 @@ func run() error {
 		}
 		if err := RunScale(ctx, clients, newKeyID, cfg, *outFile); err != nil {
 			return err
+		}
+
+	case "reshare":
+		reshareFlags.Parse(subArgs)
+		removeNode := *reshareRemove
+		if removeNode == 0 {
+			removeNode = len(env.Nodes) // default: last node
+		}
+		if removeNode < 1 || removeNode > len(env.Nodes) {
+			return fmt.Errorf("-remove must be between 1 and %d", len(env.Nodes))
+		}
+		cfg := ReshareConfig{
+			NumKeys:     *reshareKeys,
+			Concurrency: *reshareConc,
+			RemoveNode:  removeNode,
+			IsDevnet:    *reshareDevnet,
+		}
+		if err := RunReshare(ctx, env, clients, newKeyID, cfg, coll); err != nil {
+			return err
+		}
+		if *outFile != "" {
+			if err := metrics.WriteJSONL(*outFile, coll); err != nil {
+				fmt.Fprintf(os.Stderr, "warning: write output: %v\n", err)
+			} else {
+				fmt.Printf("\nresults written to %s\n", *outFile)
+			}
 		}
 
 	default:

@@ -307,16 +307,7 @@ func (n *Node) handleCoordStream(s libp2pnet.Stream) {
 		allParties := msg.Parties // old ∪ new
 		sessID := reshareSessionID(msg.GroupID, msg.KeyID, msg.ReshareNonce)
 		sessCtx, sessCancel := context.WithTimeout(n.ctx, 30*time.Second)
-		sn, err := network.NewSessionNetwork(sessCtx, n.host, sessID, allParties)
-		if err != nil {
-			sessCancel()
-			n.completeReshareKey(msg.GroupID, msg.KeyID, false)
-			n.log.Error("coord: reshare session network",
-				zap.String("group_id", msg.GroupID),
-				zap.String("key_id", msg.KeyID),
-				zap.Error(err))
-			return
-		}
+		sn := n.reshareMux.Session(sessID, allParties)
 
 		s.Write([]byte{1})
 

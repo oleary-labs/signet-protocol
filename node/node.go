@@ -253,10 +253,7 @@ func New(cfg *Config, log *zap.Logger) (*Node, error) {
 	mux.HandleFunc("POST /v1/auth", n.handleAuth)
 	mux.HandleFunc("POST /v1/keygen", n.handleKeygen)
 	mux.HandleFunc("POST /v1/sign", n.handleSign)
-	// POST /v1/reshare is disabled until operator key auth is implemented.
-	// Reshare is auto-triggered by chain membership events. The status
-	// endpoint remains available for observability.
-	// mux.HandleFunc("POST /v1/reshare", n.handleStartReshare)
+	mux.HandleFunc("POST /v1/reshare", n.handleStartReshare)
 	mux.HandleFunc("GET /v1/reshare/{group_id}", n.handleReshareStatus)
 	n.server = &http.Server{Addr: cfg.APIAddr, Handler: mux}
 
@@ -1005,8 +1002,10 @@ func (n *Node) validateSessionRequest(
 	return ap, resolvedKeyID, nil
 }
 
-// handleStartReshare handles POST /v1/reshare. Starts the background
-// coordinator for a group that has a pending reshare job.
+// handleStartReshare handles POST /v1/reshare. Creates a same-committee
+// reshare job (key refresh) and starts the coordinator. This redistributes
+// shares among the same parties without changing membership — cryptographically
+// equivalent to a membership-change reshare.
 func (n *Node) handleStartReshare(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		GroupID     string `json:"group_id"`
@@ -1026,23 +1025,40 @@ func (n *Node) handleStartReshare(w http.ResponseWriter, r *http.Request) {
 		concurrency = 1
 	}
 
+	// Check if a job already exists.
 	n.reshareJobsMu.RLock()
-	job := n.reshareJobs[groupID]
+	existingJob := n.reshareJobs[groupID]
 	n.reshareJobsMu.RUnlock()
-	if job == nil {
-		httpError(w, http.StatusNotFound, "no reshare job pending for this group")
+	if existingJob != nil {
+		httpError(w, http.StatusConflict, "reshare already in progress for this group")
+		return
+	}
+
+	// Look up group membership.
+	n.groupsMu.RLock()
+	grp, ok := n.groups[groupID]
+	n.groupsMu.RUnlock()
+	if !ok {
+		httpError(w, http.StatusNotFound, "unknown group")
+		return
+	}
+
+	// Create a same-committee reshare job (key refresh).
+	members := make([]tss.PartyID, len(grp.Members))
+	copy(members, grp.Members)
+	if err := n.createReshareJob(groupID, "refresh", members, members, grp.Threshold); err != nil {
+		httpError(w, http.StatusInternalServerError, "create reshare job: "+err.Error())
 		return
 	}
 
 	if err := n.startCoordinator(groupID, concurrency); err != nil {
-		if strings.Contains(err.Error(), "already coordinating") {
-			httpError(w, http.StatusConflict, err.Error())
-		} else {
-			httpError(w, http.StatusInternalServerError, err.Error())
-		}
+		httpError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 
+	n.reshareJobsMu.RLock()
+	job := n.reshareJobs[groupID]
+	n.reshareJobsMu.RUnlock()
 	done, _ := n.reshareStore.CountKeysDone(groupID)
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{

@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"io"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/fxamacker/cbor/v2"
@@ -19,12 +18,6 @@ import (
 
 const (
 	muxProtocol = libp2pprotocol.ID("/signet/mux/1.0.0")
-
-	// muxStreamsPerPeer is the number of outbound mux streams per peer.
-	// Multiple streams allow concurrent writes without exceeding the
-	// per-peer stream limit (default 64 outbound). 4 streams gives good
-	// parallelism while using minimal resources.
-	muxStreamsPerPeer = 4
 
 	// muxSessionWait is how long handleInbound waits for a session to be
 	// registered before dropping a message. This handles the race where a
@@ -39,10 +32,10 @@ type muxEnvelope struct {
 	Msg       tss.Message `cbor:"2,keyasint"`
 }
 
-// MuxNetwork multiplexes multiple TSS sessions over a small pool of
-// persistent streams per peer. This avoids the libp2p per-peer stream
-// limit that occurs when many concurrent sessions each open their own
-// stream (e.g. during batch reshare).
+// MuxNetwork multiplexes multiple TSS sessions over ephemeral libp2p streams.
+// Each send opens a fresh stream, writes one envelope, and closes. This avoids
+// yamux flow-control window exhaustion that occurs with long-lived streams
+// under sustained cross-region traffic.
 type MuxNetwork struct {
 	host *Host
 	ctx  context.Context
@@ -52,59 +45,42 @@ type MuxNetwork struct {
 	sessions map[string]*MuxSession
 
 	// waiters allows handleInbound to wait for a session to appear.
-	// When a session is registered, all waiters for that session are notified.
 	waiterMu sync.Mutex
 	waiters  map[string][]chan struct{}
-
-	// Pool of outbound streams per peer, lazily opened.
-	peerMu    sync.Mutex
-	peerConns map[peer.ID]*muxPeerPool
-}
-
-// muxPeerPool holds a fixed-size pool of streams to a single peer.
-// Each stream has its own mutex so writes on different streams proceed
-// in parallel.
-type muxPeerPool struct {
-	peerID  peer.ID
-	host    *Host
-	ctx     context.Context
-	streams [muxStreamsPerPeer]muxPooledStream
-	next    atomic.Uint64
-}
-
-type muxPooledStream struct {
-	mu     sync.Mutex
-	stream libp2pnet.Stream
 }
 
 // NewMuxNetwork creates a multiplexed network and registers the inbound
 // stream handler. Call Close() when done.
 func NewMuxNetwork(ctx context.Context, host *Host) *MuxNetwork {
 	mn := &MuxNetwork{
-		host:      host,
-		ctx:       ctx,
-		sessions:  make(map[string]*MuxSession),
-		waiters:   make(map[string][]chan struct{}),
-		peerConns: make(map[peer.ID]*muxPeerPool),
+		host:     host,
+		ctx:      ctx,
+		sessions: make(map[string]*MuxSession),
+		waiters:  make(map[string][]chan struct{}),
 	}
 	host.LibP2PHost().SetStreamHandler(muxProtocol, mn.handleInbound)
 	return mn
 }
 
 // Session creates or retrieves a session-scoped view that implements tss.Network.
-// Close the returned MuxSession when the TSS protocol completes.
-func (mn *MuxNetwork) Session(sessionID string, parties []tss.PartyID) *MuxSession {
+// The ctx should be the session's timeout context so that in-flight sends are
+// cancelled when the session expires. Close the returned MuxSession when the
+// TSS protocol completes.
+func (mn *MuxNetwork) Session(ctx context.Context, sessionID string, parties []tss.PartyID) *MuxSession {
 	mn.mu.Lock()
 	defer mn.mu.Unlock()
 	if s, ok := mn.sessions[sessionID]; ok {
 		return s
 	}
+	sessCtx, sessCancel := context.WithCancel(ctx)
 	s := &MuxSession{
 		mn:        mn,
 		sessionID: sessionID,
 		parties:   tss.NewPartyIDSlice(parties),
 		incoming:  make(chan *tss.Message, 1000),
 		done:      make(chan struct{}),
+		ctx:       sessCtx,
+		cancel:    sessCancel,
 	}
 	mn.sessions[sessionID] = s
 
@@ -164,89 +140,58 @@ func (mn *MuxNetwork) getSession(sessionID string) *MuxSession {
 	}
 }
 
-// handleInbound reads muxEnvelopes from an inbound stream and routes them.
+// handleInbound reads a single muxEnvelope from an inbound stream and routes it.
+// Each stream carries exactly one envelope (ephemeral stream pattern).
 func (mn *MuxNetwork) handleInbound(s libp2pnet.Stream) {
 	defer s.Close()
-	for {
-		env, err := readMuxEnvelope(s)
-		if err != nil {
-			return // stream closed or error
-		}
-		sess := mn.getSession(env.SessionID)
-		if sess == nil {
-			continue // session never appeared, drop
-		}
-		msg := env.Msg
-		select {
-		case sess.incoming <- &msg:
-		case <-sess.done:
-			continue // session closed, drop remaining messages
-		case <-mn.ctx.Done():
-			return
-		}
+	env, err := readMuxEnvelope(s)
+	if err != nil {
+		return
+	}
+	sess := mn.getSession(env.SessionID)
+	if sess == nil {
+		return // session never appeared, drop
+	}
+	msg := env.Msg
+	select {
+	case sess.incoming <- &msg:
+	case <-sess.done:
+	case <-mn.ctx.Done():
 	}
 }
 
-// send writes a muxEnvelope to one of the pooled streams for the given peer.
-// Streams are selected round-robin so concurrent sends distribute across the pool.
-func (mn *MuxNetwork) send(peerID peer.ID, sessionID string, msg *tss.Message) error {
-	pool := mn.getOrCreatePool(peerID)
+// send opens an ephemeral stream, writes a single muxEnvelope, and closes.
+// Yamux multiplexes streams over the existing TCP connection so there is no
+// new TCP handshake — only ~0.1ms of stream negotiation overhead.
+func (mn *MuxNetwork) send(ctx context.Context, peerID peer.ID, sessionID string, msg *tss.Message) error {
 	env := &muxEnvelope{SessionID: sessionID, Msg: *msg}
 
-	// Round-robin across the pool.
-	idx := pool.next.Add(1) - 1
-	ps := &pool.streams[idx%muxStreamsPerPeer]
+	// Use a per-send timeout so that congested yamux connections don't block
+	// the caller forever. The caller's context (session-scoped) may also
+	// cancel, whichever comes first.
+	sendCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
 
-	ps.mu.Lock()
-	defer ps.mu.Unlock()
-
-	// Lazy open or reconnect.
-	if ps.stream == nil {
-		s, err := pool.host.LibP2PHost().NewStream(pool.ctx, pool.peerID, muxProtocol)
-		if err != nil {
-			return fmt.Errorf("mux stream to %s: %w", pool.peerID, err)
-		}
-		ps.stream = s
+	s, err := mn.host.LibP2PHost().NewStream(sendCtx, peerID, muxProtocol)
+	if err != nil {
+		return fmt.Errorf("mux stream to %s: %w", peerID, err)
 	}
+	defer s.Close()
 
-	if err := writeMuxEnvelope(ps.stream, env); err != nil {
-		ps.stream.Close()
-		ps.stream = nil
-		return fmt.Errorf("mux write to %s: %w", pool.peerID, err)
+	if err := writeMuxEnvelope(s, env); err != nil {
+		s.Reset() // signal error to remote
+		return fmt.Errorf("mux write to %s: %w", peerID, err)
 	}
 	return nil
 }
 
-func (mn *MuxNetwork) getOrCreatePool(peerID peer.ID) *muxPeerPool {
-	mn.peerMu.Lock()
-	defer mn.peerMu.Unlock()
-	pool, ok := mn.peerConns[peerID]
-	if !ok {
-		pool = &muxPeerPool{
-			peerID: peerID,
-			host:   mn.host,
-			ctx:    mn.ctx,
-		}
-		mn.peerConns[peerID] = pool
-	}
-	return pool
-}
+// ResetStreams is a no-op retained for API compatibility. With ephemeral
+// streams there is no persistent state to reset.
+func (mn *MuxNetwork) ResetStreams() {}
 
-// Close removes the stream handler and closes all peer connections.
+// Close removes the stream handler.
 func (mn *MuxNetwork) Close() {
 	mn.host.LibP2PHost().RemoveStreamHandler(muxProtocol)
-	mn.peerMu.Lock()
-	for _, pool := range mn.peerConns {
-		for i := range pool.streams {
-			pool.streams[i].mu.Lock()
-			if pool.streams[i].stream != nil {
-				pool.streams[i].stream.Close()
-			}
-			pool.streams[i].mu.Unlock()
-		}
-	}
-	mn.peerConns = make(map[peer.ID]*muxPeerPool)
-	mn.peerMu.Unlock()
 }
 
 // MuxSession is a session-scoped view into a MuxNetwork. It implements tss.Network.
@@ -257,6 +202,8 @@ type MuxSession struct {
 	incoming  chan *tss.Message
 	done      chan struct{} // closed by Close() to signal shutdown
 	sendWG    sync.WaitGroup
+	ctx       context.Context    // session-scoped context (cancelled when session times out)
+	cancel    context.CancelFunc // cancels ctx to abort in-flight sends
 }
 
 // Send implements tss.Network. Broadcasts are unicast to all other parties.
@@ -273,7 +220,7 @@ func (s *MuxSession) Send(msg *tss.Message) {
 			s.sendWG.Add(1)
 			go func(id peer.ID) {
 				defer s.sendWG.Done()
-				s.mn.send(id, s.sessionID, msg)
+				s.mn.send(s.ctx, id, s.sessionID, msg)
 			}(peerID)
 		}
 	} else {
@@ -284,7 +231,7 @@ func (s *MuxSession) Send(msg *tss.Message) {
 		s.sendWG.Add(1)
 		go func() {
 			defer s.sendWG.Done()
-			s.mn.send(peerID, s.sessionID, msg)
+			s.mn.send(s.ctx, peerID, s.sessionID, msg)
 		}()
 	}
 }
@@ -294,12 +241,25 @@ func (s *MuxSession) Incoming() <-chan *tss.Message {
 	return s.incoming
 }
 
-// Close waits for in-flight sends and unregisters the session.
-// The incoming channel is NOT closed; the TSS Run loop exits via context
-// cancellation. This avoids a race between handleInbound goroutines
-// writing to the channel and Close() closing it.
+// Close cancels in-flight sends, waits briefly for them to drain, and
+// unregisters the session. The incoming channel is NOT closed; the TSS Run
+// loop exits via context cancellation. This avoids a race between
+// handleInbound goroutines writing to the channel and Close() closing it.
 func (s *MuxSession) Close() {
-	s.sendWG.Wait()
+	// Cancel the session context to abort any blocked NewStream/Write calls.
+	s.cancel()
+
+	// Wait for sends to drain, but don't block forever.
+	done := make(chan struct{})
+	go func() {
+		s.sendWG.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+	}
+
 	s.mn.removeSession(s.sessionID)
 	close(s.done)
 }

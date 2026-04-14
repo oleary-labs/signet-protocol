@@ -16,8 +16,9 @@ type Config struct {
 	NodeType       string   `yaml:"node_type"`
 	EthRPC         string   `yaml:"eth_rpc"`
 	FactoryAddress string   `yaml:"factory_address"`
-	VKPath         string   `yaml:"vk_path"`     // path to circuit verification key (bb format)
-	KMSSocket      string   `yaml:"kms_socket"`  // Unix socket path to external KMS; empty = in-process tss
+	VKPath         string   `yaml:"vk_path"`         // path to circuit verification key (bb format)
+	KMSSocket      string   `yaml:"kms_socket"`      // Unix socket path to external KMS; empty = in-process tss
+	ChainPollSecs  int      `yaml:"chain_poll_secs"` // chain event poll interval in seconds; 0 = default (12)
 }
 
 // LoadConfig reads a YAML config file and applies defaults for missing fields.

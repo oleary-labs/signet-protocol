@@ -47,15 +47,21 @@ func run() error {
 	reshareRemove := reshareFlags.Int("remove", 0, "1-indexed node to remove (default: last)")
 	reshareDevnet := reshareFlags.Bool("devnet", false, "use anvil time-warp to skip removal delay")
 
+	refreshFlags := flag.NewFlagSet("refresh", flag.ExitOnError)
+	refreshKeys := refreshFlags.Int("keys", 1000, "number of keys to generate before reshare")
+	refreshConc := refreshFlags.Int("concurrency", 10, "keygen concurrency")
+	refreshReshareConc := refreshFlags.Int("reshare-concurrency", 5, "reshare batch concurrency")
+
 	flag.Parse()
 
 	if flag.NArg() < 1 {
-		fmt.Fprintf(os.Stderr, "usage: harness -env <file> <correctness|perf|scale> [flags]\n")
+		fmt.Fprintf(os.Stderr, "usage: harness -env <file> <correctness|perf|scale|reshare|refresh> [flags]\n")
 		fmt.Fprintf(os.Stderr, "\nsubcommands:\n")
 		fmt.Fprintf(os.Stderr, "  correctness               run correctness tests\n")
 		fmt.Fprintf(os.Stderr, "  perf  [-concurrency N] [-duration D] [-pool N]\n")
 		fmt.Fprintf(os.Stderr, "  scale [-max-concurrency N] [-step N] [-duration D] [-pool N]\n")
 		fmt.Fprintf(os.Stderr, "  reshare [-keys N] [-concurrency N] [-remove N] [-devnet]\n")
+		fmt.Fprintf(os.Stderr, "  refresh [-keys N] [-concurrency N] [-reshare-concurrency N]\n")
 		os.Exit(2)
 	}
 	subcommand := flag.Arg(0)
@@ -159,8 +165,26 @@ func run() error {
 			}
 		}
 
+	case "refresh":
+		refreshFlags.Parse(subArgs)
+		cfg := RefreshConfig{
+			NumKeys:            *refreshKeys,
+			Concurrency:        *refreshConc,
+			ReshareConcurrency: *refreshReshareConc,
+		}
+		if err := RunRefresh(ctx, env, clients, newKeyID, cfg, coll); err != nil {
+			return err
+		}
+		if *outFile != "" {
+			if err := metrics.WriteJSONL(*outFile, coll); err != nil {
+				fmt.Fprintf(os.Stderr, "warning: write output: %v\n", err)
+			} else {
+				fmt.Printf("\nresults written to %s\n", *outFile)
+			}
+		}
+
 	default:
-		return fmt.Errorf("unknown subcommand %q — use correctness, perf, or scale", subcommand)
+		return fmt.Errorf("unknown subcommand %q — use correctness, perf, scale, reshare, or refresh", subcommand)
 	}
 
 	return nil

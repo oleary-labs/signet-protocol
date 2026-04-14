@@ -69,6 +69,16 @@ func (c *Client) Sign(ctx context.Context, keyID, messageHashHex string) (*SignR
 	return &resp, nil
 }
 
+// StartReshare calls POST /v1/reshare to trigger a same-committee reshare.
+func (c *Client) StartReshare(ctx context.Context, concurrency int) error {
+	body, _ := json.Marshal(map[string]interface{}{
+		"group_id":    c.groupID,
+		"concurrency": concurrency,
+	})
+	var resp map[string]interface{}
+	return c.post(ctx, "/v1/reshare", body, &resp)
+}
+
 // Health calls GET /v1/health and returns nil if the node is up.
 func (c *Client) Health(ctx context.Context) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.node.API+"/v1/health", nil)

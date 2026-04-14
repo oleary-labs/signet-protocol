@@ -39,19 +39,20 @@ const (
 		{"name":"AuthKeyRemoved","type":"event","inputs":[{"name":"keyHash","type":"bytes32","indexed":true},{"name":"pubkey","type":"bytes","indexed":false}],"anonymous":false}
 	]`
 
-	pollInterval = 2 * time.Second
+	defaultPollInterval = 12 * time.Second
 )
 
 // ChainClient watches the factory and group contracts for membership changes
 // and keeps n.groups up to date.
 type ChainClient struct {
-	eth     *ethclient.Client
-	factory common.Address
-	myAddr  common.Address
-	factABI abi.ABI
-	grpABI  abi.ABI
-	log     *zap.Logger
-	n       *Node
+	eth          *ethclient.Client
+	factory      common.Address
+	myAddr       common.Address
+	factABI      abi.ABI
+	grpABI       abi.ABI
+	log          *zap.Logger
+	n            *Node
+	pollInterval time.Duration
 
 	lastBlock uint64
 	stopCh    chan struct{}
@@ -82,15 +83,21 @@ func newChainClient(cfg *Config, h *network.Host, n *Node, log *zap.Logger) (*Ch
 		return nil, fmt.Errorf("derive eth address: %w", err)
 	}
 
+	poll := defaultPollInterval
+	if cfg.ChainPollSecs > 0 {
+		poll = time.Duration(cfg.ChainPollSecs) * time.Second
+	}
+
 	return &ChainClient{
-		eth:     eth,
-		factory: common.HexToAddress(cfg.FactoryAddress),
-		myAddr:  common.Address(addr),
-		factABI: factABI,
-		grpABI:  grpABI,
-		log:     log,
-		n:       n,
-		stopCh:  make(chan struct{}),
+		eth:          eth,
+		factory:      common.HexToAddress(cfg.FactoryAddress),
+		myAddr:       common.Address(addr),
+		factABI:      factABI,
+		grpABI:       grpABI,
+		log:          log,
+		n:            n,
+		pollInterval: poll,
+		stopCh:       make(chan struct{}),
 	}, nil
 }
 
@@ -217,7 +224,7 @@ func (c *ChainClient) close() {
 }
 
 func (c *ChainClient) watchLoop() {
-	ticker := time.NewTicker(pollInterval)
+	ticker := time.NewTicker(c.pollInterval)
 	defer ticker.Stop()
 	for {
 		select {

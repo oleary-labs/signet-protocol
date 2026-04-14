@@ -21,9 +21,11 @@ const coordProtocol = protocol.ID("/signet/coord/1.0.0")
 type coordMsgType uint8
 
 const (
-	msgKeygen  coordMsgType = 1
-	msgSign    coordMsgType = 2
-	msgReshare coordMsgType = 3
+	msgKeygen          coordMsgType = 1
+	msgSign            coordMsgType = 2
+	msgReshare         coordMsgType = 3
+	msgReshareComplete coordMsgType = 4
+	msgReshareBatch    coordMsgType = 5
 )
 
 // coordMsg is sent from the initiating node to each other participant to start
@@ -57,6 +59,16 @@ type coordMsg struct {
 	NewParties   []tss.PartyID `cbor:"12,keyasint,omitempty"`
 	NewThreshold int           `cbor:"13,keyasint,omitempty"`
 	ReshareNonce string        `cbor:"14,keyasint,omitempty"`
+
+	// ReshareBatch only: list of (keyID, nonce) pairs for batch reshare.
+	// Sent once per batch instead of one coord stream per key.
+	BatchKeys []reshareBatchKey `cbor:"15,keyasint,omitempty"`
+}
+
+// reshareBatchKey is a single key in a reshare batch.
+type reshareBatchKey struct {
+	KeyID string `cbor:"1,keyasint"`
+	Nonce string `cbor:"2,keyasint"`
 }
 
 // keygenSessionID returns the deterministic internal session string for a keygen.
@@ -279,11 +291,21 @@ func (n *Node) handleCoordStream(s libp2pnet.Stream) {
 
 		job, err := n.reshareStore.GetJob(msg.GroupID)
 		if err != nil || job == nil {
-			n.log.Warn("coord: reshare rejected, no reshare job for group",
-				zap.String("group_id", msg.GroupID),
-				zap.String("key_id", msg.KeyID))
-			s.Write([]byte{0})
-			return
+			// No job exists — auto-create for API-triggered refresh.
+			if err := n.createReshareJob(msg.GroupID, "refresh", msg.OldParties, msg.NewParties, msg.Threshold); err != nil {
+				n.log.Warn("coord: reshare rejected, could not create job",
+					zap.String("group_id", msg.GroupID),
+					zap.Error(err))
+				s.Write([]byte{0})
+				return
+			}
+			job, _ = n.reshareStore.GetJob(msg.GroupID)
+			if job == nil {
+				n.log.Warn("coord: reshare rejected, job creation returned nil",
+					zap.String("group_id", msg.GroupID))
+				s.Write([]byte{0})
+				return
+			}
 		}
 
 		// Check if this key is already done for this job.
@@ -306,8 +328,8 @@ func (n *Node) handleCoordStream(s libp2pnet.Stream) {
 
 		allParties := msg.Parties // old ∪ new
 		sessID := reshareSessionID(msg.GroupID, msg.KeyID, msg.ReshareNonce)
-		sessCtx, sessCancel := context.WithTimeout(n.ctx, 30*time.Second)
-		sn := n.reshareMux.Session(sessID, allParties)
+		sessCtx, sessCancel := context.WithTimeout(n.ctx, 60*time.Second)
+		sn := n.reshareMux.Session(sessCtx, sessID, allParties)
 
 		s.Write([]byte{1})
 
@@ -353,6 +375,84 @@ func (n *Node) handleCoordStream(s libp2pnet.Stream) {
 				zap.Bool("old_only", result.OldOnly),
 				zap.Uint64("generation", result.Generation))
 		}()
+
+	case msgReshareBatch:
+		if n.reshareStore == nil {
+			n.log.Warn("coord: reshare batch rejected, reshare store not initialized")
+			s.Write([]byte{0})
+			return
+		}
+
+		job, err := n.reshareStore.GetJob(msg.GroupID)
+		if err != nil || job == nil {
+			// Auto-create job for API-triggered refresh.
+			if err := n.createReshareJob(msg.GroupID, "refresh", msg.OldParties, msg.NewParties, msg.Threshold); err != nil {
+				n.log.Warn("coord: reshare batch rejected, could not create job",
+					zap.String("group_id", msg.GroupID), zap.Error(err))
+				s.Write([]byte{0})
+				return
+			}
+		}
+
+		allParties := msg.Parties
+		s.Write([]byte{1}) // ACK — we're ready to process the batch.
+
+		n.log.Info("coord: reshare batch received",
+			zap.String("group_id", msg.GroupID),
+			zap.Int("keys", len(msg.BatchKeys)))
+
+		// Process each key in the batch sequentially (coordinator controls
+		// concurrency via how many batches it sends in parallel).
+		for _, bk := range msg.BatchKeys {
+			done, _ := n.reshareStore.IsKeyDone(msg.GroupID, bk.KeyID)
+			if done {
+				continue
+			}
+			if !n.tryRegisterReshareKey(msg.GroupID, bk.KeyID) {
+				continue // already running
+			}
+
+			sessID := reshareSessionID(msg.GroupID, bk.KeyID, bk.Nonce)
+			sessCtx, sessCancel := context.WithTimeout(n.ctx, 60*time.Second)
+			sn := n.reshareMux.Session(sessCtx, sessID, allParties)
+
+			result, err := n.km.RunReshare(sessCtx, ReshareParams{
+				Host:         n.host,
+				SN:           sn,
+				SessionID:    sessID,
+				GroupID:      msg.GroupID,
+				KeyID:        bk.KeyID,
+				OldParties:   msg.OldParties,
+				NewParties:   msg.NewParties,
+				OldThreshold: msg.Threshold,
+				NewThreshold: msg.NewThreshold,
+			})
+			sessCancel()
+			sn.Close()
+
+			if err != nil {
+				n.completeReshareKey(msg.GroupID, bk.KeyID, false)
+				n.log.Error("coord: reshare batch key failed",
+					zap.String("group_id", msg.GroupID),
+					zap.String("key_id", bk.KeyID),
+					zap.Error(err))
+				continue
+			}
+
+			n.reshareStore.PutKeyDone(msg.GroupID, bk.KeyID, &ReshareKeyRecord{
+				CompletedAt: time.Now(),
+				ByNode:      string(n.host.Self()),
+				OldOnly:     result.OldOnly,
+			})
+			n.completeReshareKey(msg.GroupID, bk.KeyID, true)
+		}
+
+	case msgReshareComplete:
+		groupID := msg.GroupID
+		n.log.Info("coord: reshare complete received, cleaning up",
+			zap.String("group_id", groupID))
+		n.completeReshareJob(groupID)
+		s.Write([]byte{1})
 
 	default:
 		n.log.Warn("coord: unknown msg type", zap.Uint8("type", uint8(msg.Type)))

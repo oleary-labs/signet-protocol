@@ -194,10 +194,10 @@ func (n *Node) runReshareSession(ctx context.Context, groupID, keyID string) (er
 		allParties = append(allParties, p)
 	}
 
-	sessCtx, sessCancel := context.WithTimeout(ctx, 30*time.Second)
+	sessCtx, sessCancel := context.WithTimeout(ctx, 60*time.Second)
 	defer sessCancel()
 
-	sn := n.reshareMux.Session(sessID, allParties)
+	sn := n.reshareMux.Session(sessCtx, sessID, allParties)
 	defer sn.Close()
 
 	// Broadcast coord message to all parties.
@@ -295,7 +295,20 @@ func (n *Node) coordinatorLoop(groupID string, job *ReshareJob, concurrency int)
 		n.reshareCoordMu.Unlock()
 	}()
 
-	const maxRetries = 3
+	const maxRetries = 10
+
+	// All parties = old ∪ new.
+	allPartiesSet := make(map[tss.PartyID]bool)
+	for _, p := range job.OldParties {
+		allPartiesSet[p] = true
+	}
+	for _, p := range job.NewParties {
+		allPartiesSet[p] = true
+	}
+	allParties := make([]tss.PartyID, 0, len(allPartiesSet))
+	for p := range allPartiesSet {
+		allParties = append(allParties, p)
+	}
 
 	// Collect keys that need processing.
 	pending := make([]string, 0, len(job.KeysTotal))
@@ -324,33 +337,15 @@ func (n *Node) coordinatorLoop(groupID string, job *ReshareJob, concurrency int)
 		var wg sync.WaitGroup
 
 		for _, keyID := range pending {
-			// Re-check done (may have completed via on-demand).
 			done, _ := n.reshareStore.IsKeyDone(groupID, keyID)
 			if done {
 				continue
 			}
-
-			// If on-demand already running, wait for it.
-			k := reshareKeyID{groupID, keyID}
-			n.reshareKeysMu.Lock()
-			ch, running := n.reshareKeys[k]
-			n.reshareKeysMu.Unlock()
-			if running {
-				<-ch
-				continue
-			}
-
 			if !n.tryRegisterReshareKey(groupID, keyID) {
-				n.reshareKeysMu.Lock()
-				ch = n.reshareKeys[k]
-				n.reshareKeysMu.Unlock()
-				if ch != nil {
-					<-ch
-				}
 				continue
 			}
 
-			sem <- struct{}{} // acquire
+			sem <- struct{}{}
 			wg.Add(1)
 
 			go func(kid string) {
@@ -359,10 +354,6 @@ func (n *Node) coordinatorLoop(groupID string, job *ReshareJob, concurrency int)
 
 				err := n.runReshareSession(n.ctx, groupID, kid)
 				if err != nil {
-					n.log.Error("reshare: coordinator key failed",
-						zap.String("group_id", groupID),
-						zap.String("key_id", kid),
-						zap.Error(err))
 					failedMu.Lock()
 					failed = append(failed, kid)
 					failedMu.Unlock()
@@ -379,8 +370,125 @@ func (n *Node) coordinatorLoop(groupID string, job *ReshareJob, concurrency int)
 			zap.String("group_id", groupID),
 			zap.Int("failed", len(pending)))
 	}
+	ctx, cancel := context.WithTimeout(n.ctx, 10*time.Second)
+	err := n.broadcastCoord(ctx, allParties, coordMsg{
+		Type:    msgReshareComplete,
+		GroupID: groupID,
+	})
+	cancel()
+	if err != nil {
+		n.log.Warn("reshare: failed to broadcast completion",
+			zap.String("group_id", groupID),
+			zap.Error(err))
+	}
 
 	n.completeReshareJob(groupID)
+}
+
+// runReshareBatch sends a single batch coord message to all participants,
+// then runs each key's reshare protocol sequentially. Returns the list of
+// key IDs that failed.
+func (n *Node) runReshareBatch(ctx context.Context, groupID string, job *ReshareJob, allParties []tss.PartyID, keyIDs []string) []string {
+	// Generate nonces and build batch keys.
+	batchKeys := make([]reshareBatchKey, 0, len(keyIDs))
+	for _, kid := range keyIDs {
+		done, _ := n.reshareStore.IsKeyDone(groupID, kid)
+		if done {
+			continue
+		}
+		nonce, err := randomNonce()
+		if err != nil {
+			continue
+		}
+		batchKeys = append(batchKeys, reshareBatchKey{KeyID: kid, Nonce: nonce})
+	}
+	if len(batchKeys) == 0 {
+		return nil
+	}
+
+	// Send one coord message with all keys in this batch.
+	batchCtx, batchCancel := context.WithTimeout(ctx, 30*time.Second)
+	err := n.broadcastCoord(batchCtx, allParties, coordMsg{
+		Type:         msgReshareBatch,
+		GroupID:      groupID,
+		Parties:      allParties,
+		Threshold:    job.OldThreshold,
+		OldParties:   job.OldParties,
+		NewParties:   job.NewParties,
+		NewThreshold: job.NewThreshold,
+		BatchKeys:    batchKeys,
+	})
+	batchCancel()
+	if err != nil {
+		n.log.Error("reshare: batch coord broadcast failed",
+			zap.String("group_id", groupID),
+			zap.Int("batch_size", len(batchKeys)),
+			zap.Error(err))
+		// Return all keys as failed.
+		failed := make([]string, len(batchKeys))
+		for i, bk := range batchKeys {
+			failed[i] = bk.KeyID
+		}
+		return failed
+	}
+
+	// Process each key sequentially.
+	var failed []string
+	for _, bk := range batchKeys {
+		if !n.tryRegisterReshareKey(groupID, bk.KeyID) {
+			// Already running (on-demand), skip.
+			continue
+		}
+
+		sessID := reshareSessionID(groupID, bk.KeyID, bk.Nonce)
+		sessCtx, sessCancel := context.WithTimeout(ctx, 60*time.Second)
+		sn := n.reshareMux.Session(sessCtx, sessID, allParties)
+
+		result, err := n.km.RunReshare(sessCtx, ReshareParams{
+			Host:         n.host,
+			SN:           sn,
+			SessionID:    sessID,
+			GroupID:      groupID,
+			KeyID:        bk.KeyID,
+			OldParties:   job.OldParties,
+			NewParties:   job.NewParties,
+			OldThreshold: job.OldThreshold,
+			NewThreshold: job.NewThreshold,
+		})
+		sessCancel()
+		sn.Close()
+
+		if err != nil {
+			n.completeReshareKey(groupID, bk.KeyID, false)
+			n.log.Error("reshare: batch key failed",
+				zap.String("group_id", groupID),
+				zap.String("key_id", bk.KeyID),
+				zap.Error(err))
+			failed = append(failed, bk.KeyID)
+			continue
+		}
+
+		n.reshareStore.PutKeyDone(groupID, bk.KeyID, &ReshareKeyRecord{
+			CompletedAt: time.Now(),
+			ByNode:      string(n.host.Self()),
+			OldOnly:     result.OldOnly,
+		})
+		n.completeReshareKey(groupID, bk.KeyID, true)
+	}
+	return failed
+}
+
+// splitBatches divides keys into batches of at most batchSize.
+func splitBatches(keys []string, batchSize int) [][]string {
+	var batches [][]string
+	for i := 0; i < len(keys); i += batchSize {
+		end := i + batchSize
+		if end > len(keys) {
+			end = len(keys)
+		}
+		batches = append(batches, keys[i:end])
+	}
+	return batches
 }
 
 // completeReshareJob transitions the group back to ACTIVE, or processes the
@@ -433,15 +541,6 @@ func (n *Node) completeReshareJob(groupID string) {
 // createReshareJob creates a new ReshareJob when a membership event is detected
 // and the group is currently ACTIVE.
 func (n *Node) createReshareJob(groupID string, eventType string, oldMembers, newMembers []tss.PartyID, threshold int) error {
-	// Reject same-committee reshare. Proactive key refresh (same committee,
-	// same threshold) is a valid future capability but is disabled until
-	// operator key auth is implemented to gate administrative operations.
-	if sameParties(oldMembers, newMembers) {
-		n.log.Debug("reshare: skipping same-committee reshare (disabled)",
-			zap.String("group_id", groupID))
-		return nil
-	}
-
 	// Snapshot all current keys.
 	keys, err := n.km.ListKeys(groupID)
 	if err != nil {

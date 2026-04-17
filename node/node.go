@@ -698,7 +698,15 @@ func (n *Node) handleKeygen(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if info, _ := n.km.GetKeyInfo(req.GroupID, keyID); info != nil {
-		httpError(w, http.StatusConflict, fmt.Sprintf("key already exists: group=%s key=%s", req.GroupID, keyID))
+		ethAddr, _ := network.EthereumAddressFromGroupKey(info.GroupKey)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusConflict)
+		json.NewEncoder(w).Encode(map[string]any{
+			"group_id":         req.GroupID,
+			"key_id":           keyID,
+			"public_key":       "0x" + hex.EncodeToString(info.GroupKey),
+			"ethereum_address": "0x" + hex.EncodeToString(ethAddr[:]),
+		})
 		return
 	}
 

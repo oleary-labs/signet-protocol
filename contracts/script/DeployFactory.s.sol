@@ -9,13 +9,15 @@ import "../contracts/SignetGroup.sol";
 
 /// @title DeployFactory
 /// @notice Deploys the SignetGroup implementation, the SignetFactory implementation,
-///         and the UUPS proxy that wraps the factory.
+///         and the UUPS proxy that wraps the factory — all via CREATE2 for
+///         deterministic addresses.
 ///
 /// Required environment variables:
 ///   ADMIN_ADDRESS   — address that will own the factory (and therefore the beacon)
 ///
 /// Optional environment variables:
-///   SALT            — bytes32 hex value for CREATE2 deployments (default: 0)
+///   SALT            — uint256 salt for CREATE2 deployments (default: 0).
+///                     Increment to deploy a new version at a different address.
 ///
 /// Run (dry-run, no broadcast):
 ///   forge script script/DeployFactory.s.sol --rpc-url <RPC_URL>
@@ -26,30 +28,30 @@ import "../contracts/SignetGroup.sol";
 ///     --broadcast \
 ///     --private-key <DEPLOYER_PRIVATE_KEY>
 ///
-/// With a hardware wallet (Ledger):
-///   forge script script/DeployFactory.s.sol \
+/// Run with a specific salt:
+///   SALT=1 forge script script/DeployFactory.s.sol \
 ///     --rpc-url <RPC_URL> \
 ///     --broadcast \
-///     --ledger \
-///     --sender <SENDER_ADDRESS>
+///     --private-key <DEPLOYER_PRIVATE_KEY>
 contract DeployFactory is Script {
     function run() external {
         address admin = vm.envAddress("ADMIN_ADDRESS");
+        bytes32 salt = bytes32(vm.envOr("SALT", uint256(0)));
 
         vm.startBroadcast();
 
         // 1. Deploy the SignetGroup logic contract (used by the UpgradeableBeacon).
-        SignetGroup groupImpl = new SignetGroup();
+        SignetGroup groupImpl = new SignetGroup{salt: salt}();
 
         // 2. Deploy the SignetFactory logic contract.
-        SignetFactory factoryImpl = new SignetFactory();
+        SignetFactory factoryImpl = new SignetFactory{salt: salt}();
 
         // 3. Deploy the UUPS proxy, calling initialize() in the same transaction.
         bytes memory initData = abi.encodeCall(
             SignetFactory.initialize,
             (admin, address(groupImpl))
         );
-        ERC1967Proxy proxy = new ERC1967Proxy(address(factoryImpl), initData);
+        ERC1967Proxy proxy = new ERC1967Proxy{salt: salt}(address(factoryImpl), initData);
 
         vm.stopBroadcast();
 
@@ -59,6 +61,7 @@ contract DeployFactory is Script {
         console2.log("=== Signet Factory Deployment ===");
         console2.log("deployer       :", msg.sender);
         console2.log("admin          :", admin);
+        console2.log("salt           :", vm.toString(salt));
         console2.log("groupImpl      :", address(groupImpl));
         console2.log("factoryImpl    :", address(factoryImpl));
         console2.log("factory (proxy):", address(proxy));

@@ -136,6 +136,52 @@ echo "    factory:   $FACTORY"
 echo "    beacon:    $BEACON"
 echo "    groupImpl: $GROUP_IMPL"
 
+# --------------------------------------------------------------------------
+# 4b. Deploy SignetAccountFactory (from signet-wallet repo)
+# --------------------------------------------------------------------------
+WALLET_REPO="$REPO/../signet-wallet"
+if [[ -d "$WALLET_REPO" ]]; then
+    info "Deploying SignetAccountFactory..."
+    cd "$WALLET_REPO"
+
+    ACCT_DEPLOY_OUT=$(
+        forge script script/DeploySignetAccountFactory.s.sol \
+            --rpc-url "$RPC" \
+            --broadcast \
+            --private-key "$DEPLOYER_PK" 2>&1
+    )
+
+    ACCOUNT_FACTORY=$(echo "$ACCT_DEPLOY_OUT" | grep "DEPLOY:accountFactory=" | sed "s/.*DEPLOY:accountFactory=//")
+
+    [[ -z "$ACCOUNT_FACTORY" ]] && {
+        echo "$ACCT_DEPLOY_OUT" >&2
+        die "could not parse account factory address — see output above"
+    }
+
+    echo "    accountFactory: $ACCOUNT_FACTORY"
+
+    info "Deploying FROSTValidator..."
+    VALIDATOR_DEPLOY_OUT=$(
+        forge script script/DeployFROSTValidator.s.sol \
+            --rpc-url "$RPC" \
+            --broadcast \
+            --private-key "$DEPLOYER_PK" 2>&1
+    )
+
+    FROST_VALIDATOR=$(echo "$VALIDATOR_DEPLOY_OUT" | grep "DEPLOY:frostValidator=" | sed "s/.*DEPLOY:frostValidator=//")
+
+    [[ -z "$FROST_VALIDATOR" ]] && {
+        echo "$VALIDATOR_DEPLOY_OUT" >&2
+        die "could not parse frost validator address — see output above"
+    }
+
+    echo "    frostValidator: $FROST_VALIDATOR"
+else
+    echo "    (signet-wallet not found at $WALLET_REPO — skipping wallet contracts)"
+    ACCOUNT_FACTORY=""
+    FROST_VALIDATOR=""
+fi
+
 cd "$REPO"
 
 # --------------------------------------------------------------------------
@@ -317,6 +363,8 @@ NODE1_API=http://localhost:8080
 NODE2_API=http://localhost:8081
 NODE3_API=http://localhost:8082
 USE_KMS=${USE_KMS}
+ACCOUNT_FACTORY=${ACCOUNT_FACTORY}
+FROST_VALIDATOR=${FROST_VALIDATOR}
 EOF
 
 echo ""
@@ -326,6 +374,10 @@ echo "  Chain RPC : $RPC"
 echo "  Factory   : $FACTORY"
 echo "  Beacon    : $BEACON"
 echo "  Group     : $GROUP  (threshold=2, nodes=3)"
+if [[ -n "$ACCOUNT_FACTORY" ]]; then
+echo "  AcctFactory: $ACCOUNT_FACTORY"
+echo "  Validator  : $FROST_VALIDATOR"
+fi
 if $USE_KMS; then
 echo "  KMS       : Rust kms-frost (devnet/kms{1,2,3}.sock)"
 else

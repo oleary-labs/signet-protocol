@@ -19,3 +19,9 @@ Group IDs are full Ethereum addresses (20-byte hex hashes) used as bbolt bucket/
 
 ### Bound unbounded arrays with economic constraints
 `SignetFactory.registeredNodes` and `SignetFactory.groups` are unbounded storage arrays. Without a cap, unchecked growth could eventually brick the contracts (e.g. `getRegisteredNodes()` or `getGroups()` hitting the block gas limit). The planned solution is to gate these with economic constraints: require staking to register a node, and require USDC escrow to create a group. This naturally limits growth while aligning incentives.
+
+### Mutable removal delay with self-referential time lock
+`SignetGroup.removalDelay` is immutable after initialization — it should be changeable, but changes to the delay itself must be subject to the *current* removal delay (otherwise a malicious manager could zero the delay and immediately remove nodes). Add a `queueUpdateRemovalDelay` / `executeUpdateRemovalDelay` pattern gated by the existing delay.
+
+### Protocol-level minimum removal delay
+`SignetFactory.MIN_REMOVAL_DELAY` is currently a constant (`1 days`). This should be a mutable protocol parameter controlled at the factory level. Factory-level parameters will eventually be governed by a time-delayed multisig, so no need to build delays into the factory itself. However, since groups and nodes are subject to external control (managers, operators), the protocol needs to define and enforce minimum delays at the group level to protect participants.

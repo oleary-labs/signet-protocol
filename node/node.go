@@ -602,7 +602,7 @@ func (n *Node) handleAuth(w http.ResponseWriter, r *http.Request) {
 
 	pubHex := sessionPubToHex(sessionPubBytes)
 	n.sessions.Put(pubHex, &SessionInfo{
-		Sub:         sub,
+		Sub:         req.Sub, // raw sub from JWT, not the compound iss:sub
 		Iss:         req.Iss,
 		Exp:         time.Unix(int64(req.Exp), 0),
 		Aud:         req.Aud,
@@ -679,6 +679,14 @@ func (n *Node) handleKeygen(w http.ResponseWriter, r *http.Request) {
 			nil, // no message_hash for keygen
 		)
 		if err != nil {
+			n.log.Warn("keygen: session auth failed",
+				zap.String("group_id", req.GroupID),
+				zap.String("session_pub", req.SessionPub),
+				zap.String("key_suffix", req.KeySuffix),
+				zap.Uint64("timestamp", req.Timestamp),
+				zap.String("nonce", req.Nonce),
+				zap.Int("code", err.code),
+				zap.String("error", err.msg))
 			httpError(w, err.code, err.msg)
 			return
 		}
@@ -826,6 +834,14 @@ func (n *Node) handleSign(w http.ResponseWriter, r *http.Request) {
 			msgHash,
 		)
 		if err != nil {
+			n.log.Warn("sign: session auth failed",
+				zap.String("group_id", req.GroupID),
+				zap.String("session_pub", req.SessionPub),
+				zap.String("key_suffix", req.KeySuffix),
+				zap.Uint64("timestamp", req.Timestamp),
+				zap.String("nonce", req.Nonce),
+				zap.Int("code", err.code),
+				zap.String("error", err.msg))
 			httpError(w, err.code, err.msg)
 			return
 		}
@@ -994,6 +1010,12 @@ func (n *Node) validateSessionRequest(
 
 	// Verify request signature. The signature must cover the resolved keyID
 	// (derived from sub), not a client-supplied keyID.
+	n.log.Debug("validateSessionRequest",
+		zap.String("group_id", groupID),
+		zap.String("resolved_key_id", resolvedKeyID),
+		zap.String("nonce", nonce),
+		zap.Uint64("timestamp", timestamp),
+		zap.Int("message_hash_len", len(messageHash)))
 	if err := verifyRequestSignature(
 		sessionPubBytes, reqSigBytes,
 		groupID, resolvedKeyID, nonce, timestamp,

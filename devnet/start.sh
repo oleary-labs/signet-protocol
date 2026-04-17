@@ -7,16 +7,20 @@
 #   • signetd node{1,2,3} with p2p + HTTP APIs
 #
 # Usage:
-#   devnet/start.sh          # default: nodes use external Rust KMS
-#   devnet/start.sh --no-kms # nodes use in-process Go TSS (no KMS)
+#   devnet/start.sh                  # default: nodes use external Rust KMS, no auth
+#   devnet/start.sh --no-kms         # nodes use in-process Go TSS (no KMS)
+#   devnet/start.sh --auth           # seed Google OAuth issuer (ZK auth required)
+#   devnet/start.sh --no-kms --auth  # Go TSS + ZK auth
 
 set -euo pipefail
 
 # Parse flags.
 USE_KMS=true
+USE_AUTH=false
 for arg in "$@"; do
     case "$arg" in
         --no-kms) USE_KMS=false ;;
+        --auth)   USE_AUTH=true ;;
         *) echo "Unknown flag: $arg" >&2; exit 1 ;;
     esac
 done
@@ -167,6 +171,18 @@ done
 # --------------------------------------------------------------------------
 info "Creating signing group..."
 
+# OAuth issuer configuration — when --auth is passed, seed the group with Google
+# as a trusted issuer so ZK auth is required. Without --auth, the group has no
+# auth policy and requests are unauthenticated (the existing devnet behavior).
+if $USE_AUTH; then
+    GOOGLE_ISS="https://accounts.google.com"
+    GOOGLE_CLIENT_ID="${GOOGLE_CLIENT_ID:-203385367894-0uhir5bt81bsg1gcflfg6tdt1m3eeo0s.apps.googleusercontent.com}"
+    ISSUERS="[(${GOOGLE_ISS},[${GOOGLE_CLIENT_ID}])]"
+    echo "    issuer: ${GOOGLE_ISS} (client_id: ${GOOGLE_CLIENT_ID})"
+else
+    ISSUERS="[]"
+fi
+
 # GroupCreated(address indexed group, address indexed creator, uint256 threshold)
 GROUP_CREATED_TOPIC=$(cast keccak "GroupCreated(address,address,uint256)")
 
@@ -175,7 +191,7 @@ CREATE_RECEIPT=$(cast send \
     --rpc-url "$RPC" \
     "$FACTORY" \
     "createGroup(address[],uint256,uint256,uint256,uint256,(string,string[])[],uint256,uint256,bytes[])" \
-    "[$ADDR_1,$ADDR_2,$ADDR_3]" 2 86400 86400 86400 "[]" 86400 86400 "[]" \
+    "[$ADDR_1,$ADDR_2,$ADDR_3]" 2 86400 86400 86400 "$ISSUERS" 86400 86400 "[]" \
     --json)
 
 # topics[1] is the group address zero-padded to 32 bytes; take the last 40 hex chars.
@@ -212,6 +228,7 @@ bootstrap_peers:
 node_type: public
 eth_rpc: ${RPC}
 factory_address: ${FACTORY}
+vk_path: ${REPO}/circuits/jwt_auth/keys/vk
 EOF
 
     if $USE_KMS; then

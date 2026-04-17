@@ -115,11 +115,7 @@ contract SignetFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable, IS
         address[] calldata nodeAddrs,
         uint256 threshold,
         uint256 removalDelay,
-        uint256 issuerAddDelay,
-        uint256 issuerRemovalDelay,
         ISignetGroup.InitialIssuer[] calldata initialIssuers,
-        uint256 authKeyAddDelay,
-        uint256 authKeyRemovalDelay,
         bytes[] calldata initialAuthKeys
     ) external returns (address group) {
         require(removalDelay >= MIN_REMOVAL_DELAY, "removal delay too short");
@@ -138,11 +134,7 @@ contract SignetFactory is Initializable, OwnableUpgradeable, UUPSUpgradeable, IS
             threshold,
             removalDelay,
             address(this),
-            issuerAddDelay,
-            issuerRemovalDelay,
             initialIssuers,
-            authKeyAddDelay,
-            authKeyRemovalDelay,
             initialAuthKeys
         );
 

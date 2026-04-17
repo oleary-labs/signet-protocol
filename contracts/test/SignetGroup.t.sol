@@ -60,10 +60,10 @@ contract SignetGroupTest is PubkeyHelpersGroup {
     ISignetGroup.InitialIssuer[] internal _noIssuers;
     bytes[] internal _noAuthKeys;
 
-    /// @dev Creates a group with the given set; threshold=2, 1-day delays; manager=this.manager.
+    /// @dev Creates a group with the given set; threshold=2, 1-day removal delay; manager=this.manager.
     function _createGroup(address[] memory addrs) internal returns (ISignetGroup) {
         vm.prank(manager);
-        address g = factory.createGroup(addrs, 2, 1 days, 1 days, 1 days, _noIssuers, 1 days, 1 days, _noAuthKeys);
+        address g = factory.createGroup(addrs, 2, 1 days, _noIssuers, _noAuthKeys);
         return ISignetGroup(g);
     }
 
@@ -567,7 +567,7 @@ contract SignetGroupIssuerTest is PubkeyHelpersGroup {
         address[] memory addrs = new address[](3);
         addrs[0] = node1; addrs[1] = node2; addrs[2] = node3;
         vm.prank(manager);
-        address g = factory.createGroup(addrs, 1, 1 days, 1 days, 1 days, _noIssuers, 1 days, 1 days, _noAuthKeys);
+        address g = factory.createGroup(addrs, 1, 1 days, _noIssuers, _noAuthKeys);
         return ISignetGroup(g);
     }
 
@@ -581,12 +581,12 @@ contract SignetGroupIssuerTest is PubkeyHelpersGroup {
         issuers[0] = ISignetGroup.InitialIssuer({ issuer: ISS1, clientIds: cids });
 
         vm.prank(manager);
-        address g = factory.createGroup(addrs, 1, 1 days, 1 days, 1 days, issuers, 1 days, 1 days, _noAuthKeys);
+        address g = factory.createGroup(addrs, 1, 1 days, issuers, _noAuthKeys);
         return ISignetGroup(g);
     }
 
     // -------------------------------------------------------------------------
-    // Initial issuers at creation (no delay)
+    // Initial issuers at creation
     // -------------------------------------------------------------------------
 
     function testInitialIssuerAddedAtCreation() public {
@@ -600,10 +600,10 @@ contract SignetGroupIssuerTest is PubkeyHelpersGroup {
     }
 
     // -------------------------------------------------------------------------
-    // queueAddIssuer / executeAddIssuer
+    // addIssuer (immediate, manager-only)
     // -------------------------------------------------------------------------
 
-    function testQueueAndExecuteAddIssuer() public {
+    function testAddIssuer() public {
         ISignetGroup g = _makeGroup();
         assertEq(g.getIssuers().length, 0);
 
@@ -611,48 +611,13 @@ contract SignetGroupIssuerTest is PubkeyHelpersGroup {
         cids[0] = CLIENT_A;
 
         vm.prank(manager);
-        uint256 expectedAfter = block.timestamp + 1 days;
-        vm.expectEmit(true, false, false, true);
-        emit ISignetGroup.IssuerAddQueued(HASH1, ISS1, cids, expectedAfter);
-        g.queueAddIssuer(ISS1, cids);
-
-        // Cannot execute before delay
-        vm.expectRevert("delay not elapsed");
-        g.executeAddIssuer(HASH1);
-
-        vm.warp(block.timestamp + 1 days);
         vm.expectEmit(true, false, false, true);
         emit ISignetGroup.IssuerAdded(HASH1, ISS1, cids);
-        g.executeAddIssuer(HASH1);
+        g.addIssuer(ISS1, cids);
 
         ISignetGroup.OAuthIssuer[] memory issuers = g.getIssuers();
         assertEq(issuers.length, 1);
         assertEq(issuers[0].issuer, ISS1);
-    }
-
-    // -------------------------------------------------------------------------
-    // cancelAddIssuer
-    // -------------------------------------------------------------------------
-
-    function testCancelAddIssuer() public {
-        ISignetGroup g = _makeGroup();
-
-        string[] memory cids = new string[](1);
-        cids[0] = CLIENT_A;
-
-        vm.prank(manager);
-        g.queueAddIssuer(ISS1, cids);
-
-        vm.prank(manager);
-        vm.expectEmit(true, false, false, false);
-        emit ISignetGroup.IssuerAddCancelled(HASH1);
-        g.cancelAddIssuer(HASH1);
-
-        vm.warp(block.timestamp + 1 days);
-        vm.expectRevert("not pending");
-        g.executeAddIssuer(HASH1);
-
-        assertEq(g.getIssuers().length, 0);
     }
 
     // -------------------------------------------------------------------------
@@ -662,76 +627,27 @@ contract SignetGroupIssuerTest is PubkeyHelpersGroup {
     function testDuplicateAddIssuerReverts() public {
         ISignetGroup g = _makeGroupWithIssuer();
 
-        // ISS1 is already active; trying to queue it again should revert
         string[] memory cids = new string[](1);
         cids[0] = CLIENT_A;
         vm.prank(manager);
         vm.expectRevert("issuer already exists");
-        g.queueAddIssuer(ISS1, cids);
+        g.addIssuer(ISS1, cids);
     }
 
     // -------------------------------------------------------------------------
-    // queueRemoveIssuer / executeRemoveIssuer
+    // removeIssuer (immediate, manager-only)
     // -------------------------------------------------------------------------
 
-    function testQueueAndExecuteRemoveIssuer() public {
+    function testRemoveIssuer() public {
         ISignetGroup g = _makeGroupWithIssuer();
         assertEq(g.getIssuers().length, 1);
 
         vm.prank(manager);
-        uint256 expectedAfter = block.timestamp + 1 days;
-        vm.expectEmit(true, false, false, true);
-        emit ISignetGroup.IssuerRemovalQueued(HASH1, expectedAfter);
-        g.queueRemoveIssuer(HASH1);
-
-        // Cannot execute before delay
-        vm.expectRevert("delay not elapsed");
-        g.executeRemoveIssuer(HASH1);
-
-        vm.warp(block.timestamp + 1 days);
         vm.expectEmit(true, false, false, false);
         emit ISignetGroup.IssuerRemoved(HASH1, ISS1);
-        g.executeRemoveIssuer(HASH1);
+        g.removeIssuer(HASH1);
 
         assertEq(g.getIssuers().length, 0);
-    }
-
-    // -------------------------------------------------------------------------
-    // cancelRemoveIssuer
-    // -------------------------------------------------------------------------
-
-    function testCancelRemoveIssuer() public {
-        ISignetGroup g = _makeGroupWithIssuer();
-
-        vm.prank(manager);
-        g.queueRemoveIssuer(HASH1);
-
-        vm.prank(manager);
-        vm.expectEmit(true, false, false, false);
-        emit ISignetGroup.IssuerRemovalCancelled(HASH1);
-        g.cancelRemoveIssuer(HASH1);
-
-        vm.warp(block.timestamp + 2 days);
-        vm.expectRevert("no queued removal");
-        g.executeRemoveIssuer(HASH1);
-
-        // Issuer still present
-        assertEq(g.getIssuers().length, 1);
-    }
-
-    // -------------------------------------------------------------------------
-    // Remove before delay reverts
-    // -------------------------------------------------------------------------
-
-    function testRemoveBeforeDelayReverts() public {
-        ISignetGroup g = _makeGroupWithIssuer();
-
-        vm.prank(manager);
-        g.queueRemoveIssuer(HASH1);
-
-        vm.warp(block.timestamp + 1 days - 1);
-        vm.expectRevert("delay not elapsed");
-        g.executeRemoveIssuer(HASH1);
     }
 
     // -------------------------------------------------------------------------
@@ -745,22 +661,16 @@ contract SignetGroupIssuerTest is PubkeyHelpersGroup {
         string[] memory cids2 = new string[](1); cids2[0] = CLIENT_B;
 
         vm.startPrank(manager);
-        g.queueAddIssuer(ISS1, cids1);
-        g.queueAddIssuer(ISS2, cids2);
+        g.addIssuer(ISS1, cids1);
+        g.addIssuer(ISS2, cids2);
         vm.stopPrank();
-
-        vm.warp(block.timestamp + 1 days);
-        g.executeAddIssuer(HASH1);
-        g.executeAddIssuer(HASH2);
 
         ISignetGroup.OAuthIssuer[] memory issuers = g.getIssuers();
         assertEq(issuers.length, 2);
 
         // Remove first issuer (tests swap-and-pop)
         vm.prank(manager);
-        g.queueRemoveIssuer(HASH1);
-        vm.warp(block.timestamp + 1 days);
-        g.executeRemoveIssuer(HASH1);
+        g.removeIssuer(HASH1);
 
         issuers = g.getIssuers();
         assertEq(issuers.length, 1);
@@ -781,22 +691,22 @@ contract SignetGroupIssuerTest is PubkeyHelpersGroup {
     }
 
     // -------------------------------------------------------------------------
-    // Access control: only manager can queue/cancel
+    // Access control: only manager
     // -------------------------------------------------------------------------
 
-    function testOnlyManagerCanQueueAddIssuer() public {
+    function testOnlyManagerCanAddIssuer() public {
         ISignetGroup g = _makeGroup();
         string[] memory cids = new string[](0);
         vm.prank(node1);
         vm.expectRevert("not manager");
-        g.queueAddIssuer(ISS1, cids);
+        g.addIssuer(ISS1, cids);
     }
 
-    function testOnlyManagerCanQueueRemoveIssuer() public {
+    function testOnlyManagerCanRemoveIssuer() public {
         ISignetGroup g = _makeGroupWithIssuer();
         vm.prank(node1);
         vm.expectRevert("not manager");
-        g.queueRemoveIssuer(HASH1);
+        g.removeIssuer(HASH1);
     }
 }
 
@@ -850,7 +760,7 @@ contract SignetGroupAuthKeyTest is PubkeyHelpersGroup {
         address[] memory addrs = new address[](3);
         addrs[0] = node1; addrs[1] = node2; addrs[2] = node3;
         vm.prank(manager);
-        address g = factory.createGroup(addrs, 1, 1 days, 1 days, 1 days, _noIssuers, 1 days, 1 days, _noAuthKeys);
+        address g = factory.createGroup(addrs, 1, 1 days, _noIssuers, _noAuthKeys);
         return ISignetGroup(g);
     }
 
@@ -862,12 +772,12 @@ contract SignetGroupAuthKeyTest is PubkeyHelpersGroup {
         keys[0] = AUTH_KEY_1;
 
         vm.prank(manager);
-        address g = factory.createGroup(addrs, 1, 1 days, 1 days, 1 days, _noIssuers, 1 days, 1 days, keys);
+        address g = factory.createGroup(addrs, 1, 1 days, _noIssuers, keys);
         return ISignetGroup(g);
     }
 
     // -------------------------------------------------------------------------
-    // Initial auth keys at creation (no delay)
+    // Initial auth keys at creation
     // -------------------------------------------------------------------------
 
     function testInitialAuthKeyAddedAtCreation() public {
@@ -880,54 +790,22 @@ contract SignetGroupAuthKeyTest is PubkeyHelpersGroup {
     }
 
     // -------------------------------------------------------------------------
-    // queueAddAuthKey / executeAddAuthKey
+    // addAuthKey (immediate, manager-only)
     // -------------------------------------------------------------------------
 
-    function testQueueAndExecuteAddAuthKey() public {
+    function testAddAuthKey() public {
         ISignetGroup g = _makeGroup();
         assertEq(g.getAuthKeys().length, 0);
 
         vm.prank(manager);
-        uint256 expectedAfter = block.timestamp + 1 days;
-        vm.expectEmit(true, false, false, true);
-        emit ISignetGroup.AuthKeyAddQueued(HASH_AK1, AUTH_KEY_1, expectedAfter);
-        g.queueAddAuthKey(AUTH_KEY_1);
-
-        // Cannot execute before delay
-        vm.expectRevert("delay not elapsed");
-        g.executeAddAuthKey(HASH_AK1);
-
-        vm.warp(block.timestamp + 1 days);
         vm.expectEmit(true, false, false, true);
         emit ISignetGroup.AuthKeyAdded(HASH_AK1, AUTH_KEY_1);
-        g.executeAddAuthKey(HASH_AK1);
+        g.addAuthKey(AUTH_KEY_1);
 
         bytes[] memory keys = g.getAuthKeys();
         assertEq(keys.length, 1);
         assertEq(keccak256(keys[0]), keccak256(AUTH_KEY_1));
         assertTrue(g.isAuthKeyTrusted(HASH_AK1));
-    }
-
-    // -------------------------------------------------------------------------
-    // cancelAddAuthKey
-    // -------------------------------------------------------------------------
-
-    function testCancelAddAuthKey() public {
-        ISignetGroup g = _makeGroup();
-
-        vm.prank(manager);
-        g.queueAddAuthKey(AUTH_KEY_1);
-
-        vm.prank(manager);
-        vm.expectEmit(true, false, false, false);
-        emit ISignetGroup.AuthKeyAddCancelled(HASH_AK1);
-        g.cancelAddAuthKey(HASH_AK1);
-
-        vm.warp(block.timestamp + 1 days);
-        vm.expectRevert("not pending");
-        g.executeAddAuthKey(HASH_AK1);
-
-        assertEq(g.getAuthKeys().length, 0);
     }
 
     // -------------------------------------------------------------------------
@@ -939,73 +817,24 @@ contract SignetGroupAuthKeyTest is PubkeyHelpersGroup {
 
         vm.prank(manager);
         vm.expectRevert("auth key already exists");
-        g.queueAddAuthKey(AUTH_KEY_1);
+        g.addAuthKey(AUTH_KEY_1);
     }
 
     // -------------------------------------------------------------------------
-    // queueRemoveAuthKey / executeRemoveAuthKey
+    // removeAuthKey (immediate, manager-only)
     // -------------------------------------------------------------------------
 
-    function testQueueAndExecuteRemoveAuthKey() public {
+    function testRemoveAuthKey() public {
         ISignetGroup g = _makeGroupWithAuthKey();
         assertEq(g.getAuthKeys().length, 1);
 
         vm.prank(manager);
-        uint256 expectedAfter = block.timestamp + 1 days;
-        vm.expectEmit(true, false, false, true);
-        emit ISignetGroup.AuthKeyRemovalQueued(HASH_AK1, expectedAfter);
-        g.queueRemoveAuthKey(HASH_AK1);
-
-        // Cannot execute before delay
-        vm.expectRevert("delay not elapsed");
-        g.executeRemoveAuthKey(HASH_AK1);
-
-        vm.warp(block.timestamp + 1 days);
         vm.expectEmit(true, false, false, true);
         emit ISignetGroup.AuthKeyRemoved(HASH_AK1, AUTH_KEY_1);
-        g.executeRemoveAuthKey(HASH_AK1);
+        g.removeAuthKey(HASH_AK1);
 
         assertEq(g.getAuthKeys().length, 0);
         assertFalse(g.isAuthKeyTrusted(HASH_AK1));
-    }
-
-    // -------------------------------------------------------------------------
-    // cancelRemoveAuthKey
-    // -------------------------------------------------------------------------
-
-    function testCancelRemoveAuthKey() public {
-        ISignetGroup g = _makeGroupWithAuthKey();
-
-        vm.prank(manager);
-        g.queueRemoveAuthKey(HASH_AK1);
-
-        vm.prank(manager);
-        vm.expectEmit(true, false, false, false);
-        emit ISignetGroup.AuthKeyRemovalCancelled(HASH_AK1);
-        g.cancelRemoveAuthKey(HASH_AK1);
-
-        vm.warp(block.timestamp + 2 days);
-        vm.expectRevert("no queued removal");
-        g.executeRemoveAuthKey(HASH_AK1);
-
-        // Auth key still present
-        assertEq(g.getAuthKeys().length, 1);
-        assertTrue(g.isAuthKeyTrusted(HASH_AK1));
-    }
-
-    // -------------------------------------------------------------------------
-    // Remove before delay reverts
-    // -------------------------------------------------------------------------
-
-    function testRemoveBeforeDelayReverts() public {
-        ISignetGroup g = _makeGroupWithAuthKey();
-
-        vm.prank(manager);
-        g.queueRemoveAuthKey(HASH_AK1);
-
-        vm.warp(block.timestamp + 1 days - 1);
-        vm.expectRevert("delay not elapsed");
-        g.executeRemoveAuthKey(HASH_AK1);
     }
 
     // -------------------------------------------------------------------------
@@ -1016,22 +845,16 @@ contract SignetGroupAuthKeyTest is PubkeyHelpersGroup {
         ISignetGroup g = _makeGroup();
 
         vm.startPrank(manager);
-        g.queueAddAuthKey(AUTH_KEY_1);
-        g.queueAddAuthKey(AUTH_KEY_2);
+        g.addAuthKey(AUTH_KEY_1);
+        g.addAuthKey(AUTH_KEY_2);
         vm.stopPrank();
-
-        vm.warp(block.timestamp + 1 days);
-        g.executeAddAuthKey(HASH_AK1);
-        g.executeAddAuthKey(HASH_AK2);
 
         bytes[] memory keys = g.getAuthKeys();
         assertEq(keys.length, 2);
 
         // Remove first key (tests swap-and-pop)
         vm.prank(manager);
-        g.queueRemoveAuthKey(HASH_AK1);
-        vm.warp(block.timestamp + 1 days + 1);
-        g.executeRemoveAuthKey(HASH_AK1);
+        g.removeAuthKey(HASH_AK1);
 
         keys = g.getAuthKeys();
         assertEq(keys.length, 1);
@@ -1039,40 +862,20 @@ contract SignetGroupAuthKeyTest is PubkeyHelpersGroup {
     }
 
     // -------------------------------------------------------------------------
-    // Access control: only manager can queue/cancel
+    // Access control: only manager
     // -------------------------------------------------------------------------
 
-    function testOnlyManagerCanQueueAddAuthKey() public {
+    function testOnlyManagerCanAddAuthKey() public {
         ISignetGroup g = _makeGroup();
         vm.prank(node1);
         vm.expectRevert("not manager");
-        g.queueAddAuthKey(AUTH_KEY_1);
+        g.addAuthKey(AUTH_KEY_1);
     }
 
-    function testOnlyManagerCanQueueRemoveAuthKey() public {
+    function testOnlyManagerCanRemoveAuthKey() public {
         ISignetGroup g = _makeGroupWithAuthKey();
         vm.prank(node1);
         vm.expectRevert("not manager");
-        g.queueRemoveAuthKey(HASH_AK1);
-    }
-
-    function testOnlyManagerCanCancelAddAuthKey() public {
-        ISignetGroup g = _makeGroup();
-        vm.prank(manager);
-        g.queueAddAuthKey(AUTH_KEY_1);
-
-        vm.prank(node1);
-        vm.expectRevert("not manager");
-        g.cancelAddAuthKey(HASH_AK1);
-    }
-
-    function testOnlyManagerCanCancelRemoveAuthKey() public {
-        ISignetGroup g = _makeGroupWithAuthKey();
-        vm.prank(manager);
-        g.queueRemoveAuthKey(HASH_AK1);
-
-        vm.prank(node1);
-        vm.expectRevert("not manager");
-        g.cancelRemoveAuthKey(HASH_AK1);
+        g.removeAuthKey(HASH_AK1);
     }
 }

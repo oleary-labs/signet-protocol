@@ -35,29 +35,17 @@ contract SignetGroup is Initializable, ISignetGroup {
     // State — OAuth issuers
     // -------------------------------------------------------------------------
 
-    uint256 public issuerAddDelay;
-    uint256 public issuerRemovalDelay;
-
     mapping(bytes32 => OAuthIssuer) internal _issuers;
     bytes32[] internal _issuerHashes;
     mapping(bytes32 => uint256) internal _issuerHashIndex;   // 1-based
-
-    mapping(bytes32 => PendingIssuerAddition) internal _pendingAdditions;
-    mapping(bytes32 => uint256) internal _pendingRemovals;   // executeAfter timestamp
 
     // -------------------------------------------------------------------------
     // State — authorization keys
     // -------------------------------------------------------------------------
 
-    uint256 public authKeyAddDelay;
-    uint256 public authKeyRemovalDelay;
-
     mapping(bytes32 => bytes) internal _authKeys;            // keyHash → pubkey
     bytes32[] internal _authKeyHashes;
     mapping(bytes32 => uint256) internal _authKeyHashIndex;  // 1-based
-
-    mapping(bytes32 => PendingAuthKeyAddition) internal _pendingAuthKeyAdditions;
-    mapping(bytes32 => uint256) internal _pendingAuthKeyRemovals; // executeAfter timestamp
 
     // -------------------------------------------------------------------------
     // Upgrade-safe storage gap
@@ -76,21 +64,13 @@ contract SignetGroup is Initializable, ISignetGroup {
         uint256 _threshold,
         uint256 _removalDelay,
         address _factory,
-        uint256 _issuerAddDelay,
-        uint256 _issuerRemovalDelay,
         InitialIssuer[] calldata _initialIssuers,
-        uint256 _authKeyAddDelay,
-        uint256 _authKeyRemovalDelay,
         bytes[] calldata _initialAuthKeys
     ) external initializer {
         manager = _manager;
         threshold = _threshold;
         removalDelay = _removalDelay;
         factory = _factory;
-        issuerAddDelay = _issuerAddDelay;
-        issuerRemovalDelay = _issuerRemovalDelay;
-        authKeyAddDelay = _authKeyAddDelay;
-        authKeyRemovalDelay = _authKeyRemovalDelay;
 
         for (uint256 i = 0; i < nodeAddrs.length; i++) {
             address node = nodeAddrs[i];
@@ -107,11 +87,9 @@ contract SignetGroup is Initializable, ISignetGroup {
             }
         }
 
-        // Seed initial issuers immediately — no delay applied.
         for (uint256 i = 0; i < _initialIssuers.length; i++) {
             InitialIssuer calldata ini = _initialIssuers[i];
             bytes32 h = keccak256(abi.encodePacked(ini.issuer));
-            // Copy calldata string[] to memory for _addIssuer
             string[] memory cids = new string[](ini.clientIds.length);
             for (uint256 j = 0; j < ini.clientIds.length; j++) {
                 cids[j] = ini.clientIds[j];
@@ -119,7 +97,6 @@ contract SignetGroup is Initializable, ISignetGroup {
             _addIssuer(h, ini.issuer, cids);
         }
 
-        // Seed initial authorization keys immediately — no delay applied.
         for (uint256 i = 0; i < _initialAuthKeys.length; i++) {
             bytes32 h = keccak256(_initialAuthKeys[i]);
             _addAuthKey(h, _initialAuthKeys[i]);
@@ -212,80 +189,28 @@ contract SignetGroup is Initializable, ISignetGroup {
     }
 
     // -------------------------------------------------------------------------
-    // OAuth issuer management
+    // OAuth issuer management (immediate, manager-only)
     // -------------------------------------------------------------------------
 
     /// @inheritdoc ISignetGroup
-    function queueAddIssuer(string calldata issuer, string[] calldata clientIds) external {
+    function addIssuer(string calldata issuer, string[] calldata clientIds) external {
         require(msg.sender == manager, "not manager");
         bytes32 h = keccak256(abi.encodePacked(issuer));
         require(_issuerHashIndex[h] == 0, "issuer already exists");
-        require(_pendingAdditions[h].executeAfter == 0, "addition already queued");
 
-        uint256 executeAfter = block.timestamp + issuerAddDelay;
-
-        // Copy calldata arrays to storage via PendingIssuerAddition
-        PendingIssuerAddition storage p = _pendingAdditions[h];
-        p.issuer = issuer;
-        p.executeAfter = executeAfter;
+        string[] memory cids = new string[](clientIds.length);
         for (uint256 i = 0; i < clientIds.length; i++) {
-            p.clientIds.push(clientIds[i]);
+            cids[i] = clientIds[i];
         }
-
-        emit IssuerAddQueued(h, issuer, clientIds, executeAfter);
+        _addIssuer(h, issuer, cids);
     }
 
     /// @inheritdoc ISignetGroup
-    function cancelAddIssuer(bytes32 issuerHash) external {
-        require(msg.sender == manager, "not manager");
-        require(_pendingAdditions[issuerHash].executeAfter != 0, "not pending");
-        delete _pendingAdditions[issuerHash];
-        emit IssuerAddCancelled(issuerHash);
-    }
-
-    /// @inheritdoc ISignetGroup
-    function executeAddIssuer(bytes32 issuerHash) external {
-        PendingIssuerAddition storage p = _pendingAdditions[issuerHash];
-        require(p.executeAfter != 0, "not pending");
-        require(block.timestamp >= p.executeAfter, "delay not elapsed");
-        require(_issuerHashIndex[issuerHash] == 0, "issuer already exists");
-
-        string memory iss = p.issuer;
-        string[] memory cids = new string[](p.clientIds.length);
-        for (uint256 i = 0; i < p.clientIds.length; i++) {
-            cids[i] = p.clientIds[i];
-        }
-        delete _pendingAdditions[issuerHash];
-        _addIssuer(issuerHash, iss, cids);
-    }
-
-    /// @inheritdoc ISignetGroup
-    function queueRemoveIssuer(bytes32 issuerHash) external {
+    function removeIssuer(bytes32 issuerHash) external {
         require(msg.sender == manager, "not manager");
         require(_issuerHashIndex[issuerHash] != 0, "issuer not found");
-        require(_pendingRemovals[issuerHash] == 0, "removal already queued");
-
-        uint256 executeAfter = block.timestamp + issuerRemovalDelay;
-        _pendingRemovals[issuerHash] = executeAfter;
-        emit IssuerRemovalQueued(issuerHash, executeAfter);
-    }
-
-    /// @inheritdoc ISignetGroup
-    function cancelRemoveIssuer(bytes32 issuerHash) external {
-        require(msg.sender == manager, "not manager");
-        require(_pendingRemovals[issuerHash] != 0, "no queued removal");
-        delete _pendingRemovals[issuerHash];
-        emit IssuerRemovalCancelled(issuerHash);
-    }
-
-    /// @inheritdoc ISignetGroup
-    function executeRemoveIssuer(bytes32 issuerHash) external {
-        uint256 executeAfter = _pendingRemovals[issuerHash];
-        require(executeAfter != 0, "no queued removal");
-        require(block.timestamp >= executeAfter, "delay not elapsed");
 
         string memory iss = _issuers[issuerHash].issuer;
-        delete _pendingRemovals[issuerHash];
 
         // Swap-and-pop removal from _issuerHashes
         uint256 idx = _issuerHashIndex[issuerHash] - 1; // 0-based
@@ -303,72 +228,23 @@ contract SignetGroup is Initializable, ISignetGroup {
     }
 
     // -------------------------------------------------------------------------
-    // Authorization key management
+    // Authorization key management (immediate, manager-only)
     // -------------------------------------------------------------------------
 
     /// @inheritdoc ISignetGroup
-    function queueAddAuthKey(bytes calldata pubkey) external {
+    function addAuthKey(bytes calldata pubkey) external {
         require(msg.sender == manager, "not manager");
         bytes32 h = keccak256(pubkey);
         require(_authKeyHashIndex[h] == 0, "auth key already exists");
-        require(_pendingAuthKeyAdditions[h].executeAfter == 0, "addition already queued");
-
-        uint256 executeAfter = block.timestamp + authKeyAddDelay;
-
-        PendingAuthKeyAddition storage p = _pendingAuthKeyAdditions[h];
-        p.pubkey = pubkey;
-        p.executeAfter = executeAfter;
-
-        emit AuthKeyAddQueued(h, pubkey, executeAfter);
+        _addAuthKey(h, pubkey);
     }
 
     /// @inheritdoc ISignetGroup
-    function cancelAddAuthKey(bytes32 keyHash) external {
-        require(msg.sender == manager, "not manager");
-        require(_pendingAuthKeyAdditions[keyHash].executeAfter != 0, "not pending");
-        delete _pendingAuthKeyAdditions[keyHash];
-        emit AuthKeyAddCancelled(keyHash);
-    }
-
-    /// @inheritdoc ISignetGroup
-    function executeAddAuthKey(bytes32 keyHash) external {
-        PendingAuthKeyAddition storage p = _pendingAuthKeyAdditions[keyHash];
-        require(p.executeAfter != 0, "not pending");
-        require(block.timestamp >= p.executeAfter, "delay not elapsed");
-        require(_authKeyHashIndex[keyHash] == 0, "auth key already exists");
-
-        bytes memory pubkey = p.pubkey;
-        delete _pendingAuthKeyAdditions[keyHash];
-        _addAuthKey(keyHash, pubkey);
-    }
-
-    /// @inheritdoc ISignetGroup
-    function queueRemoveAuthKey(bytes32 keyHash) external {
+    function removeAuthKey(bytes32 keyHash) external {
         require(msg.sender == manager, "not manager");
         require(_authKeyHashIndex[keyHash] != 0, "auth key not found");
-        require(_pendingAuthKeyRemovals[keyHash] == 0, "removal already queued");
-
-        uint256 executeAfter = block.timestamp + authKeyRemovalDelay;
-        _pendingAuthKeyRemovals[keyHash] = executeAfter;
-        emit AuthKeyRemovalQueued(keyHash, executeAfter);
-    }
-
-    /// @inheritdoc ISignetGroup
-    function cancelRemoveAuthKey(bytes32 keyHash) external {
-        require(msg.sender == manager, "not manager");
-        require(_pendingAuthKeyRemovals[keyHash] != 0, "no queued removal");
-        delete _pendingAuthKeyRemovals[keyHash];
-        emit AuthKeyRemovalCancelled(keyHash);
-    }
-
-    /// @inheritdoc ISignetGroup
-    function executeRemoveAuthKey(bytes32 keyHash) external {
-        uint256 executeAfter = _pendingAuthKeyRemovals[keyHash];
-        require(executeAfter != 0, "no queued removal");
-        require(block.timestamp >= executeAfter, "delay not elapsed");
 
         bytes memory pubkey = _authKeys[keyHash];
-        delete _pendingAuthKeyRemovals[keyHash];
 
         // Swap-and-pop removal from _authKeyHashes
         uint256 idx = _authKeyHashIndex[keyHash] - 1; // 0-based

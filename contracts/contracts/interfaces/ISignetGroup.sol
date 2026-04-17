@@ -20,21 +20,10 @@ interface ISignetGroup {
         string[] clientIds;   // allowed azp/client_id values
     }
 
-    struct PendingIssuerAddition {
-        string   issuer;
-        string[] clientIds;
-        uint256  executeAfter;
-    }
-
-    /// @notice Used only in createGroup/initialize calldata to seed issuers without a delay.
+    /// @notice Used in createGroup/initialize calldata to seed issuers at creation.
     struct InitialIssuer {
         string   issuer;
         string[] clientIds;
-    }
-
-    struct PendingAuthKeyAddition {
-        bytes   pubkey;
-        uint256 executeAfter;
     }
 
     // -------------------------------------------------------------------------
@@ -53,23 +42,15 @@ interface ISignetGroup {
     // Events — OAuth issuer management
     // -------------------------------------------------------------------------
 
-    event IssuerAddQueued    (bytes32 indexed h, string issuer, string[] clientIds, uint256 executeAfter);
-    event IssuerAddCancelled (bytes32 indexed h);
-    event IssuerAdded        (bytes32 indexed h, string issuer, string[] clientIds);
-    event IssuerRemovalQueued(bytes32 indexed h, uint256 executeAfter);
-    event IssuerRemovalCancelled(bytes32 indexed h);
-    event IssuerRemoved      (bytes32 indexed h, string issuer);
+    event IssuerAdded   (bytes32 indexed h, string issuer, string[] clientIds);
+    event IssuerRemoved (bytes32 indexed h, string issuer);
 
     // -------------------------------------------------------------------------
     // Events — authorization key management
     // -------------------------------------------------------------------------
 
-    event AuthKeyAddQueued      (bytes32 indexed keyHash, bytes pubkey, uint256 executeAfter);
-    event AuthKeyAddCancelled   (bytes32 indexed keyHash);
-    event AuthKeyAdded          (bytes32 indexed keyHash, bytes pubkey);
-    event AuthKeyRemovalQueued  (bytes32 indexed keyHash, uint256 executeAfter);
-    event AuthKeyRemovalCancelled(bytes32 indexed keyHash);
-    event AuthKeyRemoved        (bytes32 indexed keyHash, bytes pubkey);
+    event AuthKeyAdded   (bytes32 indexed keyHash, bytes pubkey);
+    event AuthKeyRemoved (bytes32 indexed keyHash, bytes pubkey);
 
     // -------------------------------------------------------------------------
     // Initializer
@@ -82,11 +63,7 @@ interface ISignetGroup {
         uint256 _threshold,
         uint256 _removalDelay,
         address _factory,
-        uint256 _issuerAddDelay,
-        uint256 _issuerRemovalDelay,
         InitialIssuer[] calldata _initialIssuers,
-        uint256 _authKeyAddDelay,
-        uint256 _authKeyRemovalDelay,
         bytes[] calldata _initialAuthKeys
     ) external;
 
@@ -118,48 +95,24 @@ interface ISignetGroup {
     function transferManager(address newManager) external;
 
     // -------------------------------------------------------------------------
-    // OAuth issuer management (manager-only queue/cancel; permissionless execute)
+    // OAuth issuer management (manager-only, immediate)
     // -------------------------------------------------------------------------
 
-    /// @notice Queue an issuer addition. Key = keccak256(abi.encodePacked(issuer)).
-    function queueAddIssuer(string calldata issuer, string[] calldata clientIds) external;
+    /// @notice Add an OAuth issuer. Key = keccak256(abi.encodePacked(issuer)).
+    function addIssuer(string calldata issuer, string[] calldata clientIds) external;
 
-    /// @notice Cancel a queued issuer addition (manager only).
-    function cancelAddIssuer(bytes32 issuerHash) external;
-
-    /// @notice Execute a queued addition after issuerAddDelay has elapsed (permissionless).
-    function executeAddIssuer(bytes32 issuerHash) external;
-
-    /// @notice Queue an issuer removal (manager only).
-    function queueRemoveIssuer(bytes32 issuerHash) external;
-
-    /// @notice Cancel a queued issuer removal (manager only).
-    function cancelRemoveIssuer(bytes32 issuerHash) external;
-
-    /// @notice Execute a queued removal after issuerRemovalDelay has elapsed (permissionless).
-    function executeRemoveIssuer(bytes32 issuerHash) external;
+    /// @notice Remove an OAuth issuer (manager only).
+    function removeIssuer(bytes32 issuerHash) external;
 
     // -------------------------------------------------------------------------
-    // Authorization key management (manager-only queue/cancel; permissionless execute)
+    // Authorization key management (manager-only, immediate)
     // -------------------------------------------------------------------------
 
-    /// @notice Queue an authorization key addition. Key hash = keccak256(pubkey).
-    function queueAddAuthKey(bytes calldata pubkey) external;
+    /// @notice Add an authorization key. Key hash = keccak256(pubkey).
+    function addAuthKey(bytes calldata pubkey) external;
 
-    /// @notice Cancel a queued authorization key addition (manager only).
-    function cancelAddAuthKey(bytes32 keyHash) external;
-
-    /// @notice Execute a queued addition after authKeyAddDelay has elapsed (permissionless).
-    function executeAddAuthKey(bytes32 keyHash) external;
-
-    /// @notice Queue an authorization key removal (manager only).
-    function queueRemoveAuthKey(bytes32 keyHash) external;
-
-    /// @notice Cancel a queued authorization key removal (manager only).
-    function cancelRemoveAuthKey(bytes32 keyHash) external;
-
-    /// @notice Execute a queued removal after authKeyRemovalDelay has elapsed (permissionless).
-    function executeRemoveAuthKey(bytes32 keyHash) external;
+    /// @notice Remove an authorization key (manager only).
+    function removeAuthKey(bytes32 keyHash) external;
 
     // -------------------------------------------------------------------------
     // Views — membership
@@ -185,9 +138,6 @@ interface ISignetGroup {
     // Views — OAuth issuers
     // -------------------------------------------------------------------------
 
-    function issuerAddDelay() external view returns (uint256);
-    function issuerRemovalDelay() external view returns (uint256);
-
     /// @notice Returns all currently trusted OAuth issuers for this group.
     function getIssuers() external view returns (OAuthIssuer[] memory);
 
@@ -197,9 +147,6 @@ interface ISignetGroup {
     // -------------------------------------------------------------------------
     // Views — authorization keys
     // -------------------------------------------------------------------------
-
-    function authKeyAddDelay() external view returns (uint256);
-    function authKeyRemovalDelay() external view returns (uint256);
 
     /// @notice Returns all currently trusted authorization key pubkeys for this group.
     function getAuthKeys() external view returns (bytes[] memory);

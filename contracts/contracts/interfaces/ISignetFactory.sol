@@ -64,21 +64,13 @@ interface ISignetFactory {
     /// @param nodeAddrs            Initial set of node addresses.
     /// @param threshold            Minimum number of honest signers required (quorum).
     /// @param removalDelay         Seconds delay before a queued node removal can execute.
-    /// @param issuerAddDelay       Seconds delay before a queued issuer addition can execute.
-    /// @param issuerRemovalDelay   Seconds delay before a queued issuer removal can execute.
-    /// @param initialIssuers       OAuth issuers added immediately at creation (no delay).
-    /// @param authKeyAddDelay      Seconds delay before a queued auth key addition can execute.
-    /// @param authKeyRemovalDelay  Seconds delay before a queued auth key removal can execute.
-    /// @param initialAuthKeys      Authorization keys added immediately at creation (no delay).
+    /// @param initialIssuers       OAuth issuers to trust at creation.
+    /// @param initialAuthKeys      Authorization keys to trust at creation.
     function createGroup(
         address[] calldata nodeAddrs,
         uint256 threshold,
         uint256 removalDelay,
-        uint256 issuerAddDelay,
-        uint256 issuerRemovalDelay,
         ISignetGroup.InitialIssuer[] calldata initialIssuers,
-        uint256 authKeyAddDelay,
-        uint256 authKeyRemovalDelay,
         bytes[] calldata initialAuthKeys
     ) external returns (address group);
 

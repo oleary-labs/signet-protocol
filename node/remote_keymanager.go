@@ -50,6 +50,42 @@ func NewRemoteKeyManager(ctx context.Context, socket string, selfID tss.PartyID,
 	}, nil
 }
 
+// runSession dispatches an encoded session to the KMS: StartSession, forward
+// the initial outgoing messages to peers, then bridge the bidi stream until
+// the KMS returns a final SessionResult. Returns an error if the result is
+// missing. label is used for error wrapping ("keygen", "sign", "reshare").
+func (rkm *RemoteKeyManager) runSession(
+	ctx context.Context,
+	label string,
+	sessionID string,
+	sessionType kmspb.SessionType,
+	params []byte,
+	sn interface {
+		Send(msg *tss.Message)
+		Incoming() <-chan *tss.Message
+	},
+) (*kmspb.SessionResult, error) {
+	resp, err := rkm.client.StartSession(ctx, &kmspb.StartSessionRequest{
+		SessionId: sessionID,
+		Type:      sessionType,
+		Params:    params,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("start %s session: %w", label, err)
+	}
+	for _, out := range resp.Outgoing {
+		sn.Send(protoToTSSMessage(out))
+	}
+	result, err := rkm.bridgeSession(ctx, sessionID, sn)
+	if err != nil {
+		return nil, fmt.Errorf("%s session: %w", label, err)
+	}
+	if result == nil {
+		return nil, fmt.Errorf("%s session: no result returned", label)
+	}
+	return result, nil
+}
+
 // RunKeygen starts a keygen session on the KMS and bridges the libp2p session
 // network with the KMS's ProcessMessage stream.
 func (rkm *RemoteKeyManager) RunKeygen(ctx context.Context, p KeygenParams) (*KeyInfo, error) {
@@ -57,28 +93,10 @@ func (rkm *RemoteKeyManager) RunKeygen(ctx context.Context, p KeygenParams) (*Ke
 	if err != nil {
 		return nil, fmt.Errorf("encode keygen params: %w", err)
 	}
-	resp, err := rkm.client.StartSession(ctx, &kmspb.StartSessionRequest{
-		SessionId: p.SessionID,
-		Type:      kmspb.SessionType_SESSION_TYPE_KEYGEN,
-		Params:    params,
-	})
+	result, err := rkm.runSession(ctx, "keygen", p.SessionID, kmspb.SessionType_SESSION_TYPE_KEYGEN, params, p.SN)
 	if err != nil {
-		return nil, fmt.Errorf("start keygen session: %w", err)
+		return nil, err
 	}
-
-	// Forward initial outgoing messages from KMS to peers.
-	for _, out := range resp.Outgoing {
-		p.SN.Send(protoToTSSMessage(out))
-	}
-
-	result, err := rkm.bridgeSession(ctx, p.SessionID, p.SN)
-	if err != nil {
-		return nil, fmt.Errorf("keygen session: %w", err)
-	}
-	if result == nil {
-		return nil, fmt.Errorf("keygen session: no result returned")
-	}
-
 	return &KeyInfo{
 		GroupKey: result.GroupKey,
 		Curve:    p.Curve,
@@ -92,25 +110,9 @@ func (rkm *RemoteKeyManager) RunSign(ctx context.Context, p SignParams) (*tss.Si
 	if err != nil {
 		return nil, fmt.Errorf("encode sign params: %w", err)
 	}
-	resp, err := rkm.client.StartSession(ctx, &kmspb.StartSessionRequest{
-		SessionId: p.SessionID,
-		Type:      kmspb.SessionType_SESSION_TYPE_SIGN,
-		Params:    params,
-	})
+	result, err := rkm.runSession(ctx, "sign", p.SessionID, kmspb.SessionType_SESSION_TYPE_SIGN, params, p.SN)
 	if err != nil {
-		return nil, fmt.Errorf("start sign session: %w", err)
-	}
-
-	for _, out := range resp.Outgoing {
-		p.SN.Send(protoToTSSMessage(out))
-	}
-
-	result, err := rkm.bridgeSession(ctx, p.SessionID, p.SN)
-	if err != nil {
-		return nil, fmt.Errorf("sign session: %w", err)
-	}
-	if result == nil {
-		return nil, fmt.Errorf("sign session: no result returned")
+		return nil, err
 	}
 	// For FROST, all participants produce the same signature.
 	// For threshold ECDSA, only the coordinator produces a signature —
@@ -128,27 +130,10 @@ func (rkm *RemoteKeyManager) RunReshare(ctx context.Context, p ReshareParams) (*
 	if err != nil {
 		return nil, fmt.Errorf("encode reshare params: %w", err)
 	}
-	resp, err := rkm.client.StartSession(ctx, &kmspb.StartSessionRequest{
-		SessionId: p.SessionID,
-		Type:      kmspb.SessionType_SESSION_TYPE_RESHARE,
-		Params:    params,
-	})
+	result, err := rkm.runSession(ctx, "reshare", p.SessionID, kmspb.SessionType_SESSION_TYPE_RESHARE, params, p.SN)
 	if err != nil {
-		return nil, fmt.Errorf("start reshare session: %w", err)
+		return nil, err
 	}
-
-	for _, out := range resp.Outgoing {
-		p.SN.Send(protoToTSSMessage(out))
-	}
-
-	result, err := rkm.bridgeSession(ctx, p.SessionID, p.SN)
-	if err != nil {
-		return nil, fmt.Errorf("reshare session: %w", err)
-	}
-	if result == nil {
-		return nil, fmt.Errorf("reshare session: no result returned")
-	}
-
 	// If group_key is returned but no verifying_share, this is an old-only party.
 	oldOnly := len(result.VerifyingShare) == 0
 	return &ReshareResult{

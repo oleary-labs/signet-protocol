@@ -797,15 +797,11 @@ func (n *Node) handleKeygen(w http.ResponseWriter, r *http.Request) {
 		httpError(w, http.StatusBadRequest, "decode body: "+err.Error())
 		return
 	}
-	// Default curve to secp256k1.
-	if req.Curve == "" {
-		req.Curve = string(CurveSecp256k1)
-	}
-	curve := Curve(req.Curve)
-	if !curve.Valid() {
-		httpError(w, http.StatusBadRequest, "unsupported curve: "+req.Curve)
+	curve, ok := parseCurve(w, req.Curve)
+	if !ok {
 		return
 	}
+	req.Curve = string(curve)
 	// Parse scope and derive key_suffix from it.
 	var scopeBytes []byte
 	if req.Scope != "" {
@@ -835,44 +831,17 @@ func (n *Node) handleKeygen(w http.ResponseWriter, r *http.Request) {
 	}
 	req.GroupID = groupID
 
-	n.groupsMu.RLock()
-	grp, ok := n.groups[req.GroupID]
-	n.groupsMu.RUnlock()
+	grp, ok := n.lookupGroup(w, req.GroupID)
 	if !ok {
-		httpError(w, http.StatusNotFound, "group not found: "+req.GroupID)
 		return
 	}
 
-	keyID := req.KeyID
-	var authProof *SessionAuth
-
-	if n.auth.HasAuthPolicy(req.GroupID) {
-		if req.SessionPub == "" {
-			httpError(w, http.StatusUnauthorized, "authorization required (session_pub)")
-			return
-		}
-		ap, resolvedKeyID, err := n.validateSessionRequest(
-			req.SessionPub, req.RequestSig,
-			req.GroupID, req.KeyID, req.KeySuffix,
-			req.Nonce, req.Timestamp,
-			nil, // no message_hash for keygen
-		)
-		if err != nil {
-			n.log.Warn("keygen: session auth failed",
-				zap.String("group_id", req.GroupID),
-				zap.String("session_pub", req.SessionPub),
-				zap.String("key_suffix", req.KeySuffix),
-				zap.Uint64("timestamp", req.Timestamp),
-				zap.String("nonce", req.Nonce),
-				zap.Int("code", err.code),
-				zap.String("error", err.msg))
-			httpError(w, err.code, err.msg)
-			return
-		}
-		keyID = resolvedKeyID
-		authProof = ap
-	} else if keyID == "" {
-		httpError(w, http.StatusBadRequest, "key_id is required")
+	keyID, authProof, ok := n.applySessionAuth(w, "keygen",
+		req.GroupID, req.KeyID, req.KeySuffix,
+		req.SessionPub, req.RequestSig,
+		req.Nonce, req.Timestamp,
+		nil) // no message_hash for keygen
+	if !ok {
 		return
 	}
 
@@ -1005,14 +974,11 @@ func (n *Node) handleSign(w http.ResponseWriter, r *http.Request) {
 		httpError(w, http.StatusBadRequest, "decode body: "+err.Error())
 		return
 	}
-	if req.Curve == "" {
-		req.Curve = string(CurveSecp256k1)
-	}
-	signCurve := Curve(req.Curve)
-	if !signCurve.Valid() {
-		httpError(w, http.StatusBadRequest, "unsupported curve: "+req.Curve)
+	signCurve, ok := parseCurve(w, req.Curve)
+	if !ok {
 		return
 	}
+	req.Curve = string(signCurve)
 	groupID, ok := normalizeGroupID(w, req.GroupID)
 	if !ok {
 		return
@@ -1042,44 +1008,17 @@ func (n *Node) handleSign(w http.ResponseWriter, r *http.Request) {
 	}
 	// payload handling is deferred until after key info is loaded (need scope).
 
-	n.groupsMu.RLock()
-	grp, ok := n.groups[req.GroupID]
-	n.groupsMu.RUnlock()
+	grp, ok := n.lookupGroup(w, req.GroupID)
 	if !ok {
-		httpError(w, http.StatusNotFound, "group not found: "+req.GroupID)
 		return
 	}
 
-	keyID := req.KeyID
-	var authProof *SessionAuth
-
-	if n.auth.HasAuthPolicy(req.GroupID) {
-		if req.SessionPub == "" {
-			httpError(w, http.StatusUnauthorized, "authorization required (session_pub)")
-			return
-		}
-		ap, resolvedKeyID, err := n.validateSessionRequest(
-			req.SessionPub, req.RequestSig,
-			req.GroupID, req.KeyID, req.KeySuffix,
-			req.Nonce, req.Timestamp,
-			msgHash,
-		)
-		if err != nil {
-			n.log.Warn("sign: session auth failed",
-				zap.String("group_id", req.GroupID),
-				zap.String("session_pub", req.SessionPub),
-				zap.String("key_suffix", req.KeySuffix),
-				zap.Uint64("timestamp", req.Timestamp),
-				zap.String("nonce", req.Nonce),
-				zap.Int("code", err.code),
-				zap.String("error", err.msg))
-			httpError(w, err.code, err.msg)
-			return
-		}
-		keyID = resolvedKeyID
-		authProof = ap
-	} else if keyID == "" {
-		httpError(w, http.StatusBadRequest, "key_id is required")
+	keyID, authProof, ok := n.applySessionAuth(w, "sign",
+		req.GroupID, req.KeyID, req.KeySuffix,
+		req.SessionPub, req.RequestSig,
+		req.Nonce, req.Timestamp,
+		msgHash)
+	if !ok {
 		return
 	}
 
@@ -1606,6 +1545,78 @@ func normalizeGroupID(w http.ResponseWriter, raw string) (string, bool) {
 		return "", false
 	}
 	return g, true
+}
+
+// parseCurve defaults raw to secp256k1 when empty and validates the result.
+// On unsupported curve writes a 400 and returns ("", false).
+func parseCurve(w http.ResponseWriter, raw string) (Curve, bool) {
+	if raw == "" {
+		raw = string(CurveSecp256k1)
+	}
+	c := Curve(raw)
+	if !c.Valid() {
+		httpError(w, http.StatusBadRequest, "unsupported curve: "+raw)
+		return "", false
+	}
+	return c, true
+}
+
+// lookupGroup returns the resolved membership for groupID, or writes a 404
+// and returns (nil, false) if the node has no record of it.
+func (n *Node) lookupGroup(w http.ResponseWriter, groupID string) (*GroupInfo, bool) {
+	n.groupsMu.RLock()
+	grp, ok := n.groups[groupID]
+	n.groupsMu.RUnlock()
+	if !ok {
+		httpError(w, http.StatusNotFound, "group not found: "+groupID)
+		return nil, false
+	}
+	return grp, true
+}
+
+// applySessionAuth resolves the keyID and SessionAuth for handlers that
+// operate on a key. If the group has an auth policy, the session-bound
+// request signature is verified; otherwise the request must supply a
+// non-empty key_id directly. On failure writes the HTTP error and returns
+// (_, _, false). label is used in the warn log only ("keygen", "sign", ...).
+func (n *Node) applySessionAuth(
+	w http.ResponseWriter,
+	label string,
+	groupID, keyID, keySuffix string,
+	sessionPub, requestSig string,
+	nonce string, timestamp uint64,
+	messageHash []byte,
+) (string, *SessionAuth, bool) {
+	if !n.auth.HasAuthPolicy(groupID) {
+		if keyID == "" {
+			httpError(w, http.StatusBadRequest, "key_id is required")
+			return "", nil, false
+		}
+		return keyID, nil, true
+	}
+	if sessionPub == "" {
+		httpError(w, http.StatusUnauthorized, "authorization required (session_pub)")
+		return "", nil, false
+	}
+	ap, resolvedKeyID, herr := n.validateSessionRequest(
+		sessionPub, requestSig,
+		groupID, keyID, keySuffix,
+		nonce, timestamp,
+		messageHash,
+	)
+	if herr != nil {
+		n.log.Warn(label+": session auth failed",
+			zap.String("group_id", groupID),
+			zap.String("session_pub", sessionPub),
+			zap.String("key_suffix", keySuffix),
+			zap.Uint64("timestamp", timestamp),
+			zap.String("nonce", nonce),
+			zap.Int("code", herr.code),
+			zap.String("error", herr.msg))
+		httpError(w, herr.code, herr.msg)
+		return "", nil, false
+	}
+	return resolvedKeyID, ap, true
 }
 
 // reconnectLoop periodically re-dials any bootstrap peer that is not currently

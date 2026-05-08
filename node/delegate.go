@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/bytemare/frost"
 	"github.com/ethereum/go-ethereum/crypto"
 	"go.uber.org/zap"
 
@@ -29,6 +30,7 @@ type jwtClaims struct {
 	Iss            string `json:"iss"`              // group address
 	Sub            string `json:"sub"`              // sub-key ID (the delegated key)
 	Kid            string `json:"kid"`              // parent key ID (the signing key)
+	Scheme         string `json:"scheme"`            // signing scheme: secp256k1, ecdsa_secp256k1, ed25519
 	Grp            string `json:"grp"`              // group address (redundant with iss, for clarity)
 	Exp            int64  `json:"exp"`              // expiry timestamp
 	Iat            int64  `json:"iat"`              // issued-at timestamp
@@ -81,13 +83,24 @@ func (n *Node) handleDelegate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	keyID := req.KeyID
+	// Authenticate the caller. The request signature is over the sub-key ID
+	// (with suffix) — this binds the user's authorization to the specific
+	// sub-key being delegated. The parent key is derived by stripping the suffix.
+	var authProof *SessionAuth
+	var parentKeyID, subKeyID string
 	if n.auth.HasAuthPolicy(req.GroupID) {
 		if req.SessionPub == "" {
 			httpError(w, http.StatusUnauthorized, "authorization required (session_pub)")
 			return
 		}
-		_, resolvedKeyID, err := n.validateSessionRequest(
+		if req.KeySuffix == "" {
+			httpError(w, http.StatusBadRequest, "key_suffix (sub-key scope hash) is required")
+			return
+		}
+		// Validate session against the sub-key (with suffix). The client
+		// signs over the sub-key key_id to authorize delegation of that
+		// specific sub-key.
+		ap, resolved, err := n.validateSessionRequest(
 			req.SessionPub, req.RequestSig,
 			req.GroupID, req.KeyID, req.KeySuffix,
 			req.Nonce, req.Timestamp,
@@ -97,33 +110,43 @@ func (n *Node) handleDelegate(w http.ResponseWriter, r *http.Request) {
 			httpError(w, err.code, err.msg)
 			return
 		}
-		keyID = resolvedKeyID
+		authProof = ap
+		subKeyID = resolved
+		// Parent key is the base identity key (resolved without suffix).
+		parentKeyID = resolved[:len(resolved)-len(req.KeySuffix)-1]
+	} else {
+		subKeyID = req.KeyID
+		parentKeyID = req.ParentKeyID
 	}
 
-	if keyID == "" {
-		httpError(w, http.StatusBadRequest, "key_id is required")
+	if subKeyID == "" {
+		httpError(w, http.StatusBadRequest, "key_id or key_suffix is required")
+		return
+	}
+	if parentKeyID == "" {
+		httpError(w, http.StatusBadRequest, "parent_key_id is required")
 		return
 	}
 
 	// Verify the sub-key exists.
-	subKeyInfo, err := n.km.GetKeyInfo(req.GroupID, keyID, parentCurve)
+	subKeyInfo, err := n.km.GetKeyInfo(req.GroupID, subKeyID, parentCurve)
 	if err != nil {
 		httpError(w, http.StatusInternalServerError, "load sub-key: "+err.Error())
 		return
 	}
 	if subKeyInfo == nil {
-		httpError(w, http.StatusNotFound, fmt.Sprintf("sub-key not found: %s", keyID))
+		httpError(w, http.StatusNotFound, fmt.Sprintf("sub-key not found: %s", subKeyID))
 		return
 	}
 
 	// Verify the parent key exists and load its public key.
-	parentInfo, err := n.km.GetKeyInfo(req.GroupID, req.ParentKeyID, parentCurve)
+	parentInfo, err := n.km.GetKeyInfo(req.GroupID, parentKeyID, parentCurve)
 	if err != nil {
 		httpError(w, http.StatusInternalServerError, "load parent key: "+err.Error())
 		return
 	}
 	if parentInfo == nil {
-		httpError(w, http.StatusNotFound, fmt.Sprintf("parent key not found: %s", req.ParentKeyID))
+		httpError(w, http.StatusNotFound, fmt.Sprintf("parent key not found: %s", parentKeyID))
 		return
 	}
 
@@ -134,12 +157,13 @@ func (n *Node) handleDelegate(w http.ResponseWriter, r *http.Request) {
 	header := jwtHeader{
 		Alg: "signet-threshold",
 		Typ: "JWT",
-		Kid: req.ParentKeyID,
+		Kid: parentKeyID,
 	}
 	claims := jwtClaims{
 		Iss:          req.GroupID,
-		Sub:          keyID,
-		Kid:          req.ParentKeyID,
+		Sub:          stripKeyNamespace(subKeyID),
+		Kid:          stripKeyNamespace(parentKeyID),
+		Scheme:       string(parentCurve),
 		Grp:          req.GroupID,
 		Exp:          exp.Unix(),
 		Iat:          now.Unix(),
@@ -159,8 +183,8 @@ func (n *Node) handleDelegate(w http.ResponseWriter, r *http.Request) {
 	// Threshold sign the JWT hash using the parent key.
 	n.log.Info("delegate: signing JWT",
 		zap.String("group_id", req.GroupID),
-		zap.String("sub_key", keyID),
-		zap.String("parent_key", req.ParentKeyID),
+		zap.String("sub_key", subKeyID),
+		zap.String("parent_key", parentKeyID),
 	)
 
 	sortedSigners := tss.NewPartyIDSlice(grp.Members)
@@ -169,7 +193,7 @@ func (n *Node) handleDelegate(w http.ResponseWriter, r *http.Request) {
 		httpError(w, http.StatusInternalServerError, "generate nonce: "+err.Error())
 		return
 	}
-	sessID := signSessionID(req.GroupID, req.ParentKeyID, nonce)
+	sessID := signSessionID(req.GroupID, parentKeyID, nonce)
 
 	sn, err := network.NewSessionNetwork(r.Context(), n.host, sessID, sortedSigners)
 	if err != nil {
@@ -192,13 +216,15 @@ func (n *Node) handleDelegate(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := n.broadcastCoord(r.Context(), sortedSigners, coordMsg{
-		Type:        msgSign,
-		GroupID:     req.GroupID,
-		KeyID:       req.ParentKeyID,
-		SignNonce:   nonce,
-		Signers:     signersForCoord,
-		MessageHash: msgHash[:],
-		Curve:       string(parentCurve),
+		Type:           msgDelegateSign,
+		GroupID:        req.GroupID,
+		KeyID:          parentKeyID,
+		SignNonce:      nonce,
+		Signers:        signersForCoord,
+		MessageHash:    msgHash[:],
+		Curve:          string(parentCurve),
+		Session:        authProof,
+		DelegateSubKey: subKeyID,
 	}); err != nil {
 		httpError(w, http.StatusInternalServerError, "coordinate: "+err.Error())
 		return
@@ -209,7 +235,7 @@ func (n *Node) handleDelegate(w http.ResponseWriter, r *http.Request) {
 		SN:          sn,
 		SessionID:   sessID,
 		GroupID:     req.GroupID,
-		KeyID:       req.ParentKeyID,
+		KeyID:       parentKeyID,
 		Signers:     signersForCoord,
 		MessageHash: msgHash[:],
 		Curve:       parentCurve,
@@ -225,16 +251,16 @@ func (n *Node) handleDelegate(w http.ResponseWriter, r *http.Request) {
 
 	n.log.Info("delegate: token minted",
 		zap.String("group_id", req.GroupID),
-		zap.String("sub_key", keyID),
-		zap.String("parent_key", req.ParentKeyID),
+		zap.String("sub_key", subKeyID),
+		zap.String("parent_key", parentKeyID),
 		zap.Int64("expires_at", exp.Unix()),
 	)
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]any{
 		"token":      token,
-		"key_id":     keyID,
-		"parent_key": req.ParentKeyID,
+		"key_id":     stripKeyNamespace(subKeyID),
+		"parent_key": stripKeyNamespace(parentKeyID),
 		"expires_at": exp.Unix(),
 	})
 }
@@ -278,20 +304,6 @@ func (n *Node) VerifyDelegationToken(groupID, token string) (*jwtClaims, error) 
 		return nil, fmt.Errorf("delegation token expired")
 	}
 
-	// Load the parent key to verify signature.
-	// Try common curves — the parent key could be FROST or ECDSA.
-	var parentPubKey []byte
-	for _, curve := range []Curve{CurveSecp256k1, CurveEcdsaSecp256k1, CurveEd25519} {
-		info, err := n.km.GetKeyInfo(groupID, claims.Kid, curve)
-		if err == nil && info != nil {
-			parentPubKey = info.GroupKey
-			break
-		}
-	}
-	if parentPubKey == nil {
-		return nil, fmt.Errorf("parent key not found: %s", claims.Kid)
-	}
-
 	// Verify signature.
 	sigBytes, err := base64.RawURLEncoding.DecodeString(parts[2])
 	if err != nil {
@@ -301,45 +313,86 @@ func (n *Node) VerifyDelegationToken(groupID, token string) (*jwtClaims, error) 
 	signingInput := parts[0] + "." + parts[1]
 	msgHash := sha256.Sum256([]byte(signingInput))
 
-	// Verify based on signature length:
-	// - 65 bytes = FROST Schnorr (R.x 32 + z 32 + v 1) — NOT standard, needs custom verify
-	// - 64 bytes = ECDSA (r 32 + s 32) or FROST (R 32 + Z 32)
-	// For ECDSA: use ecrecover to verify.
-	if len(sigBytes) == 64 && len(parentPubKey) == 33 {
-		// Try ECDSA recovery: try v=0 and v=1.
-		for v := byte(0); v < 2; v++ {
-			recSig := make([]byte, 65)
-			copy(recSig, sigBytes)
-			recSig[64] = v
-			recovered, err := crypto.Ecrecover(msgHash[:], recSig)
-			if err != nil {
+	// Load the parent key using the scheme from the token claims.
+	scheme := Curve(claims.Scheme)
+	if !scheme.Valid() {
+		// Backwards compat: tokens without scheme — try all.
+		scheme = ""
+	}
+	curves := []Curve{scheme}
+	if scheme == "" {
+		curves = []Curve{CurveSecp256k1, CurveEcdsaSecp256k1, CurveEd25519}
+	}
+	// The JWT claims store key IDs without the internal "oauth:" prefix.
+	// Add it back for storage lookups.
+	internalKid := "oauth:" + claims.Kid
+	for _, curve := range curves {
+		info, err := n.km.GetKeyInfo(groupID, internalKid, curve)
+		if err != nil || info == nil {
+			continue
+		}
+		parentPubKey := info.GroupKey
+
+		switch curve {
+		case CurveSecp256k1:
+			// FROST Schnorr: R(33 compressed) || Z(32) = 65 bytes.
+			if len(sigBytes) != 65 {
 				continue
 			}
-			// Compare recovered pubkey with parent key.
-			// Convert compressed parent key to uncompressed for comparison.
+			g := frost.Secp256k1.Group()
+			vk := g.NewElement()
+			if err := vk.Decode(parentPubKey); err != nil {
+				continue
+			}
+			frostSig := &frost.Signature{
+				R:     g.NewElement(),
+				Z:     g.NewScalar(),
+				Group: g,
+			}
+			if err := frostSig.R.Decode(sigBytes[:33]); err != nil {
+				continue
+			}
+			if err := frostSig.Z.Decode(sigBytes[33:]); err != nil {
+				continue
+			}
+			if err := frost.VerifySignature(frost.Secp256k1, msgHash[:], frostSig, vk); err != nil {
+				continue
+			}
+			return &claims, nil
+
+		case CurveEcdsaSecp256k1:
+			// ECDSA: r(32) || s(32) = 64 bytes.
+			if len(sigBytes) != 64 {
+				continue
+			}
 			parentPub, err := crypto.DecompressPubkey(parentPubKey)
 			if err != nil {
 				continue
 			}
 			parentUncompressed := crypto.FromECDSAPub(parentPub)
-			if len(recovered) == len(parentUncompressed) {
-				match := true
-				for i := range recovered {
-					if recovered[i] != parentUncompressed[i] {
-						match = false
-						break
-					}
+			for v := byte(0); v < 2; v++ {
+				recSig := make([]byte, 65)
+				copy(recSig, sigBytes)
+				recSig[64] = v
+				recovered, err := crypto.Ecrecover(msgHash[:], recSig)
+				if err != nil {
+					continue
 				}
-				if match {
-					return &claims, nil
+				if len(recovered) == len(parentUncompressed) {
+					match := true
+					for i := range recovered {
+						if recovered[i] != parentUncompressed[i] {
+							match = false
+							break
+						}
+					}
+					if match {
+						return &claims, nil
+					}
 				}
 			}
 		}
-		return nil, fmt.Errorf("ECDSA signature verification failed")
 	}
 
-	// For FROST Schnorr signatures, verify using the FROST verify path.
-	// For now, accept if the signature is from a known parent key.
-	// TODO: implement Schnorr signature verification for delegation tokens.
-	return nil, fmt.Errorf("unsupported signature format (len=%d)", len(sigBytes))
+	return nil, fmt.Errorf("delegation token signature verification failed (sig_len=%d)", len(sigBytes))
 }

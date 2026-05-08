@@ -1,6 +1,7 @@
 package node
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
@@ -14,6 +15,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/ethereum/go-ethereum/crypto"
 	circuits "github.com/oleary-labs/signet-circuits/packages/go"
 	"github.com/libp2p/go-libp2p/core/peer"
 	ma "github.com/multiformats/go-multiaddr"
@@ -572,6 +574,30 @@ func (n *Node) handleAuth(w http.ResponseWriter, r *http.Request) {
 			zap.String("identity", identity),
 			zap.String("session_pub", pubHex))
 
+		// Forward session to participants.
+		n.groupsMu.RLock()
+		grpCert, grpCertOk := n.groups[req.GroupID]
+		n.groupsMu.RUnlock()
+		if grpCertOk {
+			ap := &AuthProof{
+				SessionPub:    sessionPubBytes,
+				Exp:           cert.Expiry,
+				Identity:      identity,
+				AuthKeyPub:    authKeyBytes,
+				CertSignature: sigBytes,
+			}
+			members := tss.NewPartyIDSlice(grpCert.Members)
+			go func() {
+				if err := n.broadcastCoord(n.ctx, members, coordMsg{
+					Type:    msgAuth,
+					GroupID: req.GroupID,
+					Auth:    ap,
+				}); err != nil {
+					n.log.Warn("auth: failed to forward cert session to participants", zap.Error(err))
+				}
+			}()
+		}
+
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]any{
 			"status":     "ok",
@@ -589,10 +615,13 @@ func (n *Node) handleAuth(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
+		// JWT claims use unprefixed key IDs. Add "oauth:" for internal lookups.
+		internalSubKey := "oauth:" + claims.Sub
+
 		// Verify the sub-key exists.
 		keyExists := false
 		for _, curve := range []Curve{CurveSecp256k1, CurveEcdsaSecp256k1, CurveEd25519} {
-			if info, _ := n.km.GetKeyInfo(req.GroupID, claims.Sub, curve); info != nil {
+			if info, _ := n.km.GetKeyInfo(req.GroupID, internalSubKey, curve); info != nil {
 				keyExists = true
 				break
 			}
@@ -602,14 +631,15 @@ func (n *Node) handleAuth(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		// Create session scoped to the sub-key's identity namespace.
-		// The identity is the sub-key's key_id prefix (everything before the suffix).
-		identity := claims.Sub
+		// Extract iss and sub from the unprefixed key ID. The format is
+		// <iss>:<sub>[:<suffix>] where iss is a URL like https://foo.bar.
+		delegateIss, delegateSub := parseDelegationIdentity(claims.Sub)
 		pubHex := sessionPubToHex(sessionPubBytes)
 		n.sessions.Put(pubHex, &SessionInfo{
-			Sub:      identity,
-			Exp:      time.Unix(claims.Exp, 0),
-			Identity: identity,
+			Sub:            delegateSub,
+			Iss:            delegateIss,
+			Exp:            time.Unix(claims.Exp, 0),
+			DelegatedKeyID: internalSubKey, // lock session to this specific sub-key
 		})
 		n.log.Info("auth: session registered (delegation token)",
 			zap.String("group_id", req.GroupID),
@@ -617,10 +647,35 @@ func (n *Node) handleAuth(w http.ResponseWriter, r *http.Request) {
 			zap.String("parent_key", claims.Kid),
 			zap.String("session_pub", pubHex))
 
+		// Forward session to participants. Delegation token is self-validating
+		// so participants can independently verify it.
+		n.groupsMu.RLock()
+		grpDel, grpDelOk := n.groups[req.GroupID]
+		n.groupsMu.RUnlock()
+		if grpDelOk {
+			ap := &AuthProof{
+				SessionPub:      sessionPubBytes,
+				Exp:             uint64(claims.Exp),
+				Sub:             delegateSub,
+				Iss:             delegateIss,
+				DelegationToken: req.DelegationToken,
+			}
+			members := tss.NewPartyIDSlice(grpDel.Members)
+			go func() {
+				if err := n.broadcastCoord(n.ctx, members, coordMsg{
+					Type:    msgAuth,
+					GroupID: req.GroupID,
+					Auth:    ap,
+				}); err != nil {
+					n.log.Warn("auth: failed to forward delegation session to participants", zap.Error(err))
+				}
+			}()
+		}
+
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]any{
 			"status":     "ok",
-			"identity":   identity,
+			"identity":   delegateIss + ":" + delegateSub,
 			"key_id":     claims.Sub,
 			"parent_key": claims.Kid,
 			"expires_at": claims.Exp,
@@ -677,13 +732,33 @@ func (n *Node) handleAuth(w http.ResponseWriter, r *http.Request) {
 		Exp:         time.Unix(int64(req.Exp), 0),
 		Aud:         req.Aud,
 		Azp:         req.Azp,
-		Proof:       proofBytes,
-		JWKSModulus: modulusBytes,
 	})
 	n.log.Info("auth: session registered (ZK proof)",
 		zap.String("group_id", req.GroupID),
 		zap.String("sub", sub),
 		zap.String("session_pub", pubHex))
+
+	// Forward the auth proof to all other group members so they establish
+	// the session too. This is fire-and-forget — if a participant is
+	// temporarily unreachable, the first coord message they receive will
+	// fail and the client can re-auth.
+	n.groupsMu.RLock()
+	grp, grpOk := n.groups[req.GroupID]
+	n.groupsMu.RUnlock()
+	if grpOk {
+		members := tss.NewPartyIDSlice(grp.Members)
+		go func() {
+			if err := n.broadcastCoord(n.ctx, members, coordMsg{
+				Type:    msgAuth,
+				GroupID: req.GroupID,
+				Auth:    ap,
+			}); err != nil {
+				n.log.Warn("auth: failed to forward session to participants",
+					zap.String("group_id", req.GroupID),
+					zap.Error(err))
+			}
+		}()
+	}
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]any{
@@ -746,7 +821,12 @@ func (n *Node) handleKeygen(w http.ResponseWriter, r *http.Request) {
 		}
 		// Derive key_suffix from scope hash — same scope = same key.
 		scopeHash := sha256.Sum256(scopeBytes)
-		req.KeySuffix = hex.EncodeToString(scopeHash[:8])
+		derivedSuffix := hex.EncodeToString(scopeHash[:8])
+		if req.KeySuffix != "" && req.KeySuffix != derivedSuffix {
+			httpError(w, http.StatusBadRequest, "key_suffix conflicts with scope-derived suffix")
+			return
+		}
+		req.KeySuffix = derivedSuffix
 	}
 
 	if req.GroupID == "" {
@@ -764,7 +844,7 @@ func (n *Node) handleKeygen(w http.ResponseWriter, r *http.Request) {
 	}
 
 	keyID := req.KeyID
-	var authProof *AuthProof
+	var authProof *SessionAuth
 
 	if n.auth.HasAuthPolicy(req.GroupID) {
 		if req.SessionPub == "" {
@@ -802,20 +882,11 @@ func (n *Node) handleKeygen(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusConflict)
 		json.NewEncoder(w).Encode(map[string]any{
 			"group_id":         req.GroupID,
-			"key_id":           keyID,
+			"key_id":           stripKeyNamespace(keyID),
 			"public_key":       "0x" + hex.EncodeToString(info.GroupKey),
 			"ethereum_address": "0x" + hex.EncodeToString(ethAddr[:]),
 		})
 		return
-	}
-
-	// Preflight: verify the auth proof will be accepted by participants
-	// before starting the network protocol.
-	if authProof != nil {
-		if _, err := n.auth.ValidateAuthProof(r.Context(), req.GroupID, authProof); err != nil {
-			httpError(w, http.StatusUnauthorized, "auth proof will be rejected by participants: "+err.Error())
-			return
-		}
 	}
 
 	sortedParties := tss.NewPartyIDSlice(grp.Members)
@@ -824,6 +895,8 @@ func (n *Node) handleKeygen(w http.ResponseWriter, r *http.Request) {
 	n.log.Info("keygen starting",
 		zap.String("group_id", req.GroupID),
 		zap.String("key_id", keyID),
+		zap.String("curve", req.Curve),
+		zap.Int("scope_len", len(scopeBytes)),
 		zap.Int("n", len(sortedParties)),
 		zap.Int("threshold", grp.Threshold),
 	)
@@ -843,7 +916,7 @@ func (n *Node) handleKeygen(w http.ResponseWriter, r *http.Request) {
 		Threshold: grp.Threshold,
 		Curve:     string(curve),
 		Scope:     scopeBytes,
-		Auth:      authProof,
+		Session:   authProof,
 	}); err != nil {
 		httpError(w, http.StatusInternalServerError, "coordinate: "+err.Error())
 		return
@@ -871,7 +944,7 @@ func (n *Node) handleKeygen(w http.ResponseWriter, r *http.Request) {
 
 	resp := map[string]any{
 		"group_id":   req.GroupID,
-		"key_id":     keyID,
+		"key_id":     stripKeyNamespace(keyID),
 		"curve":      req.Curve,
 		"public_key": "0x" + hex.EncodeToString(info.GroupKey),
 	}
@@ -978,7 +1051,7 @@ func (n *Node) handleSign(w http.ResponseWriter, r *http.Request) {
 	}
 
 	keyID := req.KeyID
-	var authProof *AuthProof
+	var authProof *SessionAuth
 
 	if n.auth.HasAuthPolicy(req.GroupID) {
 		if req.SessionPub == "" {
@@ -1063,14 +1136,6 @@ func (n *Node) handleSign(w http.ResponseWriter, r *http.Request) {
 	}
 	sessID := signSessionID(req.GroupID, keyID, nonce)
 
-	// Preflight: verify the auth proof will be accepted by participants.
-	if authProof != nil {
-		if _, err := n.auth.ValidateAuthProof(r.Context(), req.GroupID, authProof); err != nil {
-			httpError(w, http.StatusUnauthorized, "auth proof will be rejected by participants: "+err.Error())
-			return
-		}
-	}
-
 	n.log.Info("sign starting",
 		zap.String("group_id", req.GroupID),
 		zap.String("key_id", keyID),
@@ -1119,7 +1184,7 @@ func (n *Node) handleSign(w http.ResponseWriter, r *http.Request) {
 		MessageHash: msgHash,
 		Curve:       string(signCurve),
 		SignPayload: signPayloadBytes,
-		Auth:        authProof,
+		Session:     authProof,
 	}); err != nil {
 		httpError(w, http.StatusInternalServerError, "coordinate: "+err.Error())
 		return
@@ -1151,16 +1216,33 @@ func (n *Node) handleSign(w http.ResponseWriter, r *http.Request) {
 
 	resp := map[string]any{
 		"group_id":  req.GroupID,
-		"key_id":    keyID,
+		"key_id":    stripKeyNamespace(keyID),
 		"curve":     string(signCurve),
 		"signature": "0x" + hex.EncodeToString(sig.Bytes()),
 	}
 
 	// Include scheme-specific signature formats.
 	if signCurve == CurveEcdsaSecp256k1 {
-		// Standard ECDSA: r (32 bytes) || s (32 bytes).
-		// The caller can recover v from the public key if needed.
-		resp["ecdsa_signature"] = "0x" + hex.EncodeToString(sig.Bytes())
+		// Recoverable ECDSA: r(32) || s(32) || v(1) for ecrecover.
+		// Compute v by trying recovery and matching the known group key.
+		rawSig := sig.Bytes() // r(32) || s(32)
+		ecdsaSig := make([]byte, 65)
+		copy(ecdsaSig, rawSig)
+		for v := byte(0); v < 2; v++ {
+			ecdsaSig[64] = v
+			recovered, err := crypto.Ecrecover(msgHash, ecdsaSig)
+			if err != nil {
+				continue
+			}
+			pubKey, err := crypto.DecompressPubkey(keyInfo.GroupKey)
+			if err != nil {
+				continue
+			}
+			if bytes.Equal(recovered, crypto.FromECDSAPub(pubKey)) {
+				break
+			}
+		}
+		resp["ecdsa_signature"] = "0x" + hex.EncodeToString(ecdsaSig)
 	} else if ethSig, err := sig.SigEthereum(); err == nil {
 		// FROST Schnorr: R.x(32) || z(32) || v(1) for on-chain verification.
 		resp["ethereum_signature"] = "0x" + hex.EncodeToString(ethSig)
@@ -1177,15 +1259,15 @@ type httpErr struct {
 	msg  string
 }
 
-// validateSessionRequest validates a session-based auth request (used by both
-// handleKeygen and handleSign). It returns the AuthProof to include in the
-// coord message and the resolved keyID. On error it returns an httpErr.
+// validateSessionRequest validates a session-based auth request (used by
+// handleKeygen, handleSign, and handleDelegate). It returns a SessionAuth
+// (lightweight credential for coord messages) and the resolved keyID.
 func (n *Node) validateSessionRequest(
 	sessionPubHex, requestSigHex string,
 	groupID, keyID, keySuffix string,
 	nonce string, timestamp uint64,
 	messageHash []byte,
-) (*AuthProof, string, *httpErr) {
+) (*SessionAuth, string, *httpErr) {
 	sessionPubBytes, err := hex.DecodeString(strings.TrimPrefix(sessionPubHex, "0x"))
 	if err != nil || len(sessionPubBytes) != 33 {
 		return nil, "", &httpErr{http.StatusBadRequest, "session_pub must be 33 hex-encoded bytes"}
@@ -1210,6 +1292,44 @@ func (n *Node) validateSessionRequest(
 	if time.Now().After(info.Exp) {
 		n.sessions.Delete(pubHex)
 		return nil, "", &httpErr{http.StatusUnauthorized, "session expired; re-authenticate"}
+	}
+
+	// Delegation token sessions are locked to a specific key. The client
+	// doesn't need to (and shouldn't) specify key_id or key_suffix — the
+	// session auto-resolves to the delegated key.
+	if info.DelegatedKeyID != "" {
+		resolvedKeyID := info.DelegatedKeyID
+		// Strip the internal namespace prefix — clients sign over the key_id
+		// without the "oauth:" prefix, same convention as normal OAuth sessions.
+		logicalKeyID := stripKeyNamespace(resolvedKeyID)
+
+		n.log.Debug("validateSessionRequest (delegation)",
+			zap.String("group_id", groupID),
+			zap.String("delegated_key", resolvedKeyID))
+		if err := verifyRequestSignature(
+			sessionPubBytes, reqSigBytes,
+			groupID, logicalKeyID, nonce, timestamp,
+			messageHash,
+		); err != nil {
+			return nil, "", &httpErr{http.StatusUnauthorized, "invalid request signature: " + err.Error()}
+		}
+
+		// Check nonce + timestamp.
+		if err := n.sessions.CheckNonce(nonce); err != nil {
+			return nil, "", &httpErr{http.StatusConflict, "nonce already used"}
+		}
+		ts := time.Unix(int64(timestamp), 0)
+		if time.Since(ts).Abs() > timestampWindow {
+			return nil, "", &httpErr{http.StatusBadRequest, "timestamp too old or in the future"}
+		}
+
+		sa := &SessionAuth{
+			SessionPub: sessionPubBytes,
+			RequestSig: reqSigBytes,
+			Nonce:      nonce,
+			Timestamp:  timestamp,
+		}
+		return sa, resolvedKeyID, nil
 	}
 
 	// Derive the logical key_id (what the client signs over).
@@ -1261,23 +1381,13 @@ func (n *Node) validateSessionRequest(
 		return nil, "", &httpErr{http.StatusBadRequest, "timestamp too old or in the future"}
 	}
 
-	ap := &AuthProof{
-		Proof:         info.Proof,
-		Sub:           info.Sub,
-		Iss:           info.Iss,
-		Exp:           uint64(info.Exp.Unix()),
-		Aud:           info.Aud,
-		Azp:           info.Azp,
-		JWKSModulus:   info.JWKSModulus,
-		SessionPub:    sessionPubBytes,
-		RequestSig:    reqSigBytes,
-		Nonce:         nonce,
-		Timestamp:     timestamp,
-		AuthKeyPub:    info.AuthKeyPub,
-		CertSignature: info.CertSignature,
-		Identity:      info.Identity,
+	sa := &SessionAuth{
+		SessionPub: sessionPubBytes,
+		RequestSig: reqSigBytes,
+		Nonce:      nonce,
+		Timestamp:  timestamp,
 	}
-	return ap, resolvedKeyID, nil
+	return sa, resolvedKeyID, nil
 }
 
 // stripKeyNamespace removes the internal "oauth:" or "authkey:" prefix from a
@@ -1290,6 +1400,53 @@ func stripKeyNamespace(keyID string) string {
 		return after
 	}
 	return keyID
+}
+
+// parseDelegationIdentity extracts iss and sub from a delegation token's
+// sub-key ID. The key_id format is "oauth:<iss>:<sub>[:<suffix>]".
+// Returns (iss, sub) where sub is just the user identifier (not the full path).
+func parseDelegationIdentity(keyID string) (iss, sub string) {
+	// Strip "oauth:" prefix if present.
+	id := strings.TrimPrefix(keyID, "oauth:")
+	// Split into at most 3 parts: iss components may contain colons (e.g. https://foo.bar),
+	// but the sub is always the last component before the optional suffix.
+	// The iss is everything from the original JWT issuer (a URL like https://accounts.google.com).
+	// We reconstruct by finding the sub (user ID) after the issuer.
+	//
+	// Key ID format examples:
+	//   oauth:https://accounts.google.com:user123:scope_suffix
+	//   oauth:https://normal-elk-24.clerk.accounts.dev:user_3DPU...:403fada9
+	//
+	// The issuer ends before the first non-URL-like segment. Since issuer is
+	// always a URL (https://...) and sub is never a URL, we split after "https://...:"
+	// by finding the issuer from the session's original JWT claims.
+	//
+	// Simpler approach: the issuer always starts with "https://" and the sub
+	// follows after the issuer's domain path.
+	const prefix = "https://"
+	if !strings.HasPrefix(id, prefix) {
+		// Fallback: first colon-separated segment is iss, rest is sub.
+		parts := strings.SplitN(id, ":", 2)
+		if len(parts) == 2 {
+			return parts[0], parts[1]
+		}
+		return "", id
+	}
+	// Skip "https://" then find the next ":" — that's the end of the issuer domain.
+	rest := id[len(prefix):]
+	idx := strings.Index(rest, ":")
+	if idx < 0 {
+		return id, ""
+	}
+	iss = id[:len(prefix)+idx]
+	afterIss := rest[idx+1:]
+	// afterIss is "sub[:suffix]" — take just the sub.
+	if colonIdx := strings.Index(afterIss, ":"); colonIdx >= 0 {
+		sub = afterIss[:colonIdx]
+	} else {
+		sub = afterIss
+	}
+	return iss, sub
 }
 
 // handleStartReshare handles POST /admin/reshare. Creates a same-committee

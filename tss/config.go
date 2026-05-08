@@ -112,10 +112,7 @@ type configJSON struct {
 
 // MarshalJSON encodes the Config with hex-encoded byte fields.
 func (c *Config) MarshalJSON() ([]byte, error) {
-	parties := make([]string, len(c.Parties))
-	for i, p := range c.Parties {
-		parties[i] = string(p)
-	}
+	parties := PartyIDsToStrings(c.Parties)
 
 	pm := make(map[string]uint16, len(c.PartyMap))
 	for pid, id := range c.PartyMap {

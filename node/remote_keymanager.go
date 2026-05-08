@@ -394,15 +394,11 @@ type kmsSignParams struct {
 }
 
 func encodeKeygenParams(p KeygenParams) ([]byte, error) {
-	partyIDs := make([]string, len(p.Parties))
-	for i, pid := range p.Parties {
-		partyIDs[i] = string(pid)
-	}
 	return cbor.Marshal(&kmsKeygenParams{
 		GroupID:   p.GroupID,
 		KeyID:     p.KeyID,
 		PartyID:   string(p.Host.Self()),
-		PartyIDs:  partyIDs,
+		PartyIDs:  tss.PartyIDsToStrings(p.Parties),
 		Threshold: p.Threshold,
 		Curve:     string(p.Curve),
 		Scope:     p.Scope,
@@ -410,15 +406,11 @@ func encodeKeygenParams(p KeygenParams) ([]byte, error) {
 }
 
 func encodeSignParams(p SignParams) ([]byte, error) {
-	signerIDs := make([]string, len(p.Signers))
-	for i, pid := range p.Signers {
-		signerIDs[i] = string(pid)
-	}
 	return cbor.Marshal(&kmsSignParams{
 		GroupID:     p.GroupID,
 		KeyID:       p.KeyID,
 		PartyID:     string(p.Host.Self()),
-		SignerIDs:   signerIDs,
+		SignerIDs:   tss.PartyIDsToStrings(p.Signers),
 		MessageHash: p.MessageHash,
 		Curve:       string(p.Curve),
 	})
@@ -436,20 +428,12 @@ type kmsReshareParams struct {
 }
 
 func encodeReshareParams(p ReshareParams) ([]byte, error) {
-	oldIDs := make([]string, len(p.OldParties))
-	for i, pid := range p.OldParties {
-		oldIDs[i] = string(pid)
-	}
-	newIDs := make([]string, len(p.NewParties))
-	for i, pid := range p.NewParties {
-		newIDs[i] = string(pid)
-	}
 	return cbor.Marshal(&kmsReshareParams{
 		GroupID:      p.GroupID,
 		KeyID:        p.KeyID,
 		PartyID:      string(p.Host.Self()),
-		OldPartyIDs:  oldIDs,
-		NewPartyIDs:  newIDs,
+		OldPartyIDs:  tss.PartyIDsToStrings(p.OldParties),
+		NewPartyIDs:  tss.PartyIDsToStrings(p.NewParties),
 		NewThreshold: p.NewThreshold,
 		Curve:        string(p.Curve),
 	})

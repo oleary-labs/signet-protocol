@@ -479,10 +479,6 @@ func (n *Node) handleListKeys(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 		}
-		parties := make([]string, len(info.Parties))
-		for i, p := range info.Parties {
-			parties[i] = string(p)
-		}
 		entries = append(entries, keyEntry{
 			GroupID:         req.GroupID,
 			KeyID:           ke.KeyID,
@@ -490,7 +486,7 @@ func (n *Node) handleListKeys(w http.ResponseWriter, r *http.Request) {
 			PublicKey:       pubKeyHex,
 			EthereumAddress: ethAddr,
 			Threshold:       info.Threshold,
-			Parties:         parties,
+			Parties:         tss.PartyIDsToStrings(info.Parties),
 		})
 	}
 

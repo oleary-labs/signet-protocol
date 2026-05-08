@@ -444,11 +444,11 @@ func (n *Node) handleListKeys(w http.ResponseWriter, r *http.Request) {
 		httpError(w, http.StatusBadRequest, "decode body: "+err.Error())
 		return
 	}
-	req.GroupID = strings.ToLower(req.GroupID)
-	if req.GroupID == "" {
-		httpError(w, http.StatusBadRequest, "group_id is required")
+	groupID, ok := normalizeGroupID(w, req.GroupID)
+	if !ok {
 		return
 	}
+	req.GroupID = groupID
 
 	if n.auth.HasAuthKeys(req.GroupID) {
 		if err := n.auth.ValidateAdminAuth(req.GroupID, &req); err != nil {
@@ -534,11 +534,15 @@ func (n *Node) handleAuth(w http.ResponseWriter, r *http.Request) {
 		httpError(w, http.StatusBadRequest, "decode body: "+err.Error())
 		return
 	}
-	if req.GroupID == "" || req.SessionPub == "" {
-		httpError(w, http.StatusBadRequest, "group_id and session_pub are required")
+	if req.SessionPub == "" {
+		httpError(w, http.StatusBadRequest, "session_pub is required")
 		return
 	}
-	req.GroupID = strings.ToLower(req.GroupID)
+	groupID, ok := normalizeGroupID(w, req.GroupID)
+	if !ok {
+		return
+	}
+	req.GroupID = groupID
 
 	sessionPubBytes, err := hex.DecodeString(strings.TrimPrefix(req.SessionPub, "0x"))
 	if err != nil || len(sessionPubBytes) != 33 {
@@ -829,11 +833,11 @@ func (n *Node) handleKeygen(w http.ResponseWriter, r *http.Request) {
 		req.KeySuffix = derivedSuffix
 	}
 
-	if req.GroupID == "" {
-		httpError(w, http.StatusBadRequest, "group_id is required")
+	groupID, ok := normalizeGroupID(w, req.GroupID)
+	if !ok {
 		return
 	}
-	req.GroupID = strings.ToLower(req.GroupID)
+	req.GroupID = groupID
 
 	n.groupsMu.RLock()
 	grp, ok := n.groups[req.GroupID]
@@ -1013,10 +1017,11 @@ func (n *Node) handleSign(w http.ResponseWriter, r *http.Request) {
 		httpError(w, http.StatusBadRequest, "unsupported curve: "+req.Curve)
 		return
 	}
-	if req.GroupID == "" {
-		httpError(w, http.StatusBadRequest, "group_id is required")
+	groupID, ok := normalizeGroupID(w, req.GroupID)
+	if !ok {
 		return
 	}
+	req.GroupID = groupID
 	if req.MessageHash == "" && req.Payload == nil {
 		httpError(w, http.StatusBadRequest, "message_hash or payload is required")
 		return
@@ -1025,7 +1030,6 @@ func (n *Node) handleSign(w http.ResponseWriter, r *http.Request) {
 		httpError(w, http.StatusBadRequest, "message_hash and payload are mutually exclusive")
 		return
 	}
-	req.GroupID = strings.ToLower(req.GroupID)
 
 	var msgHash []byte
 	if req.MessageHash != "" {
@@ -1460,9 +1464,8 @@ func (n *Node) handleStartReshare(w http.ResponseWriter, r *http.Request) {
 		httpError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
 		return
 	}
-	groupID := strings.ToLower(req.GroupID)
-	if groupID == "" {
-		httpError(w, http.StatusBadRequest, "group_id is required")
+	groupID, ok := normalizeGroupID(w, req.GroupID)
+	if !ok {
 		return
 	}
 	req.AdminAuth.GroupID = groupID
@@ -1541,9 +1544,8 @@ func (n *Node) handleReshareStatus(w http.ResponseWriter, r *http.Request) {
 		httpError(w, http.StatusBadRequest, "decode body: "+err.Error())
 		return
 	}
-	groupID := strings.ToLower(req.GroupID)
-	if groupID == "" {
-		httpError(w, http.StatusBadRequest, "group_id is required")
+	groupID, ok := normalizeGroupID(w, req.GroupID)
+	if !ok {
 		return
 	}
 
@@ -1596,6 +1598,18 @@ func httpError(w http.ResponseWriter, code int, msg string) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
 	json.NewEncoder(w).Encode(map[string]string{"error": msg})
+}
+
+// normalizeGroupID lowercases raw and writes a 400 + returns false if empty.
+// Callers that combine the empty check with other required fields should
+// validate those separately and call this with the trimmed value.
+func normalizeGroupID(w http.ResponseWriter, raw string) (string, bool) {
+	g := strings.ToLower(raw)
+	if g == "" {
+		httpError(w, http.StatusBadRequest, "group_id is required")
+		return "", false
+	}
+	return g, true
 }
 
 // reconnectLoop periodically re-dials any bootstrap peer that is not currently

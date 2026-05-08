@@ -61,10 +61,15 @@ func (n *Node) handleDelegate(w http.ResponseWriter, r *http.Request) {
 		httpError(w, http.StatusBadRequest, "decode body: "+err.Error())
 		return
 	}
-	if req.GroupID == "" || req.ParentKeyID == "" {
-		httpError(w, http.StatusBadRequest, "group_id and parent_key_id are required")
+	if req.ParentKeyID == "" {
+		httpError(w, http.StatusBadRequest, "parent_key_id is required")
 		return
 	}
+	groupID, ok := normalizeGroupID(w, req.GroupID)
+	if !ok {
+		return
+	}
+	req.GroupID = groupID
 	if req.ExpiresIn <= 0 {
 		req.ExpiresIn = 30 * 24 * 3600 // default 30 days
 	}
@@ -72,7 +77,6 @@ func (n *Node) handleDelegate(w http.ResponseWriter, r *http.Request) {
 		req.Curve = string(CurveSecp256k1)
 	}
 	parentCurve := Curve(req.Curve)
-	req.GroupID = strings.ToLower(req.GroupID)
 
 	// Authenticate the user.
 	n.groupsMu.RLock()

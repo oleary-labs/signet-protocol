@@ -36,6 +36,7 @@ pub(crate) enum ReshareState<C: Ciphersuite> {
         old_secret: Option<Scalar<C>>,
         group_key: Vec<u8>,
         generation: u64,
+        scope: Vec<u8>,
         r1_received: BTreeMap<String, ReshareR1Payload>,
         broadcast_sent: bool,
     },
@@ -50,6 +51,7 @@ pub(crate) enum ReshareState<C: Ciphersuite> {
         self_new_scalar: Option<Scalar<C>>,
         group_key: Vec<u8>,
         generation: u64,
+        scope: Vec<u8>,
         all_commitments: BTreeMap<String, Vec<Element<C>>>,
         chain_keys: Vec<(String, Vec<u8>)>,
         sub_shares: BTreeMap<String, Scalar<C>>,
@@ -61,6 +63,7 @@ pub(crate) enum ReshareState<C: Ciphersuite> {
         self_new_scalar: Scalar<C>,
         group_key: Vec<u8>,
         generation: u64,
+        scope: Vec<u8>,
         new_secret: Scalar<C>,
         chain_keys: Vec<(String, Vec<u8>)>,
         pub_shares: BTreeMap<String, Vec<u8>>,
@@ -186,7 +189,7 @@ fn start_reshare<C: Ciphersuite>(
 
     let curve = Curve::from_ciphersuite::<C>();
     let stored = storage.get_key(&params.group_id, &params.key_id, &curve)?;
-    let (old_secret, group_key, generation) = if is_old {
+    let (old_secret, group_key, generation, old_scope) = if is_old {
         let s = stored.ok_or_else(|| {
             format!("reshare: old party has no key for {}/{}", params.group_id, params.key_id)
         })?;
@@ -195,9 +198,9 @@ fn start_reshare<C: Ciphersuite>(
         let secret_bytes = kp.signing_share().serialize();
         let secret = reshare::deserialize_scalar::<C>(secret_bytes.as_ref())
             .map_err(|e| format!("decode secret scalar: {e}"))?;
-        (Some(secret), s.group_key, s.generation)
+        (Some(secret), s.group_key, s.generation, s.scope)
     } else {
-        (None, vec![], 0)
+        (None, vec![], 0, vec![])
     };
 
     let mut messages = Vec::new();
@@ -247,7 +250,8 @@ fn start_reshare<C: Ciphersuite>(
             session_id: session_id.to_string(),
             params, is_old, is_new, polynomial, chain_key,
             old_scalars, new_scalars, self_old_scalar, self_new_scalar,
-            old_secret, group_key, generation, r1_received,
+            old_secret, group_key, generation, scope: old_scope,
+            r1_received,
             broadcast_sent: is_old,
         },
         StepOutput { messages, result: None },
@@ -270,14 +274,15 @@ fn process_reshare<C: Ciphersuite>(
         ReshareState::R1 {
             session_id, params, is_old, is_new, polynomial, chain_key,
             old_scalars, new_scalars, self_old_scalar, self_new_scalar,
-            old_secret, group_key, generation, mut r1_received, broadcast_sent,
+            old_secret, group_key, generation, scope, mut r1_received, broadcast_sent,
         } => {
             let rebuild = |r1_received| ReshareState::R1 {
                 session_id: session_id.clone(), params: params.clone(),
                 is_old, is_new, polynomial: polynomial.clone(), chain_key: chain_key.clone(),
                 old_scalars: old_scalars.clone(), new_scalars: new_scalars.clone(),
                 self_old_scalar, self_new_scalar, old_secret,
-                group_key: group_key.clone(), generation, r1_received, broadcast_sent,
+                group_key: group_key.clone(), generation, scope: scope.clone(),
+                r1_received, broadcast_sent,
             };
 
             let r1: ReshareR1Payload = match cbor_decode(payload) {
@@ -367,6 +372,7 @@ fn process_reshare<C: Ciphersuite>(
                     session_id, params, is_old, is_new, polynomial,
                     old_scalars, new_scalars, self_new_scalar,
                     group_key: resolved_group_key, generation: resolved_generation,
+                    scope,
                     all_commitments, chain_keys: sorted_chain_keys, sub_shares: BTreeMap::new(),
                 },
                 Ok(StepOutput { messages, result: None }),
@@ -377,13 +383,14 @@ fn process_reshare<C: Ciphersuite>(
         ReshareState::R2 {
             session_id, params, is_old, is_new, polynomial,
             old_scalars, new_scalars, self_new_scalar,
-            group_key, generation, all_commitments, chain_keys, mut sub_shares,
+            group_key, generation, scope, all_commitments, chain_keys, mut sub_shares,
         } => {
             let rebuild = |sub_shares| ReshareState::R2 {
                 session_id: session_id.clone(), params: params.clone(),
                 is_old, is_new, polynomial: polynomial.clone(),
                 old_scalars: old_scalars.clone(), new_scalars: new_scalars.clone(), self_new_scalar,
-                group_key: group_key.clone(), generation, all_commitments: all_commitments.clone(),
+                group_key: group_key.clone(), generation, scope: scope.clone(),
+                all_commitments: all_commitments.clone(),
                 chain_keys: chain_keys.clone(), sub_shares,
             };
 
@@ -448,7 +455,7 @@ fn process_reshare<C: Ciphersuite>(
                     ReshareState::R3 {
                         session_id, params, new_scalars,
                         self_new_scalar: self_scalar,
-                        group_key, generation, new_secret, chain_keys, pub_shares,
+                        group_key, generation, scope, new_secret, chain_keys, pub_shares,
                     },
                     Ok(StepOutput { messages, result: None }),
                 )
@@ -469,12 +476,13 @@ fn process_reshare<C: Ciphersuite>(
         // ---- Round 3 ----
         ReshareState::R3 {
             session_id, params, new_scalars, self_new_scalar,
-            group_key, generation, new_secret, chain_keys, mut pub_shares,
+            group_key, generation, scope, new_secret, chain_keys, mut pub_shares,
         } => {
             let rebuild = |pub_shares| ReshareState::R3 {
                 session_id: session_id.clone(), params: params.clone(),
                 new_scalars: new_scalars.clone(), self_new_scalar,
-                group_key: group_key.clone(), generation, new_secret,
+                group_key: group_key.clone(), generation, scope: scope.clone(),
+                new_secret,
                 chain_keys: chain_keys.clone(), pub_shares,
             };
 
@@ -560,7 +568,7 @@ fn process_reshare<C: Ciphersuite>(
                 group_key: group_key.clone(),
                 verifying_share: vs_bytes.clone(),
                 generation: generation + 1,
-                scope: vec![], // TODO: preserve scope from original key
+                scope,
                 status: KeyStatus::Active,
             };
             debug!(

@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"math/big"
 	"net/http"
 	"strings"
 	"time"
@@ -771,23 +772,42 @@ func (n *Node) handleSign(w http.ResponseWriter, r *http.Request) {
 	// Include scheme-specific signature formats.
 	if signCurve == CurveEcdsaSecp256k1 {
 		// Recoverable ECDSA: r(32) || s(32) || v(1) for ecrecover.
-		// Compute v by trying recovery and matching the known group key.
 		rawSig := sig.Bytes() // r(32) || s(32)
+
+		// EIP-2: normalize s to lower half of curve order.
+		// secp256k1 order N.
+		secp256k1N, _ := new(big.Int).SetString("FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141", 16)
+		halfN := new(big.Int).Rsh(secp256k1N, 1)
+		s := new(big.Int).SetBytes(rawSig[32:64])
+		if s.Cmp(halfN) > 0 {
+			s.Sub(secp256k1N, s)
+			copy(rawSig[32:64], s.FillBytes(make([]byte, 32)))
+		}
+
+		// Compute v by trying recovery and matching the known group key.
 		ecdsaSig := make([]byte, 65)
 		copy(ecdsaSig, rawSig)
+		pubKey, err := crypto.DecompressPubkey(keyInfo.GroupKey)
+		if err != nil {
+			httpError(w, http.StatusInternalServerError, "decompress group key: "+err.Error())
+			return
+		}
+		expectedPub := crypto.FromECDSAPub(pubKey)
+		vFound := false
 		for v := byte(0); v < 2; v++ {
 			ecdsaSig[64] = v
 			recovered, err := crypto.Ecrecover(msgHash, ecdsaSig)
 			if err != nil {
 				continue
 			}
-			pubKey, err := crypto.DecompressPubkey(keyInfo.GroupKey)
-			if err != nil {
-				continue
-			}
-			if bytes.Equal(recovered, crypto.FromECDSAPub(pubKey)) {
+			if bytes.Equal(recovered, expectedPub) {
+				vFound = true
 				break
 			}
+		}
+		if !vFound {
+			httpError(w, http.StatusInternalServerError, "ECDSA recovery failed: could not determine v byte")
+			return
 		}
 		resp["ecdsa_signature"] = "0x" + hex.EncodeToString(ecdsaSig)
 	} else if ethSig, err := sig.SigEthereum(); err == nil {

@@ -11,7 +11,7 @@ use crate::curve::Curve;
 use crate::reshare::{
     self, Polynomial, ReshareParams, ReshareR1Payload, ReshareR2Payload, ReshareR3Payload,
 };
-use crate::storage::{Storage, StoredKey};
+use crate::storage::{KeyStatus, Storage, StoredKey};
 use crate::types::{cbor_decode, cbor_encode, OutgoingMessage, ProcessError, SessionResult, StepOutput};
 
 type Scalar<C> = <<<C as Ciphersuite>::Group as Group>::Field as Field>::Scalar;
@@ -561,6 +561,7 @@ fn process_reshare<C: Ciphersuite>(
                 verifying_share: vs_bytes.clone(),
                 generation: generation + 1,
                 scope: vec![], // TODO: preserve scope from original key
+                status: KeyStatus::Active,
             };
             debug!(
                 key_id = params.key_id.as_str(),

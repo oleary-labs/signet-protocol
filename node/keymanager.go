@@ -46,6 +46,12 @@ type KeyManager interface {
 	// ListKeys returns all keys stored under groupID, each with its curve.
 	ListKeys(groupID string) ([]KeyEntry, error)
 
+	// SetKeyStatus changes a key's status (active ↔ disabled).
+	SetKeyStatus(groupID, keyID string, curve Curve, status string) error
+
+	// DeleteKey permanently removes a key from storage.
+	DeleteKey(groupID, keyID string, curve Curve) error
+
 	// ListGroups returns all group IDs that have at least one stored key.
 	ListGroups() ([]string, error)
 
@@ -112,4 +118,5 @@ type KeyInfo struct {
 	Threshold int
 	Curve     Curve
 	Scope     []byte // signing scope constraint (empty = unscoped)
+	Status    string // "active" or "disabled" (empty = active for backwards compat)
 }

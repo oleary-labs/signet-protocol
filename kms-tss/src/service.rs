@@ -302,11 +302,16 @@ impl KeyManager for KmsService {
             .map_err(|e| Status::internal(e))?
             .ok_or_else(|| Status::not_found(format!("key not found: {group_id}/{key_id} curve={curve}")))?;
 
+        let status = match stored.status {
+            crate::storage::KeyStatus::Active => "active",
+            crate::storage::KeyStatus::Disabled => "disabled",
+        };
         Ok(Response::new(PublicKeyResponse {
             group_key: stored.group_key,
             verifying_share: stored.verifying_share,
             generation: stored.generation,
             scope: stored.scope,
+            status: status.to_string(),
         }))
     }
 
@@ -329,5 +334,47 @@ impl KeyManager for KmsService {
             .collect();
 
         Ok(Response::new(KeyListResponse { entries }))
+    }
+
+    async fn set_key_status(
+        &self,
+        request: Request<SetKeyStatusRequest>,
+    ) -> Result<Response<SetKeyStatusResponse>, Status> {
+        let req = request.into_inner();
+        let group_id = hex::encode(&req.group_id);
+        let key_id = &req.key_id;
+        let curve = parse_curve(&req.curve)?;
+
+        let status = match req.status.as_str() {
+            "active" => crate::storage::KeyStatus::Active,
+            "disabled" => crate::storage::KeyStatus::Disabled,
+            other => return Err(Status::invalid_argument(format!("invalid status: {other}"))),
+        };
+
+        info!(group_id = %group_id, key_id = %key_id, status = %req.status, "set_key_status");
+
+        self.storage
+            .set_key_status(&group_id, key_id, &curve, status)
+            .map_err(|e| Status::internal(e))?;
+
+        Ok(Response::new(SetKeyStatusResponse {}))
+    }
+
+    async fn delete_key(
+        &self,
+        request: Request<KeyRef>,
+    ) -> Result<Response<DeleteKeyResponse>, Status> {
+        let req = request.into_inner();
+        let group_id = hex::encode(&req.group_id);
+        let key_id = &req.key_id;
+        let curve = parse_curve(&req.curve)?;
+
+        info!(group_id = %group_id, key_id = %key_id, "delete_key");
+
+        self.storage
+            .delete_key(&group_id, key_id, &curve)
+            .map_err(|e| Status::internal(e))?;
+
+        Ok(Response::new(DeleteKeyResponse {}))
     }
 }

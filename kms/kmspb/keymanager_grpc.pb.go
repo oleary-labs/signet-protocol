@@ -27,6 +27,8 @@ const (
 	KeyManager_RollbackReshare_FullMethodName       = "/signet.kms.v1.KeyManager/RollbackReshare"
 	KeyManager_GetPublicKey_FullMethodName          = "/signet.kms.v1.KeyManager/GetPublicKey"
 	KeyManager_ListKeys_FullMethodName              = "/signet.kms.v1.KeyManager/ListKeys"
+	KeyManager_SetKeyStatus_FullMethodName          = "/signet.kms.v1.KeyManager/SetKeyStatus"
+	KeyManager_DeleteKey_FullMethodName             = "/signet.kms.v1.KeyManager/DeleteKey"
 )
 
 // KeyManagerClient is the client API for KeyManager service.
@@ -58,6 +60,10 @@ type KeyManagerClient interface {
 	GetPublicKey(ctx context.Context, in *KeyRef, opts ...grpc.CallOption) (*PublicKeyResponse, error)
 	// ListKeys returns all key IDs stored for a group.
 	ListKeys(ctx context.Context, in *GroupRef, opts ...grpc.CallOption) (*KeyListResponse, error)
+	// SetKeyStatus changes a key's status (active ↔ disabled).
+	SetKeyStatus(ctx context.Context, in *SetKeyStatusRequest, opts ...grpc.CallOption) (*SetKeyStatusResponse, error)
+	// DeleteKey permanently removes a key from storage.
+	DeleteKey(ctx context.Context, in *KeyRef, opts ...grpc.CallOption) (*DeleteKeyResponse, error)
 }
 
 type keyManagerClient struct {
@@ -151,6 +157,26 @@ func (c *keyManagerClient) ListKeys(ctx context.Context, in *GroupRef, opts ...g
 	return out, nil
 }
 
+func (c *keyManagerClient) SetKeyStatus(ctx context.Context, in *SetKeyStatusRequest, opts ...grpc.CallOption) (*SetKeyStatusResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(SetKeyStatusResponse)
+	err := c.cc.Invoke(ctx, KeyManager_SetKeyStatus_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *keyManagerClient) DeleteKey(ctx context.Context, in *KeyRef, opts ...grpc.CallOption) (*DeleteKeyResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(DeleteKeyResponse)
+	err := c.cc.Invoke(ctx, KeyManager_DeleteKey_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // KeyManagerServer is the server API for KeyManager service.
 // All implementations must embed UnimplementedKeyManagerServer
 // for forward compatibility.
@@ -180,6 +206,10 @@ type KeyManagerServer interface {
 	GetPublicKey(context.Context, *KeyRef) (*PublicKeyResponse, error)
 	// ListKeys returns all key IDs stored for a group.
 	ListKeys(context.Context, *GroupRef) (*KeyListResponse, error)
+	// SetKeyStatus changes a key's status (active ↔ disabled).
+	SetKeyStatus(context.Context, *SetKeyStatusRequest) (*SetKeyStatusResponse, error)
+	// DeleteKey permanently removes a key from storage.
+	DeleteKey(context.Context, *KeyRef) (*DeleteKeyResponse, error)
 	mustEmbedUnimplementedKeyManagerServer()
 }
 
@@ -213,6 +243,12 @@ func (UnimplementedKeyManagerServer) GetPublicKey(context.Context, *KeyRef) (*Pu
 }
 func (UnimplementedKeyManagerServer) ListKeys(context.Context, *GroupRef) (*KeyListResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method ListKeys not implemented")
+}
+func (UnimplementedKeyManagerServer) SetKeyStatus(context.Context, *SetKeyStatusRequest) (*SetKeyStatusResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method SetKeyStatus not implemented")
+}
+func (UnimplementedKeyManagerServer) DeleteKey(context.Context, *KeyRef) (*DeleteKeyResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method DeleteKey not implemented")
 }
 func (UnimplementedKeyManagerServer) mustEmbedUnimplementedKeyManagerServer() {}
 func (UnimplementedKeyManagerServer) testEmbeddedByValue()                    {}
@@ -368,6 +404,42 @@ func _KeyManager_ListKeys_Handler(srv interface{}, ctx context.Context, dec func
 	return interceptor(ctx, in, info, handler)
 }
 
+func _KeyManager_SetKeyStatus_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(SetKeyStatusRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(KeyManagerServer).SetKeyStatus(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: KeyManager_SetKeyStatus_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(KeyManagerServer).SetKeyStatus(ctx, req.(*SetKeyStatusRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _KeyManager_DeleteKey_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(KeyRef)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(KeyManagerServer).DeleteKey(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: KeyManager_DeleteKey_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(KeyManagerServer).DeleteKey(ctx, req.(*KeyRef))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // KeyManager_ServiceDesc is the grpc.ServiceDesc for KeyManager service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -402,6 +474,14 @@ var KeyManager_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "ListKeys",
 			Handler:    _KeyManager_ListKeys_Handler,
+		},
+		{
+			MethodName: "SetKeyStatus",
+			Handler:    _KeyManager_SetKeyStatus_Handler,
+		},
+		{
+			MethodName: "DeleteKey",
+			Handler:    _KeyManager_DeleteKey_Handler,
 		},
 	},
 	Streams: []grpc.StreamDesc{

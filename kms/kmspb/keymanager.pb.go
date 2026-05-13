@@ -514,7 +514,8 @@ type PublicKeyResponse struct {
 	GroupKey       []byte                 `protobuf:"bytes,1,opt,name=group_key,json=groupKey,proto3" json:"group_key,omitempty"`                   // compressed group public key (33 bytes secp256k1, 32 bytes Ed25519)
 	VerifyingShare []byte                 `protobuf:"bytes,2,opt,name=verifying_share,json=verifyingShare,proto3" json:"verifying_share,omitempty"` // this node's public key share
 	Generation     uint64                 `protobuf:"varint,3,opt,name=generation,proto3" json:"generation,omitempty"`
-	Scope          []byte                 `protobuf:"bytes,4,opt,name=scope,proto3" json:"scope,omitempty"` // signing scope constraint (empty = unscoped)
+	Scope          []byte                 `protobuf:"bytes,4,opt,name=scope,proto3" json:"scope,omitempty"`   // signing scope constraint (empty = unscoped)
+	Status         string                 `protobuf:"bytes,5,opt,name=status,proto3" json:"status,omitempty"` // "active" or "disabled" (empty = active for backwards compat)
 	unknownFields  protoimpl.UnknownFields
 	sizeCache      protoimpl.SizeCache
 }
@@ -575,6 +576,13 @@ func (x *PublicKeyResponse) GetScope() []byte {
 		return x.Scope
 	}
 	return nil
+}
+
+func (x *PublicKeyResponse) GetStatus() string {
+	if x != nil {
+		return x.Status
+	}
+	return ""
 }
 
 type KeyListEntry struct {
@@ -857,6 +865,146 @@ func (*RollbackReshareResponse) Descriptor() ([]byte, []int) {
 	return file_keymanager_proto_rawDescGZIP(), []int{14}
 }
 
+type SetKeyStatusRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	GroupId       []byte                 `protobuf:"bytes,1,opt,name=group_id,json=groupId,proto3" json:"group_id,omitempty"`
+	KeyId         string                 `protobuf:"bytes,2,opt,name=key_id,json=keyId,proto3" json:"key_id,omitempty"`
+	Curve         string                 `protobuf:"bytes,3,opt,name=curve,proto3" json:"curve,omitempty"`
+	Status        string                 `protobuf:"bytes,4,opt,name=status,proto3" json:"status,omitempty"` // "active" or "disabled"
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *SetKeyStatusRequest) Reset() {
+	*x = SetKeyStatusRequest{}
+	mi := &file_keymanager_proto_msgTypes[15]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *SetKeyStatusRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*SetKeyStatusRequest) ProtoMessage() {}
+
+func (x *SetKeyStatusRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_keymanager_proto_msgTypes[15]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use SetKeyStatusRequest.ProtoReflect.Descriptor instead.
+func (*SetKeyStatusRequest) Descriptor() ([]byte, []int) {
+	return file_keymanager_proto_rawDescGZIP(), []int{15}
+}
+
+func (x *SetKeyStatusRequest) GetGroupId() []byte {
+	if x != nil {
+		return x.GroupId
+	}
+	return nil
+}
+
+func (x *SetKeyStatusRequest) GetKeyId() string {
+	if x != nil {
+		return x.KeyId
+	}
+	return ""
+}
+
+func (x *SetKeyStatusRequest) GetCurve() string {
+	if x != nil {
+		return x.Curve
+	}
+	return ""
+}
+
+func (x *SetKeyStatusRequest) GetStatus() string {
+	if x != nil {
+		return x.Status
+	}
+	return ""
+}
+
+type SetKeyStatusResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *SetKeyStatusResponse) Reset() {
+	*x = SetKeyStatusResponse{}
+	mi := &file_keymanager_proto_msgTypes[16]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *SetKeyStatusResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*SetKeyStatusResponse) ProtoMessage() {}
+
+func (x *SetKeyStatusResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_keymanager_proto_msgTypes[16]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use SetKeyStatusResponse.ProtoReflect.Descriptor instead.
+func (*SetKeyStatusResponse) Descriptor() ([]byte, []int) {
+	return file_keymanager_proto_rawDescGZIP(), []int{16}
+}
+
+type DeleteKeyResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *DeleteKeyResponse) Reset() {
+	*x = DeleteKeyResponse{}
+	mi := &file_keymanager_proto_msgTypes[17]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *DeleteKeyResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*DeleteKeyResponse) ProtoMessage() {}
+
+func (x *DeleteKeyResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_keymanager_proto_msgTypes[17]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use DeleteKeyResponse.ProtoReflect.Descriptor instead.
+func (*DeleteKeyResponse) Descriptor() ([]byte, []int) {
+	return file_keymanager_proto_rawDescGZIP(), []int{17}
+}
+
 var File_keymanager_proto protoreflect.FileDescriptor
 
 const file_keymanager_proto_rawDesc = "" +
@@ -892,14 +1040,15 @@ const file_keymanager_proto_rawDesc = "" +
 	"\x06key_id\x18\x02 \x01(\tR\x05keyId\x12\x14\n" +
 	"\x05curve\x18\x03 \x01(\tR\x05curve\"%\n" +
 	"\bGroupRef\x12\x19\n" +
-	"\bgroup_id\x18\x01 \x01(\fR\agroupId\"\x8f\x01\n" +
+	"\bgroup_id\x18\x01 \x01(\fR\agroupId\"\xa7\x01\n" +
 	"\x11PublicKeyResponse\x12\x1b\n" +
 	"\tgroup_key\x18\x01 \x01(\fR\bgroupKey\x12'\n" +
 	"\x0fverifying_share\x18\x02 \x01(\fR\x0everifyingShare\x12\x1e\n" +
 	"\n" +
 	"generation\x18\x03 \x01(\x04R\n" +
 	"generation\x12\x14\n" +
-	"\x05scope\x18\x04 \x01(\fR\x05scope\";\n" +
+	"\x05scope\x18\x04 \x01(\fR\x05scope\x12\x16\n" +
+	"\x06status\x18\x05 \x01(\tR\x06status\";\n" +
 	"\fKeyListEntry\x12\x15\n" +
 	"\x06key_id\x18\x01 \x01(\tR\x05keyId\x12\x14\n" +
 	"\x05curve\x18\x02 \x01(\tR\x05curve\"H\n" +
@@ -917,12 +1066,19 @@ const file_keymanager_proto_rawDesc = "" +
 	"generation\x18\x03 \x01(\x04R\n" +
 	"generation\x12\x14\n" +
 	"\x05curve\x18\x04 \x01(\tR\x05curve\"\x19\n" +
-	"\x17RollbackReshareResponse*u\n" +
+	"\x17RollbackReshareResponse\"u\n" +
+	"\x13SetKeyStatusRequest\x12\x19\n" +
+	"\bgroup_id\x18\x01 \x01(\fR\agroupId\x12\x15\n" +
+	"\x06key_id\x18\x02 \x01(\tR\x05keyId\x12\x14\n" +
+	"\x05curve\x18\x03 \x01(\tR\x05curve\x12\x16\n" +
+	"\x06status\x18\x04 \x01(\tR\x06status\"\x16\n" +
+	"\x14SetKeyStatusResponse\"\x13\n" +
+	"\x11DeleteKeyResponse*u\n" +
 	"\vSessionType\x12\x1c\n" +
 	"\x18SESSION_TYPE_UNSPECIFIED\x10\x00\x12\x17\n" +
 	"\x13SESSION_TYPE_KEYGEN\x10\x01\x12\x15\n" +
 	"\x11SESSION_TYPE_SIGN\x10\x02\x12\x18\n" +
-	"\x14SESSION_TYPE_RESHARE\x10\x032\xae\x05\n" +
+	"\x14SESSION_TYPE_RESHARE\x10\x032\xcd\x06\n" +
 	"\n" +
 	"KeyManager\x12W\n" +
 	"\fStartSession\x12\".signet.kms.v1.StartSessionRequest\x1a#.signet.kms.v1.StartSessionResponse\x12R\n" +
@@ -932,7 +1088,9 @@ const file_keymanager_proto_rawDesc = "" +
 	"\x15DiscardPendingReshare\x12\x15.signet.kms.v1.KeyRef\x1a,.signet.kms.v1.DiscardPendingReshareResponse\x12`\n" +
 	"\x0fRollbackReshare\x12%.signet.kms.v1.RollbackReshareRequest\x1a&.signet.kms.v1.RollbackReshareResponse\x12G\n" +
 	"\fGetPublicKey\x12\x15.signet.kms.v1.KeyRef\x1a .signet.kms.v1.PublicKeyResponse\x12C\n" +
-	"\bListKeys\x12\x17.signet.kms.v1.GroupRef\x1a\x1e.signet.kms.v1.KeyListResponseB\x12Z\x10signet/kms/kmspbb\x06proto3"
+	"\bListKeys\x12\x17.signet.kms.v1.GroupRef\x1a\x1e.signet.kms.v1.KeyListResponse\x12W\n" +
+	"\fSetKeyStatus\x12\".signet.kms.v1.SetKeyStatusRequest\x1a#.signet.kms.v1.SetKeyStatusResponse\x12D\n" +
+	"\tDeleteKey\x12\x15.signet.kms.v1.KeyRef\x1a .signet.kms.v1.DeleteKeyResponseB\x12Z\x10signet/kms/kmspbb\x06proto3"
 
 var (
 	file_keymanager_proto_rawDescOnce sync.Once
@@ -947,7 +1105,7 @@ func file_keymanager_proto_rawDescGZIP() []byte {
 }
 
 var file_keymanager_proto_enumTypes = make([]protoimpl.EnumInfo, 1)
-var file_keymanager_proto_msgTypes = make([]protoimpl.MessageInfo, 15)
+var file_keymanager_proto_msgTypes = make([]protoimpl.MessageInfo, 18)
 var file_keymanager_proto_goTypes = []any{
 	(SessionType)(0),                      // 0: signet.kms.v1.SessionType
 	(*StartSessionRequest)(nil),           // 1: signet.kms.v1.StartSessionRequest
@@ -965,6 +1123,9 @@ var file_keymanager_proto_goTypes = []any{
 	(*DiscardPendingReshareResponse)(nil), // 13: signet.kms.v1.DiscardPendingReshareResponse
 	(*RollbackReshareRequest)(nil),        // 14: signet.kms.v1.RollbackReshareRequest
 	(*RollbackReshareResponse)(nil),       // 15: signet.kms.v1.RollbackReshareResponse
+	(*SetKeyStatusRequest)(nil),           // 16: signet.kms.v1.SetKeyStatusRequest
+	(*SetKeyStatusResponse)(nil),          // 17: signet.kms.v1.SetKeyStatusResponse
+	(*DeleteKeyResponse)(nil),             // 18: signet.kms.v1.DeleteKeyResponse
 }
 var file_keymanager_proto_depIdxs = []int32{
 	0,  // 0: signet.kms.v1.StartSessionRequest.type:type_name -> signet.kms.v1.SessionType
@@ -979,16 +1140,20 @@ var file_keymanager_proto_depIdxs = []int32{
 	14, // 9: signet.kms.v1.KeyManager.RollbackReshare:input_type -> signet.kms.v1.RollbackReshareRequest
 	7,  // 10: signet.kms.v1.KeyManager.GetPublicKey:input_type -> signet.kms.v1.KeyRef
 	8,  // 11: signet.kms.v1.KeyManager.ListKeys:input_type -> signet.kms.v1.GroupRef
-	2,  // 12: signet.kms.v1.KeyManager.StartSession:output_type -> signet.kms.v1.StartSessionResponse
-	3,  // 13: signet.kms.v1.KeyManager.ProcessMessage:output_type -> signet.kms.v1.SessionMessage
-	6,  // 14: signet.kms.v1.KeyManager.AbortSession:output_type -> signet.kms.v1.AbortSessionResponse
-	12, // 15: signet.kms.v1.KeyManager.CommitReshare:output_type -> signet.kms.v1.CommitReshareResponse
-	13, // 16: signet.kms.v1.KeyManager.DiscardPendingReshare:output_type -> signet.kms.v1.DiscardPendingReshareResponse
-	15, // 17: signet.kms.v1.KeyManager.RollbackReshare:output_type -> signet.kms.v1.RollbackReshareResponse
-	9,  // 18: signet.kms.v1.KeyManager.GetPublicKey:output_type -> signet.kms.v1.PublicKeyResponse
-	11, // 19: signet.kms.v1.KeyManager.ListKeys:output_type -> signet.kms.v1.KeyListResponse
-	12, // [12:20] is the sub-list for method output_type
-	4,  // [4:12] is the sub-list for method input_type
+	16, // 12: signet.kms.v1.KeyManager.SetKeyStatus:input_type -> signet.kms.v1.SetKeyStatusRequest
+	7,  // 13: signet.kms.v1.KeyManager.DeleteKey:input_type -> signet.kms.v1.KeyRef
+	2,  // 14: signet.kms.v1.KeyManager.StartSession:output_type -> signet.kms.v1.StartSessionResponse
+	3,  // 15: signet.kms.v1.KeyManager.ProcessMessage:output_type -> signet.kms.v1.SessionMessage
+	6,  // 16: signet.kms.v1.KeyManager.AbortSession:output_type -> signet.kms.v1.AbortSessionResponse
+	12, // 17: signet.kms.v1.KeyManager.CommitReshare:output_type -> signet.kms.v1.CommitReshareResponse
+	13, // 18: signet.kms.v1.KeyManager.DiscardPendingReshare:output_type -> signet.kms.v1.DiscardPendingReshareResponse
+	15, // 19: signet.kms.v1.KeyManager.RollbackReshare:output_type -> signet.kms.v1.RollbackReshareResponse
+	9,  // 20: signet.kms.v1.KeyManager.GetPublicKey:output_type -> signet.kms.v1.PublicKeyResponse
+	11, // 21: signet.kms.v1.KeyManager.ListKeys:output_type -> signet.kms.v1.KeyListResponse
+	17, // 22: signet.kms.v1.KeyManager.SetKeyStatus:output_type -> signet.kms.v1.SetKeyStatusResponse
+	18, // 23: signet.kms.v1.KeyManager.DeleteKey:output_type -> signet.kms.v1.DeleteKeyResponse
+	14, // [14:24] is the sub-list for method output_type
+	4,  // [4:14] is the sub-list for method input_type
 	4,  // [4:4] is the sub-list for extension type_name
 	4,  // [4:4] is the sub-list for extension extendee
 	0,  // [0:4] is the sub-list for field type_name
@@ -1005,7 +1170,7 @@ func file_keymanager_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_keymanager_proto_rawDesc), len(file_keymanager_proto_rawDesc)),
 			NumEnums:      1,
-			NumMessages:   15,
+			NumMessages:   18,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

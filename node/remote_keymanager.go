@@ -191,12 +191,40 @@ func (rkm *RemoteKeyManager) GetKeyInfo(groupID, keyID string, curve Curve) (*Ke
 		}
 		return nil, err
 	}
+	status := resp.Status
+	if status == "" {
+		status = "active" // backwards compat with KMS that doesn't return status
+	}
 	return &KeyInfo{
 		GroupKey: resp.GroupKey,
 		PartyID:  rkm.selfID,
 		Curve:    curve,
 		Scope:    resp.Scope,
+		Status:   status,
 	}, nil
+}
+
+// SetKeyStatus changes a key's status (active ↔ disabled).
+func (rkm *RemoteKeyManager) SetKeyStatus(groupID, keyID string, curve Curve, status string) error {
+	gid, _ := hex.DecodeString(strings.TrimPrefix(groupID, "0x"))
+	_, err := rkm.client.SetKeyStatus(context.Background(), &kmspb.SetKeyStatusRequest{
+		GroupId: gid,
+		KeyId:   keyID,
+		Curve:   string(curve),
+		Status:  status,
+	})
+	return err
+}
+
+// DeleteKey permanently removes a key from storage.
+func (rkm *RemoteKeyManager) DeleteKey(groupID, keyID string, curve Curve) error {
+	gid, _ := hex.DecodeString(strings.TrimPrefix(groupID, "0x"))
+	_, err := rkm.client.DeleteKey(context.Background(), &kmspb.KeyRef{
+		GroupId: gid,
+		KeyId:   keyID,
+		Curve:   string(curve),
+	})
+	return err
 }
 
 // ListKeys returns all keys stored under groupID with their curves.

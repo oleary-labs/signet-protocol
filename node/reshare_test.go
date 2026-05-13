@@ -98,7 +98,9 @@ func (m *mockKeyManager) ListGroups() ([]string, error) {
 func (m *mockKeyManager) CommitReshare(groupID, keyID string, _ Curve) error               { return nil }
 func (m *mockKeyManager) DiscardPendingReshare(groupID, keyID string, _ Curve) error       { return nil }
 func (m *mockKeyManager) RollbackReshare(groupID, keyID string, _ Curve, gen uint64) error { return nil }
-func (m *mockKeyManager) Close() error                                            { return nil }
+func (m *mockKeyManager) SetKeyStatus(groupID, keyID string, _ Curve, status string) error { return nil }
+func (m *mockKeyManager) DeleteKey(groupID, keyID string, _ Curve) error                   { return nil }
+func (m *mockKeyManager) Close() error                                                     { return nil }
 
 var _ KeyManager = (*mockKeyManager)(nil)
 

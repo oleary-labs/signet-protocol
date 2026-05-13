@@ -265,6 +265,9 @@ func New(cfg *Config, log *zap.Logger) (*Node, error) {
 	mux.HandleFunc("POST /v1/keygen", n.handleKeygen)
 	mux.HandleFunc("POST /v1/sign", n.handleSign)
 	mux.HandleFunc("POST /v1/delegate", n.handleDelegate)
+	mux.HandleFunc("POST /v1/keys/disable", n.handleDisableKey)
+	mux.HandleFunc("POST /v1/keys/enable", n.handleEnableKey)
+	mux.HandleFunc("POST /v1/keys/delete", n.handleDeleteKey)
 
 	mux.HandleFunc("POST /admin/keys", n.handleListKeys)
 	// Reshare is triggered via on-chain events (node add/remove or

@@ -39,6 +39,7 @@ func (n *Node) handleListKeys(w http.ResponseWriter, r *http.Request) {
 		EthereumAddress string   `json:"ethereum_address,omitempty"`
 		Threshold       int      `json:"threshold"`
 		Parties         []string `json:"parties"`
+		Status          string   `json:"status"`
 	}
 
 	var req AdminAuth
@@ -89,6 +90,7 @@ func (n *Node) handleListKeys(w http.ResponseWriter, r *http.Request) {
 			EthereumAddress: ethAddr,
 			Threshold:       info.Threshold,
 			Parties:         tss.PartyIDsToStrings(info.Parties),
+			Status:          info.Status,
 		})
 	}
 
@@ -645,6 +647,10 @@ func (n *Node) handleSign(w http.ResponseWriter, r *http.Request) {
 		httpError(w, http.StatusNotFound, fmt.Sprintf("key not found: group=%s key=%s", req.GroupID, keyID))
 		return
 	}
+	if keyInfo.Status == "disabled" {
+		httpError(w, http.StatusForbidden, "key is disabled")
+		return
+	}
 
 	// Scope enforcement: if the key has a scope, require structured payload.
 	// If the key is unscoped, require message_hash.
@@ -1160,4 +1166,192 @@ func (n *Node) applySessionAuth(
 		return "", nil, false
 	}
 	return resolvedKeyID, ap, true
+}
+
+// handleDisableKey disables a key, preventing it from being used for signing.
+// The key remains visible in listings and can be re-enabled.
+//
+// POST /v1/keys/disable
+//
+//	{"group_id":"0x...","key_id":"...","curve":"ecdsa_secp256k1",
+//	 "session_pub":"02...","request_sig":"hex64","nonce":"hex","timestamp":123}
+func (n *Node) handleDisableKey(w http.ResponseWriter, r *http.Request) {
+	n.handleSetKeyStatus(w, r, "disabled")
+}
+
+// handleEnableKey re-enables a previously disabled key.
+//
+// POST /v1/keys/enable
+func (n *Node) handleEnableKey(w http.ResponseWriter, r *http.Request) {
+	n.handleSetKeyStatus(w, r, "active")
+}
+
+func (n *Node) handleSetKeyStatus(w http.ResponseWriter, r *http.Request, status string) {
+	var req struct {
+		GroupID    string `json:"group_id"`
+		KeyID      string `json:"key_id"`
+		KeySuffix  string `json:"key_suffix"`
+		Curve      string `json:"curve"`
+		SessionPub string `json:"session_pub"`
+		RequestSig string `json:"request_sig"`
+		Nonce      string `json:"nonce"`
+		Timestamp  uint64 `json:"timestamp"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		httpError(w, http.StatusBadRequest, "decode body: "+err.Error())
+		return
+	}
+	curve, ok := parseCurve(w, req.Curve)
+	if !ok {
+		return
+	}
+	groupID, ok := normalizeGroupID(w, req.GroupID)
+	if !ok {
+		return
+	}
+	req.GroupID = groupID
+
+	keyID, sessionAuth, ok := n.applySessionAuth(w, "set-key-status",
+		req.GroupID, req.KeyID, req.KeySuffix,
+		req.SessionPub, req.RequestSig,
+		req.Nonce, req.Timestamp,
+		nil)
+	if !ok {
+		return
+	}
+
+	grp, ok := n.lookupGroup(w, req.GroupID)
+	if !ok {
+		return
+	}
+
+	// Verify the key exists locally before broadcasting.
+	info, err := n.km.GetKeyInfo(req.GroupID, keyID, curve)
+	if err != nil {
+		httpError(w, http.StatusInternalServerError, "load key: "+err.Error())
+		return
+	}
+	if info == nil {
+		httpError(w, http.StatusNotFound, "key not found")
+		return
+	}
+
+	// Broadcast to all group members — each independently validates and updates.
+	members := tss.NewPartyIDSlice(grp.Members)
+	if err := n.broadcastCoord(r.Context(), members, coordMsg{
+		Type:      msgSetKeyStatus,
+		GroupID:   req.GroupID,
+		KeyID:     keyID,
+		Curve:     string(curve),
+		KeyStatus: status,
+		Session:   sessionAuth,
+	}); err != nil {
+		httpError(w, http.StatusInternalServerError, "coordinate: "+err.Error())
+		return
+	}
+
+	// Apply locally (initiator is excluded from broadcastCoord).
+	if err := n.km.SetKeyStatus(req.GroupID, keyID, curve, status); err != nil {
+		httpError(w, http.StatusInternalServerError, "set key status: "+err.Error())
+		return
+	}
+
+	n.log.Info("key status changed",
+		zap.String("group_id", req.GroupID),
+		zap.String("key_id", keyID),
+		zap.String("curve", string(curve)),
+		zap.String("status", status))
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{
+		"status": status,
+		"key_id": stripKeyNamespace(keyID),
+	})
+}
+
+// handleDeleteKey permanently removes a key from all nodes.
+//
+// POST /v1/keys/delete
+//
+//	{"group_id":"0x...","key_id":"...","curve":"ecdsa_secp256k1",
+//	 "session_pub":"02...","request_sig":"hex64","nonce":"hex","timestamp":123}
+func (n *Node) handleDeleteKey(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		GroupID    string `json:"group_id"`
+		KeyID      string `json:"key_id"`
+		KeySuffix  string `json:"key_suffix"`
+		Curve      string `json:"curve"`
+		SessionPub string `json:"session_pub"`
+		RequestSig string `json:"request_sig"`
+		Nonce      string `json:"nonce"`
+		Timestamp  uint64 `json:"timestamp"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		httpError(w, http.StatusBadRequest, "decode body: "+err.Error())
+		return
+	}
+	curve, ok := parseCurve(w, req.Curve)
+	if !ok {
+		return
+	}
+	groupID, ok := normalizeGroupID(w, req.GroupID)
+	if !ok {
+		return
+	}
+	req.GroupID = groupID
+
+	keyID, sessionAuth, ok := n.applySessionAuth(w, "delete-key",
+		req.GroupID, req.KeyID, req.KeySuffix,
+		req.SessionPub, req.RequestSig,
+		req.Nonce, req.Timestamp,
+		nil)
+	if !ok {
+		return
+	}
+
+	grp, ok := n.lookupGroup(w, req.GroupID)
+	if !ok {
+		return
+	}
+
+	// Verify the key exists locally before broadcasting.
+	info, err := n.km.GetKeyInfo(req.GroupID, keyID, curve)
+	if err != nil {
+		httpError(w, http.StatusInternalServerError, "load key: "+err.Error())
+		return
+	}
+	if info == nil {
+		httpError(w, http.StatusNotFound, "key not found")
+		return
+	}
+
+	// Broadcast to all group members — each independently validates and deletes.
+	members := tss.NewPartyIDSlice(grp.Members)
+	if err := n.broadcastCoord(r.Context(), members, coordMsg{
+		Type:    msgDeleteKey,
+		GroupID: req.GroupID,
+		KeyID:   keyID,
+		Curve:   string(curve),
+		Session: sessionAuth,
+	}); err != nil {
+		httpError(w, http.StatusInternalServerError, "coordinate: "+err.Error())
+		return
+	}
+
+	// Apply locally (initiator is excluded from broadcastCoord).
+	if err := n.km.DeleteKey(req.GroupID, keyID, curve); err != nil {
+		httpError(w, http.StatusInternalServerError, "delete key: "+err.Error())
+		return
+	}
+
+	n.log.Info("key deleted",
+		zap.String("group_id", req.GroupID),
+		zap.String("key_id", keyID),
+		zap.String("curve", string(curve)))
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{
+		"status": "deleted",
+		"key_id": stripKeyNamespace(keyID),
+	})
 }

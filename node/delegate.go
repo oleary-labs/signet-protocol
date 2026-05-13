@@ -142,6 +142,10 @@ func (n *Node) handleDelegate(w http.ResponseWriter, r *http.Request) {
 		httpError(w, http.StatusNotFound, fmt.Sprintf("sub-key not found: %s", subKeyID))
 		return
 	}
+	if subKeyInfo.Status == "disabled" {
+		httpError(w, http.StatusForbidden, "sub-key is disabled")
+		return
+	}
 
 	// Verify the parent key exists and load its public key.
 	parentInfo, err := n.km.GetKeyInfo(req.GroupID, parentKeyID, parentCurve)
@@ -151,6 +155,10 @@ func (n *Node) handleDelegate(w http.ResponseWriter, r *http.Request) {
 	}
 	if parentInfo == nil {
 		httpError(w, http.StatusNotFound, fmt.Sprintf("parent key not found: %s", parentKeyID))
+		return
+	}
+	if parentInfo.Status == "disabled" {
+		httpError(w, http.StatusForbidden, "parent key is disabled")
 		return
 	}
 

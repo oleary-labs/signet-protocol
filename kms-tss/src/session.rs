@@ -19,7 +19,7 @@ use crate::ecdsa_session::EcdsaSession;
 use crate::params::{KeygenParams, SignParams};
 use crate::reshare::ReshareParams;
 use crate::reshare_session::ReshareSession;
-use crate::storage::{Storage, StoredKey};
+use crate::storage::{KeyStatus, Storage, StoredKey};
 use crate::types::{OutgoingMessage, ProcessError, SessionResult, StepOutput};
 
 
@@ -460,6 +460,7 @@ fn process_typed<C: Ciphersuite>(
                     verifying_share: verifying_share.clone(),
                     generation: 0,
                     scope: params.scope.clone(),
+                    status: KeyStatus::Active,
                 };
                 try_invalid!(
                     storage.put_key(&params.group_id, &params.key_id, &params.curve, &stored),

@@ -300,5 +300,15 @@ func configToKeyInfo(cfg *tss.Config) *KeyInfo {
 	}
 }
 
+// SetKeyStatus changes a key's status. Not yet implemented for LocalKeyManager.
+func (lkm *LocalKeyManager) SetKeyStatus(groupID, keyID string, curve Curve, status string) error {
+	return fmt.Errorf("SetKeyStatus not implemented for LocalKeyManager")
+}
+
+// DeleteKey permanently removes a key. Not yet implemented for LocalKeyManager.
+func (lkm *LocalKeyManager) DeleteKey(groupID, keyID string, curve Curve) error {
+	return fmt.Errorf("DeleteKey not implemented for LocalKeyManager")
+}
+
 // Ensure LocalKeyManager implements KeyManager at compile time.
 var _ KeyManager = (*LocalKeyManager)(nil)

@@ -15,6 +15,20 @@ use sled::Transactional;
 
 use crate::curve::Curve;
 
+/// Key status — controls whether the key can be used for signing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum KeyStatus {
+    Active,
+    Disabled,
+}
+
+impl Default for KeyStatus {
+    fn default() -> Self {
+        KeyStatus::Active
+    }
+}
+
 /// Persistent key material for a single key shard.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StoredKey {
@@ -32,6 +46,10 @@ pub struct StoredKey {
     /// Empty = unscoped (signs any hash). Set at keygen time, immutable.
     #[serde(default)]
     pub scope: Vec<u8>,
+    /// Key status. Disabled keys reject sign requests but remain visible.
+    /// Defaults to Active for backwards compatibility with existing stored keys.
+    #[serde(default)]
+    pub status: KeyStatus,
 }
 
 /// sled-backed key storage with separate trees for active, pending, and archive.
@@ -127,6 +145,37 @@ impl Storage {
             entries.push((id, curve));
         }
         Ok(entries)
+    }
+
+    /// Update the status of an active key. Returns error if key not found.
+    pub fn set_key_status(&self, group_id: &str, key_id: &str, curve: &Curve, status: KeyStatus) -> Result<(), String> {
+        let tree = self
+            .db
+            .open_tree(Self::active_tree_name(group_id))
+            .map_err(|e| format!("open tree: {e}"))?;
+        let sk = storage_key(curve, key_id);
+        let mut key: StoredKey = Self::get_from_tree(&tree, &sk)?
+            .ok_or_else(|| format!("key not found: {group_id}/{key_id}"))?;
+        key.status = status;
+        let data = serde_json::to_vec(&key).map_err(|e| format!("serialize key: {e}"))?;
+        tree.insert(sk, data).map_err(|e| format!("update key: {e}"))?;
+        tree.flush().map_err(|e| format!("flush: {e}"))?;
+        Ok(())
+    }
+
+    /// Permanently delete an active key. Returns error if key not found.
+    pub fn delete_key(&self, group_id: &str, key_id: &str, curve: &Curve) -> Result<(), String> {
+        let tree = self
+            .db
+            .open_tree(Self::active_tree_name(group_id))
+            .map_err(|e| format!("open tree: {e}"))?;
+        let sk = storage_key(curve, key_id);
+        let removed = tree.remove(&sk).map_err(|e| format!("remove key: {e}"))?;
+        if removed.is_none() {
+            return Err(format!("key not found: {group_id}/{key_id}"));
+        }
+        tree.flush().map_err(|e| format!("flush: {e}"))?;
+        Ok(())
     }
 
     // -------------------------------------------------------------------------
@@ -354,6 +403,7 @@ mod tests {
             verifying_share: vec![0x03; 33],
             generation: 0,
                 scope: vec![],
+                status: KeyStatus::Active,
         };
 
         storage.put_key("group-1", "key-a", &Curve::Secp256k1, &key).unwrap();
@@ -390,6 +440,7 @@ mod tests {
             verifying_share: vec![0x03; 33],
             generation: 0,
                 scope: vec![],
+                status: KeyStatus::Active,
         };
         let ed_key = StoredKey {
             key_package: vec![10],
@@ -398,6 +449,7 @@ mod tests {
             verifying_share: vec![0x05; 32],
             generation: 0,
                 scope: vec![],
+                status: KeyStatus::Active,
         };
 
         storage.put_key("group-1", "k1", &Curve::Secp256k1, &secp_key).unwrap();
@@ -423,6 +475,7 @@ mod tests {
             verifying_share: vec![0x03; 33],
             generation: 0,
                 scope: vec![],
+                status: KeyStatus::Active,
         };
         storage.put_key("group-1", "k1", &c, &key_gen0).unwrap();
 
@@ -433,6 +486,7 @@ mod tests {
             verifying_share: vec![0x04; 33],
             generation: 1,
                 scope: vec![],
+                status: KeyStatus::Active,
         };
         storage.put_pending("group-1", "k1", &c, &key_gen1).unwrap();
 
@@ -461,6 +515,7 @@ mod tests {
             verifying_share: vec![0x03; 33],
             generation: 0,
                 scope: vec![],
+                status: KeyStatus::Active,
         };
         storage.put_key("group-1", "k1", &c, &key_gen0).unwrap();
 
@@ -471,6 +526,7 @@ mod tests {
             verifying_share: vec![0x04; 33],
             generation: 1,
                 scope: vec![],
+                status: KeyStatus::Active,
         };
         storage.put_pending("group-1", "k1", &c, &key_gen1).unwrap();
         storage.commit_reshare("group-1", "k1", &c).unwrap();
@@ -494,6 +550,7 @@ mod tests {
             verifying_share: vec![],
             generation: 1,
                 scope: vec![],
+                status: KeyStatus::Active,
         };
         storage.put_pending("group-1", "k1", &c, &key).unwrap();
         assert!(storage.get_pending("group-1", "k1", &c).unwrap().is_some());
@@ -515,6 +572,7 @@ mod tests {
             verifying_share: vec![0x03; 33],
             generation: 0,
                 scope: vec![],
+                status: KeyStatus::Active,
         };
         storage.put_key("group-1", "k1", &c, &key).unwrap();
 

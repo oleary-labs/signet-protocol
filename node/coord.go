@@ -36,7 +36,9 @@ const (
 	msgReshareBatch    coordMsgType = 5
 	msgReshareCommit   coordMsgType = 6
 	msgDelegateSign    coordMsgType = 7
-	msgAuth            coordMsgType = 8 // forward auth proof to establish session on participants
+	msgAuth            coordMsgType = 8  // forward auth proof to establish session on participants
+	msgSetKeyStatus    coordMsgType = 9  // set key status (active/disabled) across all nodes
+	msgDeleteKey       coordMsgType = 10 // permanently delete a key across all nodes
 )
 
 // coordMsg is sent from the initiating node to each other participant to start
@@ -84,6 +86,9 @@ type coordMsg struct {
 	// key in KeyID. Each participant verifies auth against this field and
 	// checks that it's under the same identity namespace as KeyID.
 	DelegateSubKey string `cbor:"20,keyasint,omitempty"`
+
+	// Key lifecycle: status for msgSetKeyStatus ("active" or "disabled").
+	KeyStatus string `cbor:"22,keyasint,omitempty"`
 
 	// Reshare only: old and new committee definitions.
 	OldParties   []tss.PartyID `cbor:"11,keyasint,omitempty"`
@@ -212,7 +217,8 @@ func (n *Node) handleCoordStream(s libp2pnet.Stream) {
 	// These operations require a previously established session. The coord
 	// message carries a lightweight SessionAuth (session pub + request sig).
 	// No ZK proof — that was verified once during msgAuth.
-	requiresUserAuth := msg.Type == msgKeygen || msg.Type == msgSign || msg.Type == msgDelegateSign
+	requiresUserAuth := msg.Type == msgKeygen || msg.Type == msgSign || msg.Type == msgDelegateSign ||
+		msg.Type == msgSetKeyStatus || msg.Type == msgDeleteKey
 	if requiresUserAuth && n.auth.HasAuthPolicy(msg.GroupID) {
 		if msg.Session == nil {
 			n.log.Warn("coord: missing session auth",
@@ -418,6 +424,12 @@ func (n *Node) handleCoordStream(s libp2pnet.Stream) {
 					zap.String("key_id", msg.KeyID))
 				return
 			}
+			if info.Status == "disabled" {
+				n.log.Warn("coord: sign rejected, key is disabled",
+					zap.String("group_id", msg.GroupID),
+					zap.String("key_id", msg.KeyID))
+				return
+			}
 
 			// Scope enforcement: if the key has a scope, participants
 			// independently verify the payload and compute the hash.
@@ -507,6 +519,12 @@ func (n *Node) handleCoordStream(s libp2pnet.Stream) {
 					zap.Error(err))
 				return
 			}
+			if info.Status == "disabled" {
+				n.log.Warn("coord: delegate-sign rejected, parent key is disabled",
+					zap.String("group_id", msg.GroupID),
+					zap.String("key_id", msg.KeyID))
+				return
+			}
 
 			// Verify the sub-key exists on this node too.
 			subInfo, err := n.km.GetKeyInfo(msg.GroupID, msg.DelegateSubKey, curve)
@@ -515,6 +533,12 @@ func (n *Node) handleCoordStream(s libp2pnet.Stream) {
 					zap.String("group_id", msg.GroupID),
 					zap.String("sub_key", msg.DelegateSubKey),
 					zap.Error(err))
+				return
+			}
+			if subInfo.Status == "disabled" {
+				n.log.Warn("coord: delegate-sign rejected, sub-key is disabled",
+					zap.String("group_id", msg.GroupID),
+					zap.String("sub_key", msg.DelegateSubKey))
 				return
 			}
 
@@ -837,6 +861,67 @@ func (n *Node) handleCoordStream(s libp2pnet.Stream) {
 		n.log.Info("coord: reshare complete received, cleaning up",
 			zap.String("group_id", groupID))
 		n.completeReshareJob(groupID)
+		s.Write([]byte{coordACK})
+
+	case msgSetKeyStatus:
+		curve := Curve(msg.Curve)
+		if curve == "" {
+			curve = CurveSecp256k1
+		}
+		if msg.KeyStatus != "active" && msg.KeyStatus != "disabled" {
+			n.log.Warn("coord: invalid key status",
+				zap.String("status", msg.KeyStatus))
+			s.Write([]byte{coordNACK})
+			return
+		}
+		// Verify the key exists on this node.
+		info, err := n.km.GetKeyInfo(msg.GroupID, msg.KeyID, curve)
+		if err != nil || info == nil {
+			n.log.Warn("coord: set-key-status key not found",
+				zap.String("group_id", msg.GroupID),
+				zap.String("key_id", msg.KeyID))
+			s.Write([]byte{coordNACK})
+			return
+		}
+		if err := n.km.SetKeyStatus(msg.GroupID, msg.KeyID, curve, msg.KeyStatus); err != nil {
+			n.log.Error("coord: set-key-status failed",
+				zap.String("group_id", msg.GroupID),
+				zap.String("key_id", msg.KeyID),
+				zap.Error(err))
+			s.Write([]byte{coordNACK})
+			return
+		}
+		n.log.Info("coord: key status changed",
+			zap.String("group_id", msg.GroupID),
+			zap.String("key_id", msg.KeyID),
+			zap.String("status", msg.KeyStatus))
+		s.Write([]byte{coordACK})
+
+	case msgDeleteKey:
+		curve := Curve(msg.Curve)
+		if curve == "" {
+			curve = CurveSecp256k1
+		}
+		// Verify the key exists on this node.
+		info, err := n.km.GetKeyInfo(msg.GroupID, msg.KeyID, curve)
+		if err != nil || info == nil {
+			n.log.Warn("coord: delete-key key not found",
+				zap.String("group_id", msg.GroupID),
+				zap.String("key_id", msg.KeyID))
+			s.Write([]byte{coordNACK})
+			return
+		}
+		if err := n.km.DeleteKey(msg.GroupID, msg.KeyID, curve); err != nil {
+			n.log.Error("coord: delete-key failed",
+				zap.String("group_id", msg.GroupID),
+				zap.String("key_id", msg.KeyID),
+				zap.Error(err))
+			s.Write([]byte{coordNACK})
+			return
+		}
+		n.log.Info("coord: key deleted",
+			zap.String("group_id", msg.GroupID),
+			zap.String("key_id", msg.KeyID))
 		s.Write([]byte{coordACK})
 
 	default:

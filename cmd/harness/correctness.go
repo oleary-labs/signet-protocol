@@ -435,6 +435,160 @@ func RunCorrectness(ctx context.Context, clients []*Client, newKeyID func() stri
 				return fmt.Errorf("expected HTTP 400, got: %v", err)
 			},
 		},
+
+		// --- Key lifecycle tests ---
+		{
+			"30-disable-key-blocks-sign",
+			func(ctx context.Context) error {
+				kid := newKeyID()
+				if _, err := c0.Keygen(ctx, kid); err != nil {
+					return fmt.Errorf("keygen: %w", err)
+				}
+				// Sign should work.
+				const msgHash = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+				if _, err := c0.Sign(ctx, kid, msgHash); err != nil {
+					return fmt.Errorf("sign before disable: %w", err)
+				}
+				// Disable.
+				resp, err := c0.DisableKey(ctx, kid)
+				if err != nil {
+					return fmt.Errorf("disable: %w", err)
+				}
+				if resp.Status != "disabled" {
+					return fmt.Errorf("expected status=disabled, got %s", resp.Status)
+				}
+				// Sign should fail with 403.
+				_, err = c0.Sign(ctx, kid, msgHash)
+				if err == nil {
+					return fmt.Errorf("expected error after disable")
+				}
+				if he := IsHTTPError(err); he == nil || he.Code != 403 {
+					return fmt.Errorf("expected HTTP 403, got: %v", err)
+				}
+				return nil
+			},
+		},
+		{
+			"31-enable-key-restores-sign",
+			func(ctx context.Context) error {
+				kid := newKeyID()
+				kg, err := c0.Keygen(ctx, kid)
+				if err != nil {
+					return fmt.Errorf("keygen: %w", err)
+				}
+				if _, err := c0.DisableKey(ctx, kid); err != nil {
+					return fmt.Errorf("disable: %w", err)
+				}
+				// Re-enable.
+				resp, err := c0.EnableKey(ctx, kid)
+				if err != nil {
+					return fmt.Errorf("enable: %w", err)
+				}
+				if resp.Status != "active" {
+					return fmt.Errorf("expected status=active, got %s", resp.Status)
+				}
+				// Sign should work again.
+				const msgHash = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+				sg, err := c0.Sign(ctx, kid, msgHash)
+				if err != nil {
+					return fmt.Errorf("sign after enable: %w", err)
+				}
+				return VerifyFROSTSignature(sg.EthereumSignature, kg.PublicKey, msgHash)
+			},
+		},
+		{
+			"32-delete-key-blocks-sign",
+			func(ctx context.Context) error {
+				kid := newKeyID()
+				if _, err := c0.Keygen(ctx, kid); err != nil {
+					return fmt.Errorf("keygen: %w", err)
+				}
+				if _, err := c0.DeleteKey(ctx, kid); err != nil {
+					return fmt.Errorf("delete: %w", err)
+				}
+				const msgHash = "0xcccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+				_, err := c0.Sign(ctx, kid, msgHash)
+				if err == nil {
+					return fmt.Errorf("expected error after delete")
+				}
+				if he := IsHTTPError(err); he == nil || he.Code != 404 {
+					return fmt.Errorf("expected HTTP 404, got: %v", err)
+				}
+				return nil
+			},
+		},
+		{
+			"33-delete-key-allows-recreate",
+			func(ctx context.Context) error {
+				kid := newKeyID()
+				if _, err := c0.Keygen(ctx, kid); err != nil {
+					return fmt.Errorf("keygen 1: %w", err)
+				}
+				if _, err := c0.DeleteKey(ctx, kid); err != nil {
+					return fmt.Errorf("delete: %w", err)
+				}
+				// Should be able to create the same key_id again.
+				kg, err := c0.Keygen(ctx, kid)
+				if err != nil {
+					return fmt.Errorf("keygen 2 (recreate): %w", err)
+				}
+				if !IsValidCompressedPubkey(kg.PublicKey) {
+					return fmt.Errorf("invalid pubkey: %s", kg.PublicKey)
+				}
+				return nil
+			},
+		},
+		{
+			"34-disable-coordinated-cross-node",
+			func(ctx context.Context) error {
+				if len(clients) < 2 {
+					return fmt.Errorf("need at least 2 nodes")
+				}
+				kid := newKeyID()
+				if _, err := c0.Keygen(ctx, kid); err != nil {
+					return fmt.Errorf("keygen: %w", err)
+				}
+				// Disable via node 0.
+				if _, err := c0.DisableKey(ctx, kid); err != nil {
+					return fmt.Errorf("disable via node0: %w", err)
+				}
+				// Sign via different node should also fail.
+				const msgHash = "0xdddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+				_, err := clients[1].Sign(ctx, kid, msgHash)
+				if err == nil {
+					return fmt.Errorf("expected sign to fail on different node after disable")
+				}
+				if he := IsHTTPError(err); he == nil || he.Code != 403 {
+					return fmt.Errorf("expected HTTP 403, got: %v", err)
+				}
+				return nil
+			},
+		},
+		{
+			"35-status-in-key-listing",
+			func(ctx context.Context) error {
+				kid := newKeyID()
+				if _, err := c0.Keygen(ctx, kid); err != nil {
+					return fmt.Errorf("keygen: %w", err)
+				}
+				if _, err := c0.DisableKey(ctx, kid); err != nil {
+					return fmt.Errorf("disable: %w", err)
+				}
+				keys, err := c0.ListKeys(ctx)
+				if err != nil {
+					return fmt.Errorf("list keys: %w", err)
+				}
+				for _, k := range keys {
+					if k.KeyID == kid {
+						if k.Status != "disabled" {
+							return fmt.Errorf("expected status=disabled in listing, got %q", k.Status)
+						}
+						return nil
+					}
+				}
+				return fmt.Errorf("key %s not found in listing", kid)
+			},
+		},
 	}
 
 	var results []CorrectnessResult

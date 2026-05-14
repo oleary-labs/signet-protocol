@@ -139,6 +139,73 @@ func (c *Client) SignScoped(ctx context.Context, keyID, curve string, payload *S
 	return &resp, nil
 }
 
+// KeyStatusResponse is the JSON response from key lifecycle endpoints.
+type KeyStatusResponse struct {
+	Status string `json:"status"`
+	KeyID  string `json:"key_id"`
+}
+
+// DisableKey calls POST /v1/keys/disable.
+func (c *Client) DisableKey(ctx context.Context, keyID string) (*KeyStatusResponse, error) {
+	body, _ := json.Marshal(map[string]string{
+		"group_id": c.groupID,
+		"key_id":   keyID,
+	})
+	var resp KeyStatusResponse
+	if err := c.post(ctx, "/v1/keys/disable", body, &resp); err != nil {
+		return nil, err
+	}
+	return &resp, nil
+}
+
+// EnableKey calls POST /v1/keys/enable.
+func (c *Client) EnableKey(ctx context.Context, keyID string) (*KeyStatusResponse, error) {
+	body, _ := json.Marshal(map[string]string{
+		"group_id": c.groupID,
+		"key_id":   keyID,
+	})
+	var resp KeyStatusResponse
+	if err := c.post(ctx, "/v1/keys/enable", body, &resp); err != nil {
+		return nil, err
+	}
+	return &resp, nil
+}
+
+// DeleteKey calls POST /v1/keys/delete.
+func (c *Client) DeleteKey(ctx context.Context, keyID string) (*KeyStatusResponse, error) {
+	body, _ := json.Marshal(map[string]string{
+		"group_id": c.groupID,
+		"key_id":   keyID,
+	})
+	var resp KeyStatusResponse
+	if err := c.post(ctx, "/v1/keys/delete", body, &resp); err != nil {
+		return nil, err
+	}
+	return &resp, nil
+}
+
+// AdminKeyEntry is a single entry from the admin key listing.
+type AdminKeyEntry struct {
+	GroupID         string `json:"group_id"`
+	KeyID           string `json:"key_id"`
+	Curve           string `json:"curve"`
+	PublicKey       string `json:"public_key"`
+	EthereumAddress string `json:"ethereum_address"`
+	Status          string `json:"status"`
+}
+
+// ListKeys calls POST /admin/keys and returns all keys for the group.
+func (c *Client) ListKeys(ctx context.Context) ([]AdminKeyEntry, error) {
+	body, _ := json.Marshal(map[string]string{
+		"group_id": c.groupID,
+	})
+	var resp []AdminKeyEntry
+	if err := c.post(ctx, "/admin/keys", body, &resp); err != nil {
+		return nil, err
+	}
+	return resp, nil
+}
+
 // StartReshare calls POST /admin/reshare to trigger a same-committee reshare.
 func (c *Client) StartReshare(ctx context.Context, concurrency int) error {
 	body, _ := json.Marshal(map[string]interface{}{

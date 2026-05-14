@@ -2,9 +2,12 @@ package main
 
 import (
 	"context"
+	"encoding/hex"
 	"fmt"
 	"sync"
 	"time"
+
+	"github.com/ethereum/go-ethereum/common"
 )
 
 // nonexistentMsgHash is a valid 32-byte hex hash used for negative tests.
@@ -25,6 +28,12 @@ type correctnessTest struct {
 // RunCorrectness runs all correctness tests and prints results. Returns true if all pass.
 func RunCorrectness(ctx context.Context, clients []*Client, newKeyID func() string) ([]CorrectnessResult, bool) {
 	c0 := clients[0]
+
+	// Test constants for EIP-712 scoped signing.
+	const testChainID = uint64(1)
+	testContract := common.HexToAddress("0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48") // USDC mainnet
+	testTo := common.HexToAddress("0x1111111111111111111111111111111111111111")
+	testScopeHex := BuildEIP712Scope(testChainID, testContract)
 
 	tests := []correctnessTest{
 		{
@@ -184,6 +193,207 @@ func RunCorrectness(ctx context.Context, clients []*Client, newKeyID func() stri
 				return VerifyFROSTSignature(sg.EthereumSignature, kg.PublicKey, msgHash)
 			},
 		},
+
+		// --- ECDSA tests ---
+		{
+			"10-ecdsa-keygen-sign-verify",
+			func(ctx context.Context) error {
+				kid := newKeyID()
+				kg, err := c0.KeygenWithCurve(ctx, kid, "ecdsa_secp256k1")
+				if err != nil {
+					return fmt.Errorf("ecdsa keygen: %w", err)
+				}
+				if !IsValidCompressedPubkey(kg.PublicKey) {
+					return fmt.Errorf("invalid pubkey: %s", kg.PublicKey)
+				}
+				const msgHash = "0x0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20"
+				sg, err := c0.SignWithCurve(ctx, kid, msgHash, "ecdsa_secp256k1")
+				if err != nil {
+					return fmt.Errorf("ecdsa sign: %w", err)
+				}
+				if sg.ECDSASignature == "" {
+					return fmt.Errorf("missing ecdsa_signature in response")
+				}
+				return VerifyECDSASignature(sg.ECDSASignature, kg.PublicKey, msgHash)
+			},
+		},
+		{
+			"11-ecdsa-s-normalized",
+			func(ctx context.Context) error {
+				// Sign multiple times and verify s is always in lower half.
+				kid := newKeyID()
+				kg, err := c0.KeygenWithCurve(ctx, kid, "ecdsa_secp256k1")
+				if err != nil {
+					return fmt.Errorf("keygen: %w", err)
+				}
+				for i := 0; i < 5; i++ {
+					hash := fmt.Sprintf("0x%064x", i+1)
+					sg, err := c0.SignWithCurve(ctx, kid, hash, "ecdsa_secp256k1")
+					if err != nil {
+						return fmt.Errorf("sign %d: %w", i, err)
+					}
+					if err := VerifyECDSASignature(sg.ECDSASignature, kg.PublicKey, hash); err != nil {
+						return fmt.Errorf("verify %d: %w", i, err)
+					}
+				}
+				return nil
+			},
+		},
+		{
+			"12-ecdsa-cross-node",
+			func(ctx context.Context) error {
+				if len(clients) < 2 {
+					return fmt.Errorf("need at least 2 nodes")
+				}
+				kid := newKeyID()
+				kg, err := clients[0].KeygenWithCurve(ctx, kid, "ecdsa_secp256k1")
+				if err != nil {
+					return fmt.Errorf("keygen: %w", err)
+				}
+				const msgHash = "0x2222222222222222222222222222222222222222222222222222222222222222"
+				sg, err := clients[1].SignWithCurve(ctx, kid, msgHash, "ecdsa_secp256k1")
+				if err != nil {
+					return fmt.Errorf("sign: %w", err)
+				}
+				return VerifyECDSASignature(sg.ECDSASignature, kg.PublicKey, msgHash)
+			},
+		},
+		{
+			"13-ecdsa-concurrent-sign",
+			func(ctx context.Context) error {
+				kid := newKeyID()
+				kg, err := c0.KeygenWithCurve(ctx, kid, "ecdsa_secp256k1")
+				if err != nil {
+					return fmt.Errorf("keygen: %w", err)
+				}
+				const n = 5
+				const msgHash = "0xcccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+				type res struct {
+					sig string
+					err error
+				}
+				ch := make(chan res, n)
+				for i := 0; i < n; i++ {
+					go func() {
+						sg, err := c0.SignWithCurve(ctx, kid, msgHash, "ecdsa_secp256k1")
+						if err != nil {
+							ch <- res{err: err}
+							return
+						}
+						ch <- res{sig: sg.ECDSASignature}
+					}()
+				}
+				for i := 0; i < n; i++ {
+					r := <-ch
+					if r.err != nil {
+						return fmt.Errorf("sign[%d]: %w", i, r.err)
+					}
+					if err := VerifyECDSASignature(r.sig, kg.PublicKey, msgHash); err != nil {
+						return fmt.Errorf("verify[%d]: %w", i, err)
+					}
+				}
+				return nil
+			},
+		},
+
+		// --- Scoped signing tests ---
+		{
+			"20-scoped-keygen-sign-verify",
+			func(ctx context.Context) error {
+				kid := newKeyID()
+				kg, err := c0.KeygenScoped(ctx, kid, "ecdsa_secp256k1", testScopeHex)
+				if err != nil {
+					return fmt.Errorf("scoped keygen: %w", err)
+				}
+				if kg.Scope == "" {
+					return fmt.Errorf("keygen response missing scope")
+				}
+				typedData := BuildTestTypedData(testChainID, testContract, testTo, "1000000")
+				sg, err := c0.SignScoped(ctx, kg.KeyID, "ecdsa_secp256k1", &SignPayload{
+					Scheme:    "eip712",
+					TypedData: typedData,
+				})
+				if err != nil {
+					return fmt.Errorf("scoped sign: %w", err)
+				}
+				if sg.ECDSASignature == "" {
+					return fmt.Errorf("missing ecdsa_signature")
+				}
+				// Compute the EIP-712 hash client-side and verify the ECDSA
+				// signature recovers to the group public key.
+				eip712Hash, err := ComputeEIP712Hash(typedData)
+				if err != nil {
+					return fmt.Errorf("compute eip712 hash: %w", err)
+				}
+				hashHex := "0x" + hex.EncodeToString(eip712Hash)
+				return VerifyECDSASignature(sg.ECDSASignature, kg.PublicKey, hashHex)
+			},
+		},
+		{
+			"21-scoped-rejects-raw-hash",
+			func(ctx context.Context) error {
+				kid := newKeyID()
+				kg, err := c0.KeygenScoped(ctx, kid, "ecdsa_secp256k1", testScopeHex)
+				if err != nil {
+					return fmt.Errorf("scoped keygen: %w", err)
+				}
+				// Try to sign with raw message_hash — should fail.
+				_, err = c0.SignWithCurve(ctx, kg.KeyID, nonexistentMsgHash, "ecdsa_secp256k1")
+				if err == nil {
+					return fmt.Errorf("expected error for raw hash on scoped key")
+				}
+				if he := IsHTTPError(err); he != nil && he.Code == 400 {
+					return nil
+				}
+				return fmt.Errorf("expected HTTP 400, got: %v", err)
+			},
+		},
+		{
+			"22-scoped-rejects-wrong-chain",
+			func(ctx context.Context) error {
+				kid := newKeyID()
+				_, err := c0.KeygenScoped(ctx, kid, "ecdsa_secp256k1", testScopeHex)
+				if err != nil {
+					return fmt.Errorf("scoped keygen: %w", err)
+				}
+				// Wrong chainId (42 instead of 1).
+				wrongData := BuildTestTypedData(42, testContract, testTo, "1000000")
+				_, err = c0.SignScoped(ctx, kid, "ecdsa_secp256k1", &SignPayload{
+					Scheme:    "eip712",
+					TypedData: wrongData,
+				})
+				if err == nil {
+					return fmt.Errorf("expected error for wrong chainId")
+				}
+				if he := IsHTTPError(err); he != nil && he.Code == 400 {
+					return nil
+				}
+				return fmt.Errorf("expected HTTP 400, got: %v", err)
+			},
+		},
+		{
+			"23-scoped-rejects-wrong-contract",
+			func(ctx context.Context) error {
+				kid := newKeyID()
+				_, err := c0.KeygenScoped(ctx, kid, "ecdsa_secp256k1", testScopeHex)
+				if err != nil {
+					return fmt.Errorf("scoped keygen: %w", err)
+				}
+				wrongContract := common.HexToAddress("0xdead000000000000000000000000000000000000")
+				wrongData := BuildTestTypedData(testChainID, wrongContract, testTo, "1000000")
+				_, err = c0.SignScoped(ctx, kid, "ecdsa_secp256k1", &SignPayload{
+					Scheme:    "eip712",
+					TypedData: wrongData,
+				})
+				if err == nil {
+					return fmt.Errorf("expected error for wrong contract")
+				}
+				if he := IsHTTPError(err); he != nil && he.Code == 400 {
+					return nil
+				}
+				return fmt.Errorf("expected HTTP 400, got: %v", err)
+			},
+		},
 	}
 
 	var results []CorrectnessResult
@@ -230,15 +440,50 @@ func (p *KeyPool) Next() KeyPoolEntry {
 	return e
 }
 
-// BuildKeyPool pre-generates n keys, distributing keygen requests across the ring.
+// BuildKeyPool pre-generates n FROST secp256k1 keys.
 func BuildKeyPool(ctx context.Context, ring *ClientRing, n int, newKeyID func() string) (*KeyPool, error) {
+	return BuildKeyPoolWithCurve(ctx, ring, n, newKeyID, "")
+}
+
+// BuildKeyPoolWithCurve pre-generates n keys with the specified curve.
+func BuildKeyPoolWithCurve(ctx context.Context, ring *ClientRing, n int, newKeyID func() string, curve string) (*KeyPool, error) {
 	pool := &KeyPool{}
-	fmt.Printf("  building key pool (%d keys, %d nodes)...", n, ring.Len())
+	label := "frost"
+	if curve != "" {
+		label = curve
+	}
+	fmt.Printf("  building %s key pool (%d keys, %d nodes)...", label, n, ring.Len())
 	for i := 0; i < n; i++ {
 		c := ring.Next()
-		resp, err := c.Keygen(ctx, newKeyID())
+		var resp *KeygenResponse
+		var err error
+		if curve == "" {
+			resp, err = c.Keygen(ctx, newKeyID())
+		} else {
+			resp, err = c.KeygenWithCurve(ctx, newKeyID(), curve)
+		}
 		if err != nil {
 			return nil, fmt.Errorf("keygen pool[%d]: %w", i, err)
+		}
+		pool.entries = append(pool.entries, KeyPoolEntry{
+			KeyID:     resp.KeyID,
+			PublicKey: resp.PublicKey,
+		})
+	}
+	fmt.Printf(" done\n")
+	return pool, nil
+}
+
+// BuildScopedKeyPool pre-generates n EIP-712 scoped ECDSA keys.
+func BuildScopedKeyPool(ctx context.Context, ring *ClientRing, n int, newKeyID func() string) (*KeyPool, error) {
+	pool := &KeyPool{}
+	scopeHex := BuildEIP712Scope(scopedTestChainID, scopedTestContract)
+	fmt.Printf("  building scoped key pool (%d keys, %d nodes)...", n, ring.Len())
+	for i := 0; i < n; i++ {
+		c := ring.Next()
+		resp, err := c.KeygenScoped(ctx, newKeyID(), "ecdsa_secp256k1", scopeHex)
+		if err != nil {
+			return nil, fmt.Errorf("scoped keygen pool[%d]: %w", i, err)
 		}
 		pool.entries = append(pool.entries, KeyPoolEntry{
 			KeyID:     resp.KeyID,

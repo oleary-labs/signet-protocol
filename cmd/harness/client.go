@@ -31,15 +31,20 @@ func NewClient(node Node, groupID string, timeout time.Duration) *Client {
 type KeygenResponse struct {
 	GroupID         string `json:"group_id"`
 	KeyID           string `json:"key_id"`
+	Curve           string `json:"curve"`
 	PublicKey       string `json:"public_key"`
 	EthereumAddress string `json:"ethereum_address"`
+	Scope           string `json:"scope,omitempty"`
 }
 
 // SignResponse is the JSON response from POST /v1/sign.
 type SignResponse struct {
-	GroupID           string `json:"group_id"`
-	KeyID             string `json:"key_id"`
-	EthereumSignature string `json:"ethereum_signature"`
+	GroupID            string `json:"group_id"`
+	KeyID              string `json:"key_id"`
+	Curve              string `json:"curve"`
+	Signature          string `json:"signature"`
+	EthereumSignature  string `json:"ethereum_signature"`
+	ECDSASignature     string `json:"ecdsa_signature"`
 }
 
 // Keygen calls POST /v1/keygen and returns the response.
@@ -55,12 +60,77 @@ func (c *Client) Keygen(ctx context.Context, keyID string) (*KeygenResponse, err
 	return &resp, nil
 }
 
+// KeygenWithCurve calls POST /v1/keygen with an explicit curve.
+func (c *Client) KeygenWithCurve(ctx context.Context, keyID, curve string) (*KeygenResponse, error) {
+	body, _ := json.Marshal(map[string]string{
+		"group_id": c.groupID,
+		"key_id":   keyID,
+		"curve":    curve,
+	})
+	var resp KeygenResponse
+	if err := c.post(ctx, "/v1/keygen", body, &resp); err != nil {
+		return nil, err
+	}
+	return &resp, nil
+}
+
+// KeygenScoped calls POST /v1/keygen with a scope (hex-encoded).
+func (c *Client) KeygenScoped(ctx context.Context, keyID, curve, scopeHex string) (*KeygenResponse, error) {
+	body, _ := json.Marshal(map[string]string{
+		"group_id": c.groupID,
+		"key_id":   keyID,
+		"curve":    curve,
+		"scope":    scopeHex,
+	})
+	var resp KeygenResponse
+	if err := c.post(ctx, "/v1/keygen", body, &resp); err != nil {
+		return nil, err
+	}
+	return &resp, nil
+}
+
 // Sign calls POST /v1/sign and returns the response.
 func (c *Client) Sign(ctx context.Context, keyID, messageHashHex string) (*SignResponse, error) {
 	body, _ := json.Marshal(map[string]string{
 		"group_id":     c.groupID,
 		"key_id":       keyID,
 		"message_hash": messageHashHex,
+	})
+	var resp SignResponse
+	if err := c.post(ctx, "/v1/sign", body, &resp); err != nil {
+		return nil, err
+	}
+	return &resp, nil
+}
+
+// SignWithCurve calls POST /v1/sign with an explicit curve.
+func (c *Client) SignWithCurve(ctx context.Context, keyID, messageHashHex, curve string) (*SignResponse, error) {
+	body, _ := json.Marshal(map[string]string{
+		"group_id":     c.groupID,
+		"key_id":       keyID,
+		"message_hash": messageHashHex,
+		"curve":        curve,
+	})
+	var resp SignResponse
+	if err := c.post(ctx, "/v1/sign", body, &resp); err != nil {
+		return nil, err
+	}
+	return &resp, nil
+}
+
+// SignPayload is a structured signing payload for scoped keys.
+type SignPayload struct {
+	Scheme    string          `json:"scheme"`
+	TypedData json.RawMessage `json:"typed_data,omitempty"`
+}
+
+// SignScoped calls POST /v1/sign with a structured payload (for scoped keys).
+func (c *Client) SignScoped(ctx context.Context, keyID, curve string, payload *SignPayload) (*SignResponse, error) {
+	body, _ := json.Marshal(map[string]interface{}{
+		"group_id": c.groupID,
+		"key_id":   keyID,
+		"curve":    curve,
+		"payload":  payload,
 	})
 	var resp SignResponse
 	if err := c.post(ctx, "/v1/sign", body, &resp); err != nil {

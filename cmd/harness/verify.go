@@ -142,6 +142,69 @@ func frostChallenge(rCompressed, groupPubKey, message []byte) *big.Int {
 	return c
 }
 
+// VerifyECDSASignature verifies a recoverable ECDSA signature (65-byte hex: r||s||v)
+// against the group public key (33-byte compressed hex) and message hash (32-byte hex).
+func VerifyECDSASignature(sigHex, groupPubKeyHex, msgHashHex string) error {
+	sigBytes, err := decodeHex(sigHex)
+	if err != nil {
+		return fmt.Errorf("decode sig: %w", err)
+	}
+	if len(sigBytes) != 65 {
+		return fmt.Errorf("ecdsa sig must be 65 bytes, got %d", len(sigBytes))
+	}
+
+	groupKey, err := decodeHex(groupPubKeyHex)
+	if err != nil {
+		return fmt.Errorf("decode group key: %w", err)
+	}
+
+	msgHash, err := decodeHex(msgHashHex)
+	if err != nil {
+		return fmt.Errorf("decode msg hash: %w", err)
+	}
+	if len(msgHash) != 32 {
+		return fmt.Errorf("msg hash must be 32 bytes, got %d", len(msgHash))
+	}
+
+	// Verify s is in the lower half (EIP-2).
+	s := new(big.Int).SetBytes(sigBytes[32:64])
+	halfN := new(big.Int).Rsh(secp256k1N, 1)
+	if s.Cmp(halfN) > 0 {
+		return fmt.Errorf("ECDSA s not normalized (EIP-2): s > N/2")
+	}
+
+	// ecrecover and compare.
+	recovered, err := crypto.Ecrecover(msgHash, sigBytes)
+	if err != nil {
+		return fmt.Errorf("ecrecover: %w", err)
+	}
+
+	pubKey, err := crypto.DecompressPubkey(groupKey)
+	if err != nil {
+		return fmt.Errorf("decompress group key: %w", err)
+	}
+	expected := crypto.FromECDSAPub(pubKey)
+
+	if !equal(recovered, expected) {
+		recoveredAddr := common.BytesToAddress(crypto.Keccak256(recovered[1:])[12:])
+		expectedAddr := crypto.PubkeyToAddress(*pubKey)
+		return fmt.Errorf("ecrecover mismatch: got %s, want %s", recoveredAddr.Hex(), expectedAddr.Hex())
+	}
+	return nil
+}
+
+func equal(a, b []byte) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
 // IsValidCompressedPubkey returns true if s is a valid 33-byte compressed secp256k1 point.
 func IsValidCompressedPubkey(s string) bool {
 	b, err := decodeHex(s)

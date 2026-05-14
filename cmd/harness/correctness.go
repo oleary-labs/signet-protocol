@@ -194,6 +194,47 @@ func RunCorrectness(ctx context.Context, clients []*Client, newKeyID func() stri
 			},
 		},
 
+		// --- Ed25519 tests ---
+		{
+			"8-ed25519-keygen-sign-verify",
+			func(ctx context.Context) error {
+				kid := newKeyID()
+				kg, err := c0.KeygenWithCurve(ctx, kid, "ed25519")
+				if err != nil {
+					return fmt.Errorf("ed25519 keygen: %w", err)
+				}
+				pubKey, err := decodeHex(kg.PublicKey)
+				if err != nil || len(pubKey) != 32 {
+					return fmt.Errorf("invalid ed25519 pubkey: %s (len=%d)", kg.PublicKey, len(pubKey))
+				}
+				const msgHash = "0x0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20"
+				sg, err := c0.SignWithCurve(ctx, kid, msgHash, "ed25519")
+				if err != nil {
+					return fmt.Errorf("ed25519 sign: %w", err)
+				}
+				return VerifyEd25519Signature(sg.Signature, kg.PublicKey, msgHash)
+			},
+		},
+		{
+			"9-ed25519-cross-node",
+			func(ctx context.Context) error {
+				if len(clients) < 2 {
+					return fmt.Errorf("need at least 2 nodes")
+				}
+				kid := newKeyID()
+				kg, err := clients[0].KeygenWithCurve(ctx, kid, "ed25519")
+				if err != nil {
+					return fmt.Errorf("keygen: %w", err)
+				}
+				const msgHash = "0x3333333333333333333333333333333333333333333333333333333333333333"
+				sg, err := clients[1].SignWithCurve(ctx, kid, msgHash, "ed25519")
+				if err != nil {
+					return fmt.Errorf("sign: %w", err)
+				}
+				return VerifyEd25519Signature(sg.Signature, kg.PublicKey, msgHash)
+			},
+		},
+
 		// --- ECDSA tests ---
 		{
 			"10-ecdsa-keygen-sign-verify",

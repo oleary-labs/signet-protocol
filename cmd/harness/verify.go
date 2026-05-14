@@ -1,6 +1,7 @@
 package main
 
 import (
+	"crypto/ed25519"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
@@ -203,6 +204,36 @@ func equal(a, b []byte) bool {
 		}
 	}
 	return true
+}
+
+// VerifyEd25519Signature verifies a FROST Ed25519 signature (64-byte hex: R||Z)
+// against the group public key (32-byte hex) and the original message (32-byte hex hash).
+func VerifyEd25519Signature(sigHex, groupPubKeyHex, msgHashHex string) error {
+	sigBytes, err := decodeHex(sigHex)
+	if err != nil {
+		return fmt.Errorf("decode sig: %w", err)
+	}
+	if len(sigBytes) != 64 {
+		return fmt.Errorf("ed25519 sig must be 64 bytes, got %d", len(sigBytes))
+	}
+	pubKey, err := decodeHex(groupPubKeyHex)
+	if err != nil {
+		return fmt.Errorf("decode group key: %w", err)
+	}
+	if len(pubKey) != 32 {
+		return fmt.Errorf("ed25519 pubkey must be 32 bytes, got %d", len(pubKey))
+	}
+	msgHash, err := decodeHex(msgHashHex)
+	if err != nil {
+		return fmt.Errorf("decode msg hash: %w", err)
+	}
+	if len(msgHash) != 32 {
+		return fmt.Errorf("msg hash must be 32 bytes, got %d", len(msgHash))
+	}
+	if !ed25519.Verify(ed25519.PublicKey(pubKey), msgHash, sigBytes) {
+		return fmt.Errorf("ed25519 signature verification failed")
+	}
+	return nil
 }
 
 // IsValidCompressedPubkey returns true if s is a valid 33-byte compressed secp256k1 point.

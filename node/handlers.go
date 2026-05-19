@@ -1122,8 +1122,8 @@ func parseCurve(w http.ResponseWriter, raw string) (Curve, bool) {
 	if raw == "" {
 		raw = string(CurveSecp256k1)
 	}
-	c := Curve(raw)
-	if !c.Valid() {
+	c, ok := Curve(raw).Normalize()
+	if !ok {
 		httpError(w, http.StatusBadRequest, "unsupported curve: "+raw)
 		return "", false
 	}

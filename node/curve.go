@@ -9,9 +9,25 @@ const (
 	CurveEcdsaSecp256k1 Curve = "ecdsa_secp256k1"
 )
 
-// Valid returns true if c is a recognized curve.
+// Normalize resolves aliases to canonical curve names.
+// Returns the canonical Curve and true, or ("", false) if unrecognized.
+func (c Curve) Normalize() (Curve, bool) {
+	switch c {
+	case CurveSecp256k1, "frost_secp256k1":
+		return CurveSecp256k1, true
+	case CurveEd25519, "frost_ed25519":
+		return CurveEd25519, true
+	case CurveEcdsaSecp256k1:
+		return CurveEcdsaSecp256k1, true
+	default:
+		return "", false
+	}
+}
+
+// Valid returns true if c is a recognized curve (including aliases).
 func (c Curve) Valid() bool {
-	return c == CurveSecp256k1 || c == CurveEd25519 || c == CurveEcdsaSecp256k1
+	_, ok := c.Normalize()
+	return ok
 }
 
 // String returns the wire name (used in CBOR params and API responses).

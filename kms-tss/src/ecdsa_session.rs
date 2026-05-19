@@ -622,6 +622,22 @@ fn process_ecdsa(
                 return (EcdsaState::Completed, Err(ProcessError::Invalid("R is identity".into())));
             }
 
+            // Verify R_j consistency for all j > t+1: the remaining points
+            // must lie on the same degree-t polynomial. A malicious party
+            // sending an inconsistent R_j is detected here.
+            for j in (t + 1)..ordered_scalars.len() {
+                let expected = exponent_interpolation(
+                    &ordered_scalars[..t + 1],
+                    &big_r_ordered[..t + 1],
+                    Some(&ordered_scalars[j]),
+                );
+                if expected != big_r_ordered[j] {
+                    return (EcdsaState::Completed, Err(ProcessError::Invalid(
+                        format!("R_j inconsistent for party {}", ordered_ids[j])
+                    )));
+                }
+            }
+
             // Scalar interpolation of w using all n points (degree 2t, needs ≥ 2t+1).
             let w = scalar_interpolation(&ordered_scalars, &w_ordered, None);
             if bool::from(w.is_zero()) {
@@ -706,6 +722,20 @@ fn process_ecdsa(
                 None,
             );
 
+            // Verify W_j consistency for all j > t+1.
+            for j in (t + 1)..ordered_scalars.len() {
+                let expected = exponent_interpolation(
+                    &ordered_scalars[..t + 1],
+                    &big_w_ordered[..t + 1],
+                    Some(&ordered_scalars[j]),
+                );
+                if expected != big_w_ordered[j] {
+                    return (EcdsaState::Completed, Err(ProcessError::Invalid(
+                        format!("W_j inconsistent for party {}", ordered_ids[j])
+                    )));
+                }
+            }
+
             // Verify W == g^w
             if big_w != ProjectivePoint::GENERATOR * w {
                 return (EcdsaState::Completed, Err(ProcessError::Invalid("W != g^w".into())));
@@ -728,6 +758,13 @@ fn process_ecdsa(
                 .unwrap_or_else(|_| <Scalar as Reduce<U256>>::reduce_bytes(
                     k256::FieldBytes::from_slice(&params.message),
                 ));
+
+            // Reject zero hash — enables algebraic split-view attacks (NEAR analysis).
+            if bool::from(msg_hash.is_zero()) {
+                return (EcdsaState::Completed, Err(ProcessError::Invalid(
+                    "refusing to sign zero hash (algebraic attack vector)".into()
+                )));
+            }
 
             let beta_rx = beta_me * big_r_x + e_me;
             let s_me = msg_hash * alpha_me + beta_rx;

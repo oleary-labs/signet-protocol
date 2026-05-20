@@ -12,6 +12,7 @@ Signet: threshold signing protocol with a multi-scheme KMS. The Rust KMS (`kms-t
 The Go node (`signetd`) exposes an HTTP API on `/v1/*` with a `curve` parameter that selects the scheme. The stack also includes Foundry smart contracts, libp2p networking, and a ZK-based JWT authentication layer.
 
 For the canonical recent-changes summary, see `docs/TESTNET-1-CHANGES.md`.
+For the canonical curve-string reference (all consumers speak these strings to the HTTP API), see `docs/CURVES.md`.
 
 - Main module: `signet` (Go)
 - KMS (primary): `kms-tss/` — Rust gRPC service implementing FROST + ECDSA via `frost-core`, `frost-ed25519`, `frost-secp256k1`, `k256`

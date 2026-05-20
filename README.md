@@ -184,6 +184,8 @@ All endpoints speak JSON. Keygen and sign requests **block** until the protocol 
 
 Group membership and threshold are resolved from the chain — they are not passed in API requests.
 
+All keygen, sign, delegate, and key-lifecycle endpoints accept a `curve` parameter — one of `frost_secp256k1`, `frost_ed25519`, or `ecdsa_secp256k1`. See [`docs/CURVES.md`](docs/CURVES.md) for the canonical reference (per-curve algorithm, response shapes, picking guidance).
+
 ### `GET /v1/health`
 
 Liveness check.

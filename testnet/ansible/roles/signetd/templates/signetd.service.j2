@@ -3,8 +3,8 @@ Description=Signet threshold signing node
 After=network-online.target
 Wants=network-online.target
 {% if use_kms | default(false) %}
-After=kms-frost.service
-Requires=kms-frost.service
+After=kms-tss.service
+Requires=kms-tss.service
 {% endif %}
 
 [Service]

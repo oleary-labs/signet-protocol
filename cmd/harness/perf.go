@@ -6,8 +6,15 @@ import (
 	"sync"
 	"time"
 
+	"github.com/ethereum/go-ethereum/common"
+
 	"signet/cmd/harness/metrics"
 )
+
+// Test constants for scoped key perf scenarios.
+const scopedTestChainID = uint64(1)
+
+var scopedTestContract = common.HexToAddress("0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48")
 
 // PerfConfig controls a performance scenario run.
 type PerfConfig struct {
@@ -29,9 +36,9 @@ func RunPerf(ctx context.Context, clients []*Client, newKeyID func() string, cfg
 		return err
 	}
 
-	// 2. Concurrent keygen.
-	fmt.Println("\n  [concurrent-keygen]")
-	if err := runConcurrentOp(ctx, cfg, coll, "concurrent-keygen", "keygen", func() error {
+	// 2. Concurrent FROST keygen.
+	fmt.Println("\n  [concurrent-keygen-frost]")
+	if err := runConcurrentOp(ctx, cfg, coll, "concurrent-keygen-frost", "keygen", func() error {
 		c := ring.Next()
 		_, err := c.Keygen(ctx, newKeyID())
 		return err
@@ -39,14 +46,14 @@ func RunPerf(ctx context.Context, clients []*Client, newKeyID func() string, cfg
 		return err
 	}
 
-	// 3. Concurrent sign — pre-build key pool.
-	fmt.Println("\n  [concurrent-sign]")
+	// 3. Concurrent FROST sign.
+	fmt.Println("\n  [concurrent-sign-frost]")
 	pool, err := BuildKeyPool(ctx, ring, cfg.PoolSize, newKeyID)
 	if err != nil {
-		return fmt.Errorf("build key pool: %w", err)
+		return fmt.Errorf("build frost key pool: %w", err)
 	}
 	const signMsg = "0x0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20"
-	if err := runConcurrentOp(ctx, cfg, coll, "concurrent-sign", "sign", func() error {
+	if err := runConcurrentOp(ctx, cfg, coll, "concurrent-sign-frost", "sign", func() error {
 		c := ring.Next()
 		e := pool.Next()
 		_, err := c.Sign(ctx, e.KeyID, signMsg)
@@ -55,7 +62,52 @@ func RunPerf(ctx context.Context, clients []*Client, newKeyID func() string, cfg
 		return err
 	}
 
-	// 4. Mixed load.
+	// 4. Concurrent ECDSA keygen.
+	fmt.Println("\n  [concurrent-keygen-ecdsa]")
+	if err := runConcurrentOp(ctx, cfg, coll, "concurrent-keygen-ecdsa", "keygen", func() error {
+		c := ring.Next()
+		_, err := c.KeygenWithCurve(ctx, newKeyID(), "ecdsa_secp256k1")
+		return err
+	}); err != nil {
+		return err
+	}
+
+	// 5. Concurrent ECDSA sign.
+	fmt.Println("\n  [concurrent-sign-ecdsa]")
+	ecdsaPool, err := BuildKeyPoolWithCurve(ctx, ring, cfg.PoolSize, newKeyID, "ecdsa_secp256k1")
+	if err != nil {
+		return fmt.Errorf("build ecdsa key pool: %w", err)
+	}
+	if err := runConcurrentOp(ctx, cfg, coll, "concurrent-sign-ecdsa", "sign", func() error {
+		c := ring.Next()
+		e := ecdsaPool.Next()
+		_, err := c.SignWithCurve(ctx, e.KeyID, signMsg, "ecdsa_secp256k1")
+		return err
+	}); err != nil {
+		return err
+	}
+
+	// 6. Concurrent scoped ECDSA sign (EIP-712).
+	fmt.Println("\n  [concurrent-sign-scoped]")
+	scopedPool, err := BuildScopedKeyPool(ctx, ring, cfg.PoolSize, newKeyID)
+	if err != nil {
+		return fmt.Errorf("build scoped key pool: %w", err)
+	}
+	testTo := common.HexToAddress("0x1111111111111111111111111111111111111111")
+	if err := runConcurrentOp(ctx, cfg, coll, "concurrent-sign-scoped", "sign", func() error {
+		c := ring.Next()
+		e := scopedPool.Next()
+		typedData := BuildTestTypedData(scopedTestChainID, scopedTestContract, testTo, "1000000")
+		_, err := c.SignScoped(ctx, e.KeyID, "ecdsa_secp256k1", &SignPayload{
+			Scheme:    "eip712",
+			TypedData: typedData,
+		})
+		return err
+	}); err != nil {
+		return err
+	}
+
+	// 7. Mixed load (FROST + ECDSA).
 	fmt.Println("\n  [mixed-load]")
 	if err := runMixedLoad(ctx, ring, cfg, newKeyID, pool, signMsg, coll); err != nil {
 		return err

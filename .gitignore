@@ -30,6 +30,13 @@ go.work.sum
 # macOS
 .DS_Store
 
+# Node modules
+scripts/node_modules/
+scripts/package-lock.json
+
+# Solana test keypair (contains private key)
+scripts/.solana-test-keypair.json
+
 # Editor/IDE
 .idea/
 # .vscode/
@@ -43,6 +50,7 @@ settings.local.json
 
 # Test data
 /data/
+devnet/data/
 
 # Apalache model checker output
 _apalache-out/

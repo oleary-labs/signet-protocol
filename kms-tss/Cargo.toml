@@ -1,13 +1,16 @@
 [package]
-name = "kms-frost"
+name = "kms-tss"
 version = "0.1.0"
 edition = "2024"
 
 [dependencies]
 ciborium = "0.2"
+frost-core = "2.2"
+frost-ed25519 = "2.2"
 frost-secp256k1 = "2.2"
 hex = "0.4"
-k256 = { version = "0.13", features = ["arithmetic"] }
+k256 = { version = "0.13", features = ["arithmetic", "ecdsa"] }
+ecdsa = { version = "0.16", features = ["digest", "hazmat"] }
 prost = "0.13"
 rand = "0.8"
 serde = { version = "1", features = ["derive"] }

@@ -22,17 +22,17 @@
         state: stopped
       when: action == "stop"
 
-    - name: Stop kms-frost
+    - name: Stop kms-tss
       systemd:
-        name: kms-frost
+        name: kms-tss
         state: stopped
       when: action == "stop" and use_kms | default(false) | bool
       failed_when: false
 
     # ---- Start ----
-    - name: Start kms-frost
+    - name: Start kms-tss
       systemd:
-        name: kms-frost
+        name: kms-tss
         state: started
       when: action == "start" and use_kms | default(false) | bool
 
@@ -43,9 +43,9 @@
       when: action == "start"
 
     # ---- Restart ----
-    - name: Restart kms-frost
+    - name: Restart kms-tss
       systemd:
-        name: kms-frost
+        name: kms-tss
         state: restarted
       when: action == "restart" and use_kms | default(false) | bool
 
@@ -68,14 +68,14 @@
         msg: "{{ status_out.stdout_lines }}"
       when: action | default("status") == "status" and status_out is defined
 
-    - name: Check kms-frost status
-      command: systemctl status kms-frost --no-pager
+    - name: Check kms-tss status
+      command: systemctl status kms-tss --no-pager
       register: kms_status_out
       changed_when: false
       failed_when: false
       when: action | default("status") == "status" and use_kms | default(false) | bool
 
-    - name: Show kms-frost status
+    - name: Show kms-tss status
       debug:
         msg: "{{ kms_status_out.stdout_lines }}"
       when: action | default("status") == "status" and use_kms | default(false) | bool and kms_status_out is defined
@@ -93,13 +93,13 @@
       when: action == "logs" and log_out is defined
 
     # ---- KMS Logs ----
-    - name: Fetch recent kms-frost logs
-      command: journalctl -u kms-frost --no-pager -n {{ log_lines | default(50) }}
+    - name: Fetch recent kms-tss logs
+      command: journalctl -u kms-tss --no-pager -n {{ log_lines | default(50) }}
       register: kms_log_out
       changed_when: false
       when: action == "logs-kms"
 
-    - name: Show kms-frost logs
+    - name: Show kms-tss logs
       debug:
         msg: "{{ kms_log_out.stdout_lines }}"
       when: action == "logs-kms" and kms_log_out is defined
@@ -112,9 +112,9 @@
       when: action == "clean"
       failed_when: false
 
-    - name: Stop kms-frost before clean
+    - name: Stop kms-tss before clean
       systemd:
-        name: kms-frost
+        name: kms-tss
         state: stopped
       when: action == "clean" and use_kms | default(false) | bool
       failed_when: false

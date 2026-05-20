@@ -155,7 +155,7 @@ func TestSigEthereumEcrecover(t *testing.T) {
 	v := ethSig[64]
 
 	// c = FROST challenge H2(R_compressed || groupKey || msgHash)
-	c := frostChallenge(sig.R[:], groupKey, msgHash)
+	c := frostChallenge(sig.R, groupKey, msgHash)
 	if c.Sign() == 0 {
 		t.Fatal("challenge c is zero")
 	}

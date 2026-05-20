@@ -52,3 +52,12 @@ func ReversePartyMap(pm map[PartyID]uint16) map[uint16]PartyID {
 	}
 	return m
 }
+
+// PartyIDsToStrings returns a new []string with each PartyID converted via string().
+func PartyIDsToStrings(ids []PartyID) []string {
+	out := make([]string, len(ids))
+	for i, p := range ids {
+		out[i] = string(p)
+	}
+	return out
+}

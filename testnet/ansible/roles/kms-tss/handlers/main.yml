@@ -4,8 +4,8 @@
   systemd:
     daemon_reload: true
 
-- name: restart kms-frost
+- name: restart kms-tss
   become: true
   systemd:
-    name: kms-frost
+    name: kms-tss
     state: restarted

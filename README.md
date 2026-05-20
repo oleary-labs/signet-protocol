@@ -35,7 +35,7 @@ cmd/harness/       — multi-node test harness (correctness + performance)
 cmd/zkbench/       — ZK proof benchmark tool
 node/              — HTTP API, coordinator, chain client, auth
 tss/               — FROST adapter (keygen/sign round runner, Go fallback path)
-kms-frost/         — Rust KMS: ZF FROST keygen/signing over gRPC (production default)
+kms-tss/         — Rust KMS: ZF FROST keygen/signing over gRPC (production default)
 kms/               — gRPC client and generated protobuf (Go side)
 network/           — libp2p host + session network
 contracts/         — Solidity (Foundry): SignetFactory, SignetGroup
@@ -57,10 +57,10 @@ cd signet-protocol
 go build ./cmd/signetd/
 
 # Build the Rust KMS (production default)
-cd kms-frost && cargo build --release
+cd kms-tss && cargo build --release
 ```
 
-The node binary is `./signetd`. The KMS binary is `kms-frost/target/release/kms-frost`.
+The node binary is `./signetd`. The KMS binary is `kms-tss/target/release/kms-tss`.
 
 To run without the Rust KMS (in-process Go FROST, for development), pass `--no-kms` to the devnet scripts or omit `kms_socket` from the node config.
 
@@ -96,7 +96,7 @@ eth_rpc:          ""                           # e.g. http://localhost:8545
 factory_address:  ""                           # SignetFactory contract address (0x...)
 
 # KMS (Rust FROST process)
-kms_socket:       ""                           # Unix socket path to kms-frost; empty = in-process Go FROST
+kms_socket:       ""                           # Unix socket path to kms-tss; empty = in-process Go FROST
 
 # Auth options
 vk_path:          ""                           # path to circuit verification key (required for ZK auth)
@@ -183,6 +183,8 @@ All endpoints speak JSON. Keygen and sign requests **block** until the protocol 
 **A client only needs to contact one node.** The receiving node coordinates with the other group members over the internal `/signet/coord/1.0.0` libp2p protocol.
 
 Group membership and threshold are resolved from the chain — they are not passed in API requests.
+
+All keygen, sign, delegate, and key-lifecycle endpoints accept a `curve` parameter — one of `frost_secp256k1`, `frost_ed25519`, or `ecdsa_secp256k1`. See [`docs/CURVES.md`](docs/CURVES.md) for the canonical reference (per-curve algorithm, response shapes, picking guidance).
 
 ### `GET /v1/health`
 
@@ -482,7 +484,7 @@ All protocol messages travel over direct libp2p streams using a session-scoped p
 
 ### Cryptography
 
-FROST (RFC 9591) on secp256k1, implemented via ZcashFoundation/frost (Rust). The production path runs FROST keygen and signing in a dedicated Rust KMS process (`kms-frost`) connected to the Go node over a gRPC Unix domain socket. A Go fallback path (`--no-kms`) using `bytemare/frost` is retained for development.
+FROST (RFC 9591) on secp256k1, implemented via ZcashFoundation/frost (Rust). The production path runs FROST keygen and signing in a dedicated Rust KMS process (`kms-tss`) connected to the Go node over a gRPC Unix domain socket. A Go fallback path (`--no-kms`) using `bytemare/frost` is retained for development.
 
 See [docs/KMS-INTEGRATION.md](docs/KMS-INTEGRATION.md) for the KMS architecture, bug fixes, and performance comparison.
 

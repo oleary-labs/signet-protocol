@@ -210,10 +210,10 @@ func TestKeygenAndSign(t *testing.T) {
 		Z:     g.NewScalar(),
 		Group: g,
 	}
-	if err := frostSig.R.Decode(sig.R[:]); err != nil {
+	if err := frostSig.R.Decode(sig.R); err != nil {
 		t.Fatalf("decode R: %v", err)
 	}
-	if err := frostSig.Z.Decode(sig.Z[:]); err != nil {
+	if err := frostSig.Z.Decode(sig.Z); err != nil {
 		t.Fatalf("decode Z: %v", err)
 	}
 	if err := frost.VerifySignature(frost.Secp256k1, msg, frostSig, vk); err != nil {
@@ -776,10 +776,10 @@ func verifySignature(t *testing.T, sig *Signature, groupKey []byte, msg []byte) 
 		Z:     g.NewScalar(),
 		Group: g,
 	}
-	if err := frostSig.R.Decode(sig.R[:]); err != nil {
+	if err := frostSig.R.Decode(sig.R); err != nil {
 		t.Fatalf("decode R: %v", err)
 	}
-	if err := frostSig.Z.Decode(sig.Z[:]); err != nil {
+	if err := frostSig.Z.Decode(sig.Z); err != nil {
 		t.Fatalf("decode Z: %v", err)
 	}
 	if err := frost.VerifySignature(frost.Secp256k1, msg, frostSig, vk); err != nil {

@@ -494,6 +494,21 @@ type AuthProof struct {
 	AuthKeyPub    []byte `cbor:"14,keyasint,omitempty"` // 34-byte scheme-prefixed key (prefix + compressed pubkey)
 	CertSignature []byte `cbor:"15,keyasint,omitempty"` // 64 bytes (ECDSA) or 65 bytes (Schnorr)
 	Identity      string `cbor:"16,keyasint,omitempty"` // application-defined identity
+
+	// Delegation token (delegation path only).
+	DelegationToken string `cbor:"17,keyasint,omitempty"`
+}
+
+// SessionAuth is a lightweight credential carried in keygen/sign/delegate
+// coord messages. It proves the caller has an active session by signing
+// the request with the ephemeral session key. Participants look up the
+// session pub in their local cache (established via msgAuth) and verify
+// the request signature — no ZK re-verification needed.
+type SessionAuth struct {
+	SessionPub []byte `cbor:"1,keyasint"` // 33-byte compressed secp256k1
+	RequestSig []byte `cbor:"2,keyasint"` // 64-byte [R || S]
+	Nonce      string `cbor:"3,keyasint"`
+	Timestamp  uint64 `cbor:"4,keyasint"`
 }
 
 // SessionClaims holds the full set of claims extracted from a JWT, used to

@@ -42,6 +42,14 @@ service KeyManager {
 
   // ListKeys returns all key IDs stored for a group.
   rpc ListKeys(GroupRef) returns (KeyListResponse);
+
+  // Key lifecycle -------------------------------------------------------------
+
+  // SetKeyStatus changes a key's status (active ↔ disabled).
+  rpc SetKeyStatus(SetKeyStatusRequest) returns (SetKeyStatusResponse);
+
+  // DeleteKey permanently removes a key from storage.
+  rpc DeleteKey(KeyRef) returns (DeleteKeyResponse);
 }
 
 // ---------------------------------------------------------------------------
@@ -134,6 +142,7 @@ message AbortSessionResponse {}
 message KeyRef {
   bytes  group_id = 1; // 32-byte group identifier
   string key_id   = 2;
+  string curve    = 3; // "secp256k1" or "ed25519"; empty defaults to "secp256k1"
 }
 
 message GroupRef {
@@ -141,13 +150,20 @@ message GroupRef {
 }
 
 message PublicKeyResponse {
-  bytes  group_key       = 1; // 33-byte compressed secp256k1 point
+  bytes  group_key       = 1; // compressed group public key (33 bytes secp256k1, 32 bytes Ed25519)
   bytes  verifying_share = 2; // this node's public key share
   uint64 generation      = 3;
+  bytes  scope           = 4; // signing scope constraint (empty = unscoped)
+  string status          = 5; // "active" or "disabled" (empty = active for backwards compat)
+}
+
+message KeyListEntry {
+  string key_id = 1;
+  string curve  = 2; // "secp256k1" or "ed25519"
 }
 
 message KeyListResponse {
-  repeated string key_ids = 1;
+  repeated KeyListEntry entries = 1;
 }
 
 // ---------------------------------------------------------------------------
@@ -164,6 +180,22 @@ message RollbackReshareRequest {
   bytes  group_id   = 1;
   string key_id     = 2;
   uint64 generation = 3; // target generation to restore
+  string curve      = 4; // "secp256k1" or "ed25519"; empty defaults to "secp256k1"
 }
 
 message RollbackReshareResponse {}
+
+// ---------------------------------------------------------------------------
+// Key lifecycle
+// ---------------------------------------------------------------------------
+
+message SetKeyStatusRequest {
+  bytes  group_id = 1;
+  string key_id   = 2;
+  string curve    = 3;
+  string status   = 4; // "active" or "disabled"
+}
+
+message SetKeyStatusResponse {}
+
+message DeleteKeyResponse {}

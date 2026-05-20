@@ -64,7 +64,7 @@ func (m *mockKeyManager) RunReshare(ctx context.Context, p ReshareParams) (*Resh
 	return &ReshareResult{OldOnly: false, Generation: 1}, nil
 }
 
-func (m *mockKeyManager) GetKeyInfo(groupID, keyID string) (*KeyInfo, error) {
+func (m *mockKeyManager) GetKeyInfo(groupID, keyID string, _ Curve) (*KeyInfo, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	for _, k := range m.keys[groupID] {
@@ -75,11 +75,13 @@ func (m *mockKeyManager) GetKeyInfo(groupID, keyID string) (*KeyInfo, error) {
 	return nil, nil
 }
 
-func (m *mockKeyManager) ListKeys(groupID string) ([]string, error) {
+func (m *mockKeyManager) ListKeys(groupID string) ([]KeyEntry, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	out := make([]string, len(m.keys[groupID]))
-	copy(out, m.keys[groupID])
+	out := make([]KeyEntry, len(m.keys[groupID]))
+	for i, k := range m.keys[groupID] {
+		out[i] = KeyEntry{KeyID: k, Curve: CurveSecp256k1}
+	}
 	return out, nil
 }
 
@@ -93,10 +95,12 @@ func (m *mockKeyManager) ListGroups() ([]string, error) {
 	return out, nil
 }
 
-func (m *mockKeyManager) CommitReshare(groupID, keyID string) error               { return nil }
-func (m *mockKeyManager) DiscardPendingReshare(groupID, keyID string) error       { return nil }
-func (m *mockKeyManager) RollbackReshare(groupID, keyID string, gen uint64) error { return nil }
-func (m *mockKeyManager) Close() error                                            { return nil }
+func (m *mockKeyManager) CommitReshare(groupID, keyID string, _ Curve) error               { return nil }
+func (m *mockKeyManager) DiscardPendingReshare(groupID, keyID string, _ Curve) error       { return nil }
+func (m *mockKeyManager) RollbackReshare(groupID, keyID string, _ Curve, gen uint64) error { return nil }
+func (m *mockKeyManager) SetKeyStatus(groupID, keyID string, _ Curve, status string) error { return nil }
+func (m *mockKeyManager) DeleteKey(groupID, keyID string, _ Curve) error                   { return nil }
+func (m *mockKeyManager) Close() error                                                     { return nil }
 
 var _ KeyManager = (*mockKeyManager)(nil)
 
@@ -572,7 +576,7 @@ func TestNode_RunReshareSession_ErrorClosesChannel(t *testing.T) {
 	// Run the session — should fail immediately with "no reshare job".
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	err := n.runReshareSession(ctx, groupID, "k1")
+	err := n.runReshareSession(ctx, groupID, "k1", CurveSecp256k1)
 	if err == nil {
 		t.Fatal("expected error")
 	}

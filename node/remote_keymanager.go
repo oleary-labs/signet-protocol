@@ -50,6 +50,42 @@ func NewRemoteKeyManager(ctx context.Context, socket string, selfID tss.PartyID,
 	}, nil
 }
 
+// runSession dispatches an encoded session to the KMS: StartSession, forward
+// the initial outgoing messages to peers, then bridge the bidi stream until
+// the KMS returns a final SessionResult. Returns an error if the result is
+// missing. label is used for error wrapping ("keygen", "sign", "reshare").
+func (rkm *RemoteKeyManager) runSession(
+	ctx context.Context,
+	label string,
+	sessionID string,
+	sessionType kmspb.SessionType,
+	params []byte,
+	sn interface {
+		Send(msg *tss.Message)
+		Incoming() <-chan *tss.Message
+	},
+) (*kmspb.SessionResult, error) {
+	resp, err := rkm.client.StartSession(ctx, &kmspb.StartSessionRequest{
+		SessionId: sessionID,
+		Type:      sessionType,
+		Params:    params,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("start %s session: %w", label, err)
+	}
+	for _, out := range resp.Outgoing {
+		sn.Send(protoToTSSMessage(out))
+	}
+	result, err := rkm.bridgeSession(ctx, sessionID, sn)
+	if err != nil {
+		return nil, fmt.Errorf("%s session: %w", label, err)
+	}
+	if result == nil {
+		return nil, fmt.Errorf("%s session: no result returned", label)
+	}
+	return result, nil
+}
+
 // RunKeygen starts a keygen session on the KMS and bridges the libp2p session
 // network with the KMS's ProcessMessage stream.
 func (rkm *RemoteKeyManager) RunKeygen(ctx context.Context, p KeygenParams) (*KeyInfo, error) {
@@ -57,30 +93,14 @@ func (rkm *RemoteKeyManager) RunKeygen(ctx context.Context, p KeygenParams) (*Ke
 	if err != nil {
 		return nil, fmt.Errorf("encode keygen params: %w", err)
 	}
-	resp, err := rkm.client.StartSession(ctx, &kmspb.StartSessionRequest{
-		SessionId: p.SessionID,
-		Type:      kmspb.SessionType_SESSION_TYPE_KEYGEN,
-		Params:    params,
-	})
+	result, err := rkm.runSession(ctx, "keygen", p.SessionID, kmspb.SessionType_SESSION_TYPE_KEYGEN, params, p.SN)
 	if err != nil {
-		return nil, fmt.Errorf("start keygen session: %w", err)
+		return nil, err
 	}
-
-	// Forward initial outgoing messages from KMS to peers.
-	for _, out := range resp.Outgoing {
-		p.SN.Send(protoToTSSMessage(out))
-	}
-
-	result, err := rkm.bridgeSession(ctx, p.SessionID, p.SN)
-	if err != nil {
-		return nil, fmt.Errorf("keygen session: %w", err)
-	}
-	if result == nil {
-		return nil, fmt.Errorf("keygen session: no result returned")
-	}
-
 	return &KeyInfo{
 		GroupKey: result.GroupKey,
+		Curve:    p.Curve,
+		Scope:    p.Scope,
 	}, nil
 }
 
@@ -90,34 +110,18 @@ func (rkm *RemoteKeyManager) RunSign(ctx context.Context, p SignParams) (*tss.Si
 	if err != nil {
 		return nil, fmt.Errorf("encode sign params: %w", err)
 	}
-	resp, err := rkm.client.StartSession(ctx, &kmspb.StartSessionRequest{
-		SessionId: p.SessionID,
-		Type:      kmspb.SessionType_SESSION_TYPE_SIGN,
-		Params:    params,
-	})
+	result, err := rkm.runSession(ctx, "sign", p.SessionID, kmspb.SessionType_SESSION_TYPE_SIGN, params, p.SN)
 	if err != nil {
-		return nil, fmt.Errorf("start sign session: %w", err)
+		return nil, err
 	}
-
-	for _, out := range resp.Outgoing {
-		p.SN.Send(protoToTSSMessage(out))
-	}
-
-	result, err := rkm.bridgeSession(ctx, p.SessionID, p.SN)
-	if err != nil {
-		return nil, fmt.Errorf("sign session: %w", err)
-	}
-	if result == nil {
-		return nil, fmt.Errorf("sign session: no result returned")
-	}
-	if len(result.SignatureR) != 33 || len(result.SignatureZ) != 32 {
-		return nil, fmt.Errorf("sign session: invalid signature sizes R=%d Z=%d", len(result.SignatureR), len(result.SignatureZ))
-	}
-
-	var sig tss.Signature
-	copy(sig.R[:], result.SignatureR)
-	copy(sig.Z[:], result.SignatureZ)
-	return &sig, nil
+	// For FROST, all participants produce the same signature.
+	// For threshold ECDSA, only the coordinator produces a signature —
+	// participants return empty R/Z after sending their share.
+	// Both cases: return whatever the KMS produced.
+	return &tss.Signature{
+		R: result.SignatureR,
+		Z: result.SignatureZ,
+	}, nil
 }
 
 // RunReshare starts a reshare session on the KMS and bridges messages.
@@ -126,27 +130,10 @@ func (rkm *RemoteKeyManager) RunReshare(ctx context.Context, p ReshareParams) (*
 	if err != nil {
 		return nil, fmt.Errorf("encode reshare params: %w", err)
 	}
-	resp, err := rkm.client.StartSession(ctx, &kmspb.StartSessionRequest{
-		SessionId: p.SessionID,
-		Type:      kmspb.SessionType_SESSION_TYPE_RESHARE,
-		Params:    params,
-	})
+	result, err := rkm.runSession(ctx, "reshare", p.SessionID, kmspb.SessionType_SESSION_TYPE_RESHARE, params, p.SN)
 	if err != nil {
-		return nil, fmt.Errorf("start reshare session: %w", err)
+		return nil, err
 	}
-
-	for _, out := range resp.Outgoing {
-		p.SN.Send(protoToTSSMessage(out))
-	}
-
-	result, err := rkm.bridgeSession(ctx, p.SessionID, p.SN)
-	if err != nil {
-		return nil, fmt.Errorf("reshare session: %w", err)
-	}
-	if result == nil {
-		return nil, fmt.Errorf("reshare session: no result returned")
-	}
-
 	// If group_key is returned but no verifying_share, this is an old-only party.
 	oldOnly := len(result.VerifyingShare) == 0
 	return &ReshareResult{
@@ -156,43 +143,47 @@ func (rkm *RemoteKeyManager) RunReshare(ctx context.Context, p ReshareParams) (*
 }
 
 // CommitReshare promotes a pending reshare result to active in the KMS.
-func (rkm *RemoteKeyManager) CommitReshare(groupID, keyID string) error {
+func (rkm *RemoteKeyManager) CommitReshare(groupID, keyID string, curve Curve) error {
 	gid, _ := hex.DecodeString(strings.TrimPrefix(groupID, "0x"))
 	_, err := rkm.client.CommitReshare(context.Background(), &kmspb.KeyRef{
 		GroupId: gid,
 		KeyId:   keyID,
+		Curve:   string(curve),
 	})
 	return err
 }
 
 // DiscardPendingReshare removes a pending reshare result in the KMS.
-func (rkm *RemoteKeyManager) DiscardPendingReshare(groupID, keyID string) error {
+func (rkm *RemoteKeyManager) DiscardPendingReshare(groupID, keyID string, curve Curve) error {
 	gid, _ := hex.DecodeString(strings.TrimPrefix(groupID, "0x"))
 	_, err := rkm.client.DiscardPendingReshare(context.Background(), &kmspb.KeyRef{
 		GroupId: gid,
 		KeyId:   keyID,
+		Curve:   string(curve),
 	})
 	return err
 }
 
 // RollbackReshare restores a previous generation as active in the KMS.
-func (rkm *RemoteKeyManager) RollbackReshare(groupID, keyID string, generation uint64) error {
+func (rkm *RemoteKeyManager) RollbackReshare(groupID, keyID string, curve Curve, generation uint64) error {
 	gid, _ := hex.DecodeString(strings.TrimPrefix(groupID, "0x"))
 	_, err := rkm.client.RollbackReshare(context.Background(), &kmspb.RollbackReshareRequest{
 		GroupId:    gid,
 		KeyId:      keyID,
 		Generation: generation,
+		Curve:      string(curve),
 	})
 	return err
 }
 
 // GetKeyInfo returns public metadata for a stored key.
 // Returns (nil, nil) if the key does not exist (matching KeyManager contract).
-func (rkm *RemoteKeyManager) GetKeyInfo(groupID, keyID string) (*KeyInfo, error) {
+func (rkm *RemoteKeyManager) GetKeyInfo(groupID, keyID string, curve Curve) (*KeyInfo, error) {
 	gid, _ := hex.DecodeString(strings.TrimPrefix(groupID, "0x"))
 	resp, err := rkm.client.GetPublicKey(context.Background(), &kmspb.KeyRef{
 		GroupId: gid,
 		KeyId:   keyID,
+		Curve:   string(curve),
 	})
 	if err != nil {
 		if st, ok := grpcstatus.FromError(err); ok && st.Code() == codes.NotFound {
@@ -200,14 +191,44 @@ func (rkm *RemoteKeyManager) GetKeyInfo(groupID, keyID string) (*KeyInfo, error)
 		}
 		return nil, err
 	}
+	status := resp.Status
+	if status == "" {
+		status = "active" // backwards compat with KMS that doesn't return status
+	}
 	return &KeyInfo{
 		GroupKey: resp.GroupKey,
 		PartyID:  rkm.selfID,
+		Curve:    curve,
+		Scope:    resp.Scope,
+		Status:   status,
 	}, nil
 }
 
-// ListKeys returns all key IDs stored under groupID.
-func (rkm *RemoteKeyManager) ListKeys(groupID string) ([]string, error) {
+// SetKeyStatus changes a key's status (active ↔ disabled).
+func (rkm *RemoteKeyManager) SetKeyStatus(groupID, keyID string, curve Curve, status string) error {
+	gid, _ := hex.DecodeString(strings.TrimPrefix(groupID, "0x"))
+	_, err := rkm.client.SetKeyStatus(context.Background(), &kmspb.SetKeyStatusRequest{
+		GroupId: gid,
+		KeyId:   keyID,
+		Curve:   string(curve),
+		Status:  status,
+	})
+	return err
+}
+
+// DeleteKey permanently removes a key from storage.
+func (rkm *RemoteKeyManager) DeleteKey(groupID, keyID string, curve Curve) error {
+	gid, _ := hex.DecodeString(strings.TrimPrefix(groupID, "0x"))
+	_, err := rkm.client.DeleteKey(context.Background(), &kmspb.KeyRef{
+		GroupId: gid,
+		KeyId:   keyID,
+		Curve:   string(curve),
+	})
+	return err
+}
+
+// ListKeys returns all keys stored under groupID with their curves.
+func (rkm *RemoteKeyManager) ListKeys(groupID string) ([]KeyEntry, error) {
 	gid, _ := hex.DecodeString(strings.TrimPrefix(groupID, "0x"))
 	resp, err := rkm.client.ListKeys(context.Background(), &kmspb.GroupRef{
 		GroupId: gid,
@@ -215,7 +236,11 @@ func (rkm *RemoteKeyManager) ListKeys(groupID string) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	return resp.KeyIds, nil
+	entries := make([]KeyEntry, len(resp.Entries))
+	for i, e := range resp.Entries {
+		entries[i] = KeyEntry{KeyID: e.KeyId, Curve: Curve(e.Curve)}
+	}
+	return entries, nil
 }
 
 // ListGroups is not directly supported by the KMS proto; returns an error.
@@ -362,11 +387,13 @@ func protoToTSSMessage(pm *kmspb.SessionMessage) *tss.Message {
 
 // kmsKeygenParams is the CBOR wire format for keygen session params.
 type kmsKeygenParams struct {
-	GroupID  string   `cbor:"group_id"`
-	KeyID    string   `cbor:"key_id"`
-	PartyID  string   `cbor:"party_id"`
-	PartyIDs []string `cbor:"party_ids"`
-	Threshold int     `cbor:"threshold"`
+	GroupID   string   `cbor:"group_id"`
+	KeyID     string   `cbor:"key_id"`
+	PartyID   string   `cbor:"party_id"`
+	PartyIDs  []string `cbor:"party_ids"`
+	Threshold int      `cbor:"threshold"`
+	Curve     string   `cbor:"curve,omitempty"`
+	Scope     []byte   `cbor:"scope,omitempty"`
 }
 
 // kmsSignParams is the CBOR wire format for sign session params.
@@ -376,62 +403,52 @@ type kmsSignParams struct {
 	PartyID     string   `cbor:"party_id"`
 	SignerIDs   []string `cbor:"signer_ids"`
 	MessageHash []byte   `cbor:"message"`
+	Curve       string   `cbor:"curve,omitempty"`
 }
 
 func encodeKeygenParams(p KeygenParams) ([]byte, error) {
-	partyIDs := make([]string, len(p.Parties))
-	for i, pid := range p.Parties {
-		partyIDs[i] = string(pid)
-	}
 	return cbor.Marshal(&kmsKeygenParams{
 		GroupID:   p.GroupID,
 		KeyID:     p.KeyID,
 		PartyID:   string(p.Host.Self()),
-		PartyIDs:  partyIDs,
+		PartyIDs:  tss.PartyIDsToStrings(p.Parties),
 		Threshold: p.Threshold,
+		Curve:     string(p.Curve),
+		Scope:     p.Scope,
 	})
 }
 
 func encodeSignParams(p SignParams) ([]byte, error) {
-	signerIDs := make([]string, len(p.Signers))
-	for i, pid := range p.Signers {
-		signerIDs[i] = string(pid)
-	}
 	return cbor.Marshal(&kmsSignParams{
 		GroupID:     p.GroupID,
 		KeyID:       p.KeyID,
 		PartyID:     string(p.Host.Self()),
-		SignerIDs:   signerIDs,
+		SignerIDs:   tss.PartyIDsToStrings(p.Signers),
 		MessageHash: p.MessageHash,
+		Curve:       string(p.Curve),
 	})
 }
 
 // kmsReshareParams is the CBOR wire format for reshare session params.
 type kmsReshareParams struct {
-	GroupID     string   `cbor:"group_id"`
-	KeyID       string   `cbor:"key_id"`
-	PartyID     string   `cbor:"party_id"`
-	OldPartyIDs []string `cbor:"old_party_ids"`
-	NewPartyIDs []string `cbor:"new_party_ids"`
-	NewThreshold int     `cbor:"new_threshold"`
+	GroupID      string   `cbor:"group_id"`
+	KeyID        string   `cbor:"key_id"`
+	PartyID      string   `cbor:"party_id"`
+	OldPartyIDs  []string `cbor:"old_party_ids"`
+	NewPartyIDs  []string `cbor:"new_party_ids"`
+	NewThreshold int      `cbor:"new_threshold"`
+	Curve        string   `cbor:"curve,omitempty"`
 }
 
 func encodeReshareParams(p ReshareParams) ([]byte, error) {
-	oldIDs := make([]string, len(p.OldParties))
-	for i, pid := range p.OldParties {
-		oldIDs[i] = string(pid)
-	}
-	newIDs := make([]string, len(p.NewParties))
-	for i, pid := range p.NewParties {
-		newIDs[i] = string(pid)
-	}
 	return cbor.Marshal(&kmsReshareParams{
 		GroupID:      p.GroupID,
 		KeyID:        p.KeyID,
 		PartyID:      string(p.Host.Self()),
-		OldPartyIDs:  oldIDs,
-		NewPartyIDs:  newIDs,
+		OldPartyIDs:  tss.PartyIDsToStrings(p.OldParties),
+		NewPartyIDs:  tss.PartyIDsToStrings(p.NewParties),
 		NewThreshold: p.NewThreshold,
+		Curve:        string(p.Curve),
 	})
 }
 

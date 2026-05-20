@@ -39,7 +39,7 @@ The cluster spec supersedes the lifecycle spec for reasoning about hardening-doc
 | ReshareJob storage (bbolt) | Not started | -- |
 | `/v1/reshare` API endpoints | Not started | -- |
 | Stale key check in sign handler | Not started | -- |
-| KMS reshare | Stub | `kms-frost/src/service.rs` |
+| KMS reshare | Stub | `kms-tss/src/service.rs` |
 
 ---
 

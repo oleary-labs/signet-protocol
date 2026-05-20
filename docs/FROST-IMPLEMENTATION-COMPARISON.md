@@ -1,7 +1,7 @@
 # FROST Implementation Comparison: bytemare/frost vs ZcashFoundation/frost
 
 > **Historical document — decision made.** ZcashFoundation/frost (Rust) was selected and
-> is now the production implementation via the `kms-frost` process. `bytemare/frost` (Go)
+> is now the production implementation via the `kms-tss` process. `bytemare/frost` (Go)
 > is retained as a development/testing fallback (`--no-kms`). This comparison is kept for
 > context on the decision rationale. The reshare analysis remains relevant — **reshare is
 > a priority roadmap item** and will be implemented in the Rust KMS using the

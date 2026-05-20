@@ -218,9 +218,10 @@ func (r *signAggregateRound) Finalize() ([]*Message, Round, interface{}, error) 
 	rBytes := frostSig.R.Encode() // 33 bytes for secp256k1
 	zBytes := frostSig.Z.Encode() // 32 bytes for secp256k1
 
-	var sig Signature
-	copy(sig.R[:], rBytes)
-	copy(sig.Z[:], zBytes)
+	sig := Signature{
+		R: rBytes,
+		Z: zBytes,
+	}
 
 	return nil, nil, &sig, nil
 }

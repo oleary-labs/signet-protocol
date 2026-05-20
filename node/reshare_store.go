@@ -31,7 +31,7 @@ type ReshareJob struct {
 	NewParties   []tss.PartyID            `json:"new_parties"`
 	OldThreshold int                      `json:"old_threshold"`
 	NewThreshold int                      `json:"new_threshold"`
-	KeysTotal    []string                 `json:"keys_total"`
+	KeysTotal    []KeyEntry               `json:"keys_total"`
 	StartedAt    time.Time                `json:"started_at"`
 	EventType    string                   `json:"event_type"` // "node_added" | "node_removed"
 	DeferredEvents []DeferredMembershipEvent `json:"deferred_events,omitempty"`

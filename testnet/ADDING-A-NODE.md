@@ -98,7 +98,7 @@ Edit `testnet/ansible/inventory.yml` and add the new node:
 ```bash
 cd testnet/ansible
 
-# Deploy signetd + kms-frost + bb to the new node only
+# Deploy signetd + kms-tss + bb to the new node only
 FACTORY_ADDRESS=0xB4c55139db4ad9c481DAA82B249F934CBbB73b91 \
 SEPOLIA_RPC_URL=https://... \
 ansible-playbook deploy.yml -l node4
@@ -160,7 +160,7 @@ reshare redistributes key shares to include the new node within seconds.
 If you're not using Ansible, see the deploy playbook and role templates
 for the exact steps:
 - `roles/signetd/tasks/main.yml` — binary, config, systemd
-- `roles/kms-frost/tasks/main.yml` — KMS binary, systemd
+- `roles/kms-tss/tasks/main.yml` — KMS binary, systemd
 - `roles/bb/tasks/main.yml` — Barretenberg installation
 - `roles/signetd/templates/config.yaml.j2` — node config with bootstrap peers
 - `roles/signetd/templates/signetd.service.j2` — systemd unit (note `HOME=/opt/signet`)

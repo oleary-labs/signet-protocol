@@ -27,22 +27,30 @@ type KeyManager interface {
 
 	// CommitReshare promotes a pending reshare result to active, archiving
 	// the previous active version. No-op if nothing is pending.
-	CommitReshare(groupID, keyID string) error
+	CommitReshare(groupID, keyID string, curve Curve) error
 
 	// DiscardPendingReshare removes a pending reshare result without
 	// promoting it. The active key is untouched.
-	DiscardPendingReshare(groupID, keyID string) error
+	DiscardPendingReshare(groupID, keyID string, curve Curve) error
 
 	// RollbackReshare restores a previous version as the active key.
 	// Used when a retry discovers partial commit across the committee.
-	RollbackReshare(groupID, keyID string, generation uint64) error
+	RollbackReshare(groupID, keyID string, curve Curve, generation uint64) error
 
 	// GetKeyInfo returns public metadata for a stored key shard, or
-	// (nil, nil) if the key does not exist.
-	GetKeyInfo(groupID, keyID string) (*KeyInfo, error)
+	// (nil, nil) if the key does not exist. Curve is required to
+	// identify the correct key when the same key_id exists for
+	// multiple curves.
+	GetKeyInfo(groupID, keyID string, curve Curve) (*KeyInfo, error)
 
-	// ListKeys returns all key IDs stored under groupID.
-	ListKeys(groupID string) ([]string, error)
+	// ListKeys returns all keys stored under groupID, each with its curve.
+	ListKeys(groupID string) ([]KeyEntry, error)
+
+	// SetKeyStatus changes a key's status (active ↔ disabled).
+	SetKeyStatus(groupID, keyID string, curve Curve, status string) error
+
+	// DeleteKey permanently removes a key from storage.
+	DeleteKey(groupID, keyID string, curve Curve) error
 
 	// ListGroups returns all group IDs that have at least one stored key.
 	ListGroups() ([]string, error)
@@ -60,6 +68,8 @@ type KeygenParams struct {
 	KeyID     string
 	Parties   []tss.PartyID
 	Threshold int
+	Curve     Curve
+	Scope     []byte // optional signing scope constraint
 }
 
 // SignParams holds the inputs for a signing session.
@@ -71,6 +81,7 @@ type SignParams struct {
 	KeyID       string
 	Signers     []tss.PartyID
 	MessageHash []byte
+	Curve       Curve
 }
 
 // ReshareParams holds the inputs for a key reshare session.
@@ -84,6 +95,7 @@ type ReshareParams struct {
 	NewParties   []tss.PartyID
 	OldThreshold int
 	NewThreshold int
+	Curve        Curve
 }
 
 // ReshareResult holds the outcome of a reshare session for a single key.
@@ -100,8 +112,11 @@ type ReshareResult struct {
 // KeyInfo holds public metadata about a stored key shard. It does not contain
 // secret key material.
 type KeyInfo struct {
-	GroupKey  []byte        // 33-byte compressed secp256k1 group public key
+	GroupKey  []byte        // compressed group public key (33 bytes secp256k1, 32 bytes Ed25519)
 	PartyID  tss.PartyID   // this node's party ID
 	Parties  []tss.PartyID // all parties in the key group
 	Threshold int
+	Curve     Curve
+	Scope     []byte // signing scope constraint (empty = unscoped)
+	Status    string // "active" or "disabled" (empty = active for backwards compat)
 }

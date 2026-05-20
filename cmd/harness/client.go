@@ -31,15 +31,20 @@ func NewClient(node Node, groupID string, timeout time.Duration) *Client {
 type KeygenResponse struct {
 	GroupID         string `json:"group_id"`
 	KeyID           string `json:"key_id"`
+	Curve           string `json:"curve"`
 	PublicKey       string `json:"public_key"`
 	EthereumAddress string `json:"ethereum_address"`
+	Scope           string `json:"scope,omitempty"`
 }
 
 // SignResponse is the JSON response from POST /v1/sign.
 type SignResponse struct {
-	GroupID           string `json:"group_id"`
-	KeyID             string `json:"key_id"`
-	EthereumSignature string `json:"ethereum_signature"`
+	GroupID            string `json:"group_id"`
+	KeyID              string `json:"key_id"`
+	Curve              string `json:"curve"`
+	Signature          string `json:"signature"`
+	EthereumSignature  string `json:"ethereum_signature"`
+	ECDSASignature     string `json:"ecdsa_signature"`
 }
 
 // Keygen calls POST /v1/keygen and returns the response.
@@ -47,6 +52,35 @@ func (c *Client) Keygen(ctx context.Context, keyID string) (*KeygenResponse, err
 	body, _ := json.Marshal(map[string]string{
 		"group_id": c.groupID,
 		"key_id":   keyID,
+	})
+	var resp KeygenResponse
+	if err := c.post(ctx, "/v1/keygen", body, &resp); err != nil {
+		return nil, err
+	}
+	return &resp, nil
+}
+
+// KeygenWithCurve calls POST /v1/keygen with an explicit curve.
+func (c *Client) KeygenWithCurve(ctx context.Context, keyID, curve string) (*KeygenResponse, error) {
+	body, _ := json.Marshal(map[string]string{
+		"group_id": c.groupID,
+		"key_id":   keyID,
+		"curve":    curve,
+	})
+	var resp KeygenResponse
+	if err := c.post(ctx, "/v1/keygen", body, &resp); err != nil {
+		return nil, err
+	}
+	return &resp, nil
+}
+
+// KeygenScoped calls POST /v1/keygen with a scope (hex-encoded).
+func (c *Client) KeygenScoped(ctx context.Context, keyID, curve, scopeHex string) (*KeygenResponse, error) {
+	body, _ := json.Marshal(map[string]string{
+		"group_id": c.groupID,
+		"key_id":   keyID,
+		"curve":    curve,
+		"scope":    scopeHex,
 	})
 	var resp KeygenResponse
 	if err := c.post(ctx, "/v1/keygen", body, &resp); err != nil {
@@ -67,6 +101,109 @@ func (c *Client) Sign(ctx context.Context, keyID, messageHashHex string) (*SignR
 		return nil, err
 	}
 	return &resp, nil
+}
+
+// SignWithCurve calls POST /v1/sign with an explicit curve.
+func (c *Client) SignWithCurve(ctx context.Context, keyID, messageHashHex, curve string) (*SignResponse, error) {
+	body, _ := json.Marshal(map[string]string{
+		"group_id":     c.groupID,
+		"key_id":       keyID,
+		"message_hash": messageHashHex,
+		"curve":        curve,
+	})
+	var resp SignResponse
+	if err := c.post(ctx, "/v1/sign", body, &resp); err != nil {
+		return nil, err
+	}
+	return &resp, nil
+}
+
+// SignPayload is a structured signing payload for scoped keys.
+type SignPayload struct {
+	Scheme    string          `json:"scheme"`
+	TypedData json.RawMessage `json:"typed_data,omitempty"`
+}
+
+// SignScoped calls POST /v1/sign with a structured payload (for scoped keys).
+func (c *Client) SignScoped(ctx context.Context, keyID, curve string, payload *SignPayload) (*SignResponse, error) {
+	body, _ := json.Marshal(map[string]interface{}{
+		"group_id": c.groupID,
+		"key_id":   keyID,
+		"curve":    curve,
+		"payload":  payload,
+	})
+	var resp SignResponse
+	if err := c.post(ctx, "/v1/sign", body, &resp); err != nil {
+		return nil, err
+	}
+	return &resp, nil
+}
+
+// KeyStatusResponse is the JSON response from key lifecycle endpoints.
+type KeyStatusResponse struct {
+	Status string `json:"status"`
+	KeyID  string `json:"key_id"`
+}
+
+// DisableKey calls POST /v1/keys/disable.
+func (c *Client) DisableKey(ctx context.Context, keyID string) (*KeyStatusResponse, error) {
+	body, _ := json.Marshal(map[string]string{
+		"group_id": c.groupID,
+		"key_id":   keyID,
+	})
+	var resp KeyStatusResponse
+	if err := c.post(ctx, "/v1/keys/disable", body, &resp); err != nil {
+		return nil, err
+	}
+	return &resp, nil
+}
+
+// EnableKey calls POST /v1/keys/enable.
+func (c *Client) EnableKey(ctx context.Context, keyID string) (*KeyStatusResponse, error) {
+	body, _ := json.Marshal(map[string]string{
+		"group_id": c.groupID,
+		"key_id":   keyID,
+	})
+	var resp KeyStatusResponse
+	if err := c.post(ctx, "/v1/keys/enable", body, &resp); err != nil {
+		return nil, err
+	}
+	return &resp, nil
+}
+
+// DeleteKey calls POST /v1/keys/delete.
+func (c *Client) DeleteKey(ctx context.Context, keyID string) (*KeyStatusResponse, error) {
+	body, _ := json.Marshal(map[string]string{
+		"group_id": c.groupID,
+		"key_id":   keyID,
+	})
+	var resp KeyStatusResponse
+	if err := c.post(ctx, "/v1/keys/delete", body, &resp); err != nil {
+		return nil, err
+	}
+	return &resp, nil
+}
+
+// AdminKeyEntry is a single entry from the admin key listing.
+type AdminKeyEntry struct {
+	GroupID         string `json:"group_id"`
+	KeyID           string `json:"key_id"`
+	Curve           string `json:"curve"`
+	PublicKey       string `json:"public_key"`
+	EthereumAddress string `json:"ethereum_address"`
+	Status          string `json:"status"`
+}
+
+// ListKeys calls POST /admin/keys and returns all keys for the group.
+func (c *Client) ListKeys(ctx context.Context) ([]AdminKeyEntry, error) {
+	body, _ := json.Marshal(map[string]string{
+		"group_id": c.groupID,
+	})
+	var resp []AdminKeyEntry
+	if err := c.post(ctx, "/admin/keys", body, &resp); err != nil {
+		return nil, err
+	}
+	return resp, nil
 }
 
 // StartReshare calls POST /admin/reshare to trigger a same-committee reshare.

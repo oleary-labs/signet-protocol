@@ -277,6 +277,8 @@ github.com/oleary-labs/frost v0.0.0-20260408020012-f506991dfd28 h1:N9EmcoD2Pddgg
 github.com/oleary-labs/frost v0.0.0-20260408020012-f506991dfd28/go.mod h1:90aaL7LFVg4kBGT7swbtayNP/q3Iv9lBnSdYNuGffbw=
 github.com/oleary-labs/signet-circuits/packages/go v0.1.0 h1:QVyp5UOlbU77dhAySszyIAEvdiSE9piMlo/41k2oD/w=
 github.com/oleary-labs/signet-circuits/packages/go v0.1.0/go.mod h1:F168I65y20KzPgYiDqjbR32vSz48bH0ah9v6YLISlR0=
+github.com/oleary-labs/signet-circuits/packages/go v0.3.0 h1:NI0Y7gt1qIxb4HpsKBCVsLAAvq9+eesSKVCOghiSPdM=
+github.com/oleary-labs/signet-circuits/packages/go v0.3.0/go.mod h1:F168I65y20KzPgYiDqjbR32vSz48bH0ah9v6YLISlR0=
 github.com/pbnjay/memory v0.0.0-20210728143218-7b4eea64cf58 h1:onHthvaw9LFnH4t2DcNVpwGmV9E1BkGknEliJkfwQj0=
 github.com/pbnjay/memory v0.0.0-20210728143218-7b4eea64cf58/go.mod h1:DXv8WO4yhMYhSNPKjeNKa5WY9YCIEBRbNzFFPJbWO6Y=
 github.com/pion/datachannel v1.5.10 h1:ly0Q26K1i6ZkGf42W7D4hQYR90pZwzFOjTq5AuCKk4o=

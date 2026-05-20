@@ -8,7 +8,7 @@ log_level: debug
 
 # KMS configuration
 use_kms: true
-kms_bin: /usr/local/bin/kms-frost
+kms_bin: /usr/local/bin/kms-tss
 kms_socket: /run/signet/kms.sock
 kms_data_dir: /opt/signet/kms-data
 

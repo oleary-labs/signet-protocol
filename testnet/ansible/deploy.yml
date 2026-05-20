@@ -1,5 +1,5 @@
 ---
-# deploy.yml — Deploy signetd (and optionally kms-frost) to all testnet nodes.
+# deploy.yml — Deploy signetd (and optionally kms-tss) to all testnet nodes.
 #
 # Prerequisites:
 #   1. Instances provisioned and IPs in inventory.yml
@@ -8,8 +8,8 @@
 #   4. host_vars populated with peer_id, eth_address, eth_privkey
 #   5. Binaries cross-compiled:
 #        GOOS=linux GOARCH=amd64 go build -o build/signetd-linux-amd64 ./cmd/signetd
-#        cross build --release --target x86_64-unknown-linux-gnu  (in kms-frost/)
-#        cp kms-frost/target/x86_64-unknown-linux-gnu/release/kms-frost build/kms-frost-linux-amd64
+#        cross build --release --target x86_64-unknown-linux-gnu  (in kms-tss/)
+#        cp kms-tss/target/x86_64-unknown-linux-gnu/release/kms-tss build/kms-tss-linux-amd64
 #
 # Usage:
 #   cd testnet/ansible
@@ -53,6 +53,6 @@
 
   roles:
     - bb
-    - role: kms-frost
+    - role: kms-tss
       when: use_kms | default(false) | bool
     - signetd

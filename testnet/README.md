@@ -14,7 +14,7 @@
 - **Signing group:** 2-of-3 (threshold=2)
 - **Chain:** Sepolia
 - **Auth:** Google OAuth (accounts.google.com)
-- **KMS:** enabled (Rust kms-frost, FROST keygen/sign/reshare)
+- **KMS:** enabled (Rust kms-tss, FROST keygen/sign/reshare)
 - **Barretenberg:** installed on each node for ZK proof verification
 - **Factory:** `0xB4c55139db4ad9c481DAA82B249F934CBbB73b91`
 - **Group:** `0xf75bfc536ecf70006361685f1ed0b005ea08b773`
@@ -69,10 +69,10 @@ with Google OAuth as a trusted issuer. Writes `testnet/.env`.
 # signetd
 GOOS=linux GOARCH=amd64 go build -o build/signetd-linux-amd64 ./cmd/signetd
 
-# kms-frost (requires cross toolchain or Docker)
-# Pre-built binary: build/kms-frost-linux-amd64
+# kms-tss (requires cross toolchain or Docker)
+# Pre-built binary: build/kms-tss-linux-amd64
 
-# Deploy everything: signetd + kms-frost + bb (Barretenberg)
+# Deploy everything: signetd + kms-tss + bb (Barretenberg)
 cd testnet/ansible
 FACTORY_ADDRESS=0x... SEPOLIA_RPC_URL=https://... \
 ansible-playbook deploy.yml
@@ -80,7 +80,7 @@ ansible-playbook deploy.yml
 
 The deploy playbook installs:
 - `signetd` binary + config + systemd unit
-- `kms-frost` binary + systemd unit (started before signetd)
+- `kms-tss` binary + systemd unit (started before signetd)
 - `bb` (Barretenberg) for ZK proof verification
 
 ### 5. Verify
@@ -90,14 +90,14 @@ ansible-playbook manage.yml -e action=status
 ```
 
 All 3 nodes should show `active (running)` for both `signetd` and
-`kms-frost` services.
+`kms-tss` services.
 
 ## Management
 
 From `testnet/ansible/`:
 
 ```bash
-# Status (signetd + kms-frost)
+# Status (signetd + kms-tss)
 ansible-playbook manage.yml -e action=status
 
 # Logs
@@ -169,6 +169,6 @@ testnet/
       node{1..3}.yml              # generated: peer_id, eth_address, etc.
     roles/
       signetd/                    # signetd binary + config + systemd
-      kms-frost/                  # kms-frost binary + systemd
+      kms-tss/                  # kms-tss binary + systemd
       bb/                         # Barretenberg install (ZK verify)
 ```

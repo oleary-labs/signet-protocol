@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
-	"encoding/json"
 	"fmt"
 	"net/http"
 	"os"
@@ -265,6 +264,10 @@ func New(cfg *Config, log *zap.Logger) (*Node, error) {
 	mux.HandleFunc("POST /v1/auth", n.handleAuth)
 	mux.HandleFunc("POST /v1/keygen", n.handleKeygen)
 	mux.HandleFunc("POST /v1/sign", n.handleSign)
+	mux.HandleFunc("POST /v1/delegate", n.handleDelegate)
+	mux.HandleFunc("POST /v1/keys/disable", n.handleDisableKey)
+	mux.HandleFunc("POST /v1/keys/enable", n.handleEnableKey)
+	mux.HandleFunc("POST /v1/keys/delete", n.handleDeleteKey)
 
 	mux.HandleFunc("POST /admin/keys", n.handleListKeys)
 	// Reshare is triggered via on-chain events (node add/remove or
@@ -375,8 +378,8 @@ func (n *Node) markKeygenDone(groupID, keyID string) {
 // awaitKey returns the KeyInfo for (groupID, keyID), waiting up to timeout
 // for a concurrent keygen to finish. Returns (nil, nil) if the key is genuinely
 // absent and no keygen is in flight.
-func (n *Node) awaitKey(groupID, keyID string, timeout time.Duration) (*KeyInfo, error) {
-	info, err := n.km.GetKeyInfo(groupID, keyID)
+func (n *Node) awaitKey(groupID, keyID string, curve Curve, timeout time.Duration) (*KeyInfo, error) {
+	info, err := n.km.GetKeyInfo(groupID, keyID, curve)
 	if err != nil || info != nil {
 		return info, err
 	}
@@ -392,7 +395,7 @@ func (n *Node) awaitKey(groupID, keyID string, timeout time.Duration) (*KeyInfo,
 
 	select {
 	case <-ch:
-		return n.km.GetKeyInfo(groupID, keyID)
+		return n.km.GetKeyInfo(groupID, keyID, curve)
 	case <-time.After(timeout):
 		return nil, fmt.Errorf("timeout waiting for keygen to complete for key %s", keyID)
 	case <-n.ctx.Done():
@@ -409,696 +412,6 @@ func randomNonce() (string, error) {
 	return hex.EncodeToString(b), nil
 }
 
-// --- HTTP handlers ---
-
-func (n *Node) handleHealth(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-	w.Write([]byte(`{"status":"ok"}`))
-}
-
-func (n *Node) handleInfo(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(n.Info())
-}
-
-// handleListKeys returns public metadata for all persisted key shards.
-//
-// POST /admin/keys — list keys for a group. Requires admin auth (auth key signature).
-func (n *Node) handleListKeys(w http.ResponseWriter, r *http.Request) {
-	type keyEntry struct {
-		GroupID         string   `json:"group_id"`
-		KeyID           string   `json:"key_id"`
-		PublicKey       string   `json:"public_key"`
-		EthereumAddress string   `json:"ethereum_address"`
-		Threshold       int      `json:"threshold"`
-		Parties         []string `json:"parties"`
-	}
-
-	var req AdminAuth
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		httpError(w, http.StatusBadRequest, "decode body: "+err.Error())
-		return
-	}
-	req.GroupID = strings.ToLower(req.GroupID)
-	if req.GroupID == "" {
-		httpError(w, http.StatusBadRequest, "group_id is required")
-		return
-	}
-
-	if n.auth.HasAuthKeys(req.GroupID) {
-		if err := n.auth.ValidateAdminAuth(req.GroupID, &req); err != nil {
-			httpError(w, http.StatusUnauthorized, "admin auth failed: "+err.Error())
-			return
-		}
-	}
-
-	keyIDs, err := n.km.ListKeys(req.GroupID)
-	if err != nil {
-		httpError(w, http.StatusInternalServerError, "list keys: "+err.Error())
-		return
-	}
-
-	entries := make([]keyEntry, 0)
-	for _, kid := range keyIDs {
-		info, err := n.km.GetKeyInfo(req.GroupID, kid)
-		if err != nil || info == nil {
-			continue
-		}
-		pubKeyHex := ""
-		ethAddr := ""
-		if len(info.GroupKey) > 0 {
-			pubKeyHex = "0x" + hex.EncodeToString(info.GroupKey)
-			if addr, err := network.EthereumAddressFromGroupKey(info.GroupKey); err == nil {
-				ethAddr = "0x" + hex.EncodeToString(addr[:])
-			}
-		}
-		parties := make([]string, len(info.Parties))
-		for i, p := range info.Parties {
-			parties[i] = string(p)
-		}
-		entries = append(entries, keyEntry{
-			GroupID:         req.GroupID,
-			KeyID:           kid,
-			PublicKey:       pubKeyHex,
-			EthereumAddress: ethAddr,
-			Threshold:       info.Threshold,
-			Parties:         parties,
-		})
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(entries)
-}
-
-// handleAuth registers an ephemeral session key with verified identity claims.
-//
-// POST /v1/auth
-//
-// Auth key certificate:
-//
-//	{"group_id":"0x...","session_pub":"02abc...",
-//	 "certificate":{"auth_key_pub":"02...","signature":"hex64","identity":"user1","expiry":1709900000}}
-//
-// OAuth/ZK proof:
-//
-//	{"group_id":"0x...","proof":"hex...","session_pub":"02abc...",
-//	 "sub":"user123","iss":"https://...","exp":1709900000,
-//	 "aud":"app.example.com","azp":"client-id","jwks_modulus":"hex..."}
-func (n *Node) handleAuth(w http.ResponseWriter, r *http.Request) {
-	var req struct {
-		GroupID     string `json:"group_id"`
-		Proof       string `json:"proof"`         // ZK proof hex
-		SessionPub  string `json:"session_pub"`   // hex, 33-byte compressed secp256k1
-		Sub         string `json:"sub"`           // JWT subject
-		Iss         string `json:"iss"`           // JWT issuer
-		Exp         uint64 `json:"exp"`           // JWT expiry unix timestamp
-		Aud         string `json:"aud"`           // JWT audience
-		Azp         string `json:"azp"`           // JWT authorized party
-		JWKSModulus string `json:"jwks_modulus"`  // RSA modulus hex
-
-		// Authorization key certificate fields
-		Certificate *AuthCertificate `json:"certificate,omitempty"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		httpError(w, http.StatusBadRequest, "decode body: "+err.Error())
-		return
-	}
-	if req.GroupID == "" || req.SessionPub == "" {
-		httpError(w, http.StatusBadRequest, "group_id and session_pub are required")
-		return
-	}
-	req.GroupID = strings.ToLower(req.GroupID)
-
-	sessionPubBytes, err := hex.DecodeString(strings.TrimPrefix(req.SessionPub, "0x"))
-	if err != nil || len(sessionPubBytes) != 33 {
-		httpError(w, http.StatusBadRequest, "session_pub must be 33 hex-encoded bytes")
-		return
-	}
-
-	// Authorization key certificate path.
-	if req.Certificate != nil {
-		cert := req.Certificate
-		cert.GroupID = req.GroupID
-		cert.SessionPub = req.SessionPub
-
-		identity, err := n.auth.ValidateAuthCertificate(req.GroupID, cert)
-		if err != nil {
-			httpError(w, http.StatusUnauthorized, "certificate verification failed: "+err.Error())
-			return
-		}
-
-		authKeyBytes, _ := hex.DecodeString(strings.TrimPrefix(cert.AuthKeyPub, "0x"))
-		sigBytes, _ := hex.DecodeString(strings.TrimPrefix(cert.Signature, "0x"))
-
-		pubHex := sessionPubToHex(sessionPubBytes)
-		n.sessions.Put(pubHex, &SessionInfo{
-			Sub:           identity,
-			Exp:           time.Unix(int64(cert.Expiry), 0),
-			Identity:      identity,
-			AuthKeyPub:    authKeyBytes,
-			CertSignature: sigBytes,
-		})
-		n.log.Info("auth: session registered (auth key certificate)",
-			zap.String("group_id", req.GroupID),
-			zap.String("identity", identity),
-			zap.String("session_pub", pubHex))
-
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]any{
-			"status":     "ok",
-			"identity":   identity,
-			"expires_at": int64(cert.Expiry),
-		})
-		return
-	}
-
-	// OAuth/ZK proof path.
-	if req.Proof == "" {
-		httpError(w, http.StatusBadRequest, "proof or certificate is required")
-		return
-	}
-	if req.Sub == "" || req.Iss == "" || req.Exp == 0 {
-		httpError(w, http.StatusBadRequest, "sub, iss, and exp are required with ZK proof")
-		return
-	}
-	if req.JWKSModulus == "" {
-		httpError(w, http.StatusBadRequest, "jwks_modulus is required with ZK proof")
-		return
-	}
-
-	proofBytes, err := hex.DecodeString(strings.TrimPrefix(req.Proof, "0x"))
-	if err != nil || len(proofBytes) == 0 {
-		httpError(w, http.StatusBadRequest, "invalid proof hex")
-		return
-	}
-	modulusBytes, err := hex.DecodeString(strings.TrimPrefix(req.JWKSModulus, "0x"))
-	if err != nil || len(modulusBytes) == 0 {
-		httpError(w, http.StatusBadRequest, "invalid jwks_modulus hex")
-		return
-	}
-
-	ap := &AuthProof{
-		Proof:       proofBytes,
-		Sub:         req.Sub,
-		Iss:         req.Iss,
-		Exp:         req.Exp,
-		Aud:         req.Aud,
-		Azp:         req.Azp,
-		JWKSModulus: modulusBytes,
-		SessionPub:  sessionPubBytes,
-	}
-
-	sub, err := n.auth.ValidateAuthProof(r.Context(), req.GroupID, ap)
-	if err != nil {
-		httpError(w, http.StatusUnauthorized, "proof verification failed: "+err.Error())
-		return
-	}
-
-	pubHex := sessionPubToHex(sessionPubBytes)
-	n.sessions.Put(pubHex, &SessionInfo{
-		Sub:         req.Sub, // raw sub from JWT, not the compound iss:sub
-		Iss:         req.Iss,
-		Exp:         time.Unix(int64(req.Exp), 0),
-		Aud:         req.Aud,
-		Azp:         req.Azp,
-		Proof:       proofBytes,
-		JWKSModulus: modulusBytes,
-	})
-	n.log.Info("auth: session registered (ZK proof)",
-		zap.String("group_id", req.GroupID),
-		zap.String("sub", sub),
-		zap.String("session_pub", pubHex))
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]any{
-		"status":     "ok",
-		"sub":        sub,
-		"expires_at": int64(req.Exp),
-	})
-}
-
-// handleKeygen runs a distributed key generation session.
-//
-// POST /v1/keygen
-//
-//	{"group_id":"0xGroupAddr","key_id":"primary"}
-//
-// Session-auth mode (groups with issuers):
-//
-//	{"group_id":"0x...","key_suffix":"primary",
-//	 "session_pub":"02abc...","request_sig":"hex64","nonce":"hex","timestamp":123}
-//
-// The key shard is stored under (group_id, key_id). The group members and
-// threshold are resolved from the node's in-memory group map.
-func (n *Node) handleKeygen(w http.ResponseWriter, r *http.Request) {
-	var req struct {
-		GroupID    string `json:"group_id"`
-		KeyID      string `json:"key_id"`
-		KeySuffix  string `json:"key_suffix"`
-		SessionPub string `json:"session_pub"`
-		RequestSig string `json:"request_sig"`
-		Nonce      string `json:"nonce"`
-		Timestamp  uint64 `json:"timestamp"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		httpError(w, http.StatusBadRequest, "decode body: "+err.Error())
-		return
-	}
-	if req.GroupID == "" {
-		httpError(w, http.StatusBadRequest, "group_id is required")
-		return
-	}
-	req.GroupID = strings.ToLower(req.GroupID)
-
-	n.groupsMu.RLock()
-	grp, ok := n.groups[req.GroupID]
-	n.groupsMu.RUnlock()
-	if !ok {
-		httpError(w, http.StatusNotFound, "group not found: "+req.GroupID)
-		return
-	}
-
-	keyID := req.KeyID
-	var authProof *AuthProof
-
-	if n.auth.HasAuthPolicy(req.GroupID) {
-		if req.SessionPub == "" {
-			httpError(w, http.StatusUnauthorized, "authorization required (session_pub)")
-			return
-		}
-		ap, resolvedKeyID, err := n.validateSessionRequest(
-			req.SessionPub, req.RequestSig,
-			req.GroupID, req.KeyID, req.KeySuffix,
-			req.Nonce, req.Timestamp,
-			nil, // no message_hash for keygen
-		)
-		if err != nil {
-			n.log.Warn("keygen: session auth failed",
-				zap.String("group_id", req.GroupID),
-				zap.String("session_pub", req.SessionPub),
-				zap.String("key_suffix", req.KeySuffix),
-				zap.Uint64("timestamp", req.Timestamp),
-				zap.String("nonce", req.Nonce),
-				zap.Int("code", err.code),
-				zap.String("error", err.msg))
-			httpError(w, err.code, err.msg)
-			return
-		}
-		keyID = resolvedKeyID
-		authProof = ap
-	} else if keyID == "" {
-		httpError(w, http.StatusBadRequest, "key_id is required")
-		return
-	}
-
-	if info, _ := n.km.GetKeyInfo(req.GroupID, keyID); info != nil {
-		ethAddr, _ := network.EthereumAddressFromGroupKey(info.GroupKey)
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusConflict)
-		json.NewEncoder(w).Encode(map[string]any{
-			"group_id":         req.GroupID,
-			"key_id":           keyID,
-			"public_key":       "0x" + hex.EncodeToString(info.GroupKey),
-			"ethereum_address": "0x" + hex.EncodeToString(ethAddr[:]),
-		})
-		return
-	}
-
-	// Preflight: verify the auth proof will be accepted by participants
-	// before starting the network protocol.
-	if authProof != nil {
-		if _, err := n.auth.ValidateAuthProof(r.Context(), req.GroupID, authProof); err != nil {
-			httpError(w, http.StatusUnauthorized, "auth proof will be rejected by participants: "+err.Error())
-			return
-		}
-	}
-
-	sortedParties := tss.NewPartyIDSlice(grp.Members)
-	sessID := keygenSessionID(req.GroupID, keyID)
-
-	n.log.Info("keygen starting",
-		zap.String("group_id", req.GroupID),
-		zap.String("key_id", keyID),
-		zap.Int("n", len(sortedParties)),
-		zap.Int("threshold", grp.Threshold),
-	)
-
-	sn, err := network.NewSessionNetwork(r.Context(), n.host, sessID, sortedParties)
-	if err != nil {
-		httpError(w, http.StatusInternalServerError, "session network: "+err.Error())
-		return
-	}
-	defer sn.Close()
-
-	if err := n.broadcastCoord(r.Context(), sortedParties, coordMsg{
-		Type:      msgKeygen,
-		GroupID:   req.GroupID,
-		KeyID:     keyID,
-		Parties:   sortedParties,
-		Threshold: grp.Threshold,
-		Auth:      authProof,
-	}); err != nil {
-		httpError(w, http.StatusInternalServerError, "coordinate: "+err.Error())
-		return
-	}
-
-	info, err := n.km.RunKeygen(r.Context(), KeygenParams{
-		Host:      n.host,
-		SN:        sn,
-		SessionID: sessID,
-		GroupID:   req.GroupID,
-		KeyID:     keyID,
-		Parties:   sortedParties,
-		Threshold: grp.Threshold,
-	})
-	if err != nil {
-		n.log.Error("keygen failed",
-			zap.String("group_id", req.GroupID),
-			zap.String("key_id", keyID),
-			zap.Error(err))
-		httpError(w, http.StatusInternalServerError, "keygen: "+err.Error())
-		return
-	}
-
-	ethAddr, err := network.EthereumAddressFromGroupKey(info.GroupKey)
-	if err != nil {
-		httpError(w, http.StatusInternalServerError, "eth addr: "+err.Error())
-		return
-	}
-
-	n.log.Info("keygen complete",
-		zap.String("group_id", req.GroupID),
-		zap.String("key_id", keyID),
-		zap.String("eth_addr", "0x"+hex.EncodeToString(ethAddr[:])),
-	)
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]any{
-		"group_id":         req.GroupID,
-		"key_id":           keyID,
-		"public_key":       "0x" + hex.EncodeToString(info.GroupKey),
-		"ethereum_address": "0x" + hex.EncodeToString(ethAddr[:]),
-	})
-}
-
-// handleSign runs a threshold signing session using a previously generated key.
-//
-// POST /v1/sign
-//
-//	{"group_id":"0xGroupAddr","key_id":"primary","message_hash":"0xdeadbeef..."}
-//
-// Session-auth mode (groups with issuers):
-//
-//	{"group_id":"0x...","key_suffix":"primary","message_hash":"0xdeadbeef...",
-//	 "session_pub":"02abc...","request_sig":"hex64","nonce":"hex","timestamp":123}
-func (n *Node) handleSign(w http.ResponseWriter, r *http.Request) {
-	var req struct {
-		GroupID     string `json:"group_id"`
-		KeyID       string `json:"key_id"`
-		KeySuffix   string `json:"key_suffix"`
-		MessageHash string `json:"message_hash"`
-		SessionPub  string `json:"session_pub"`
-		RequestSig  string `json:"request_sig"`
-		Nonce       string `json:"nonce"`
-		Timestamp   uint64 `json:"timestamp"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		httpError(w, http.StatusBadRequest, "decode body: "+err.Error())
-		return
-	}
-	if req.GroupID == "" || req.MessageHash == "" {
-		httpError(w, http.StatusBadRequest, "group_id and message_hash are required")
-		return
-	}
-	req.GroupID = strings.ToLower(req.GroupID)
-
-	msgHash, err := hex.DecodeString(strings.TrimPrefix(req.MessageHash, "0x"))
-	if err != nil {
-		httpError(w, http.StatusBadRequest, "invalid message_hash: "+err.Error())
-		return
-	}
-	if len(msgHash) != 32 {
-		httpError(w, http.StatusBadRequest, "message_hash must be exactly 32 bytes (64 hex chars)")
-		return
-	}
-
-	n.groupsMu.RLock()
-	grp, ok := n.groups[req.GroupID]
-	n.groupsMu.RUnlock()
-	if !ok {
-		httpError(w, http.StatusNotFound, "group not found: "+req.GroupID)
-		return
-	}
-
-	keyID := req.KeyID
-	var authProof *AuthProof
-
-	if n.auth.HasAuthPolicy(req.GroupID) {
-		if req.SessionPub == "" {
-			httpError(w, http.StatusUnauthorized, "authorization required (session_pub)")
-			return
-		}
-		ap, resolvedKeyID, err := n.validateSessionRequest(
-			req.SessionPub, req.RequestSig,
-			req.GroupID, req.KeyID, req.KeySuffix,
-			req.Nonce, req.Timestamp,
-			msgHash,
-		)
-		if err != nil {
-			n.log.Warn("sign: session auth failed",
-				zap.String("group_id", req.GroupID),
-				zap.String("session_pub", req.SessionPub),
-				zap.String("key_suffix", req.KeySuffix),
-				zap.Uint64("timestamp", req.Timestamp),
-				zap.String("nonce", req.Nonce),
-				zap.Int("code", err.code),
-				zap.String("error", err.msg))
-			httpError(w, err.code, err.msg)
-			return
-		}
-		keyID = resolvedKeyID
-		authProof = ap
-	} else if keyID == "" {
-		httpError(w, http.StatusBadRequest, "key_id is required")
-		return
-	}
-
-	// Block if the key is stale (pending reshare). Waits until the reshare
-	// completes or triggers an on-demand reshare if no session is running.
-	if n.isKeyStale(req.GroupID, keyID) {
-		n.log.Info("sign: key is stale, waiting for reshare",
-			zap.String("group_id", req.GroupID),
-			zap.String("key_id", keyID))
-		if err := n.waitForReshare(r.Context(), req.GroupID, keyID); err != nil {
-			httpError(w, http.StatusServiceUnavailable, "key reshare pending: "+err.Error())
-			return
-		}
-	}
-
-	keyInfo, err := n.km.GetKeyInfo(req.GroupID, keyID)
-	if err != nil {
-		httpError(w, http.StatusInternalServerError, "load config: "+err.Error())
-		return
-	}
-	if keyInfo == nil {
-		httpError(w, http.StatusNotFound, fmt.Sprintf("key not found: group=%s key=%s", req.GroupID, keyID))
-		return
-	}
-
-	sortedSigners := tss.NewPartyIDSlice(grp.Members)
-	if !sortedSigners.Contains(keyInfo.PartyID) {
-		httpError(w, http.StatusBadRequest, "this node is not a member of group "+req.GroupID)
-		return
-	}
-
-	nonce, err := randomNonce()
-	if err != nil {
-		httpError(w, http.StatusInternalServerError, "generate nonce: "+err.Error())
-		return
-	}
-	sessID := signSessionID(req.GroupID, keyID, nonce)
-
-	// Preflight: verify the auth proof will be accepted by participants.
-	if authProof != nil {
-		if _, err := n.auth.ValidateAuthProof(r.Context(), req.GroupID, authProof); err != nil {
-			httpError(w, http.StatusUnauthorized, "auth proof will be rejected by participants: "+err.Error())
-			return
-		}
-	}
-
-	n.log.Info("sign starting",
-		zap.String("group_id", req.GroupID),
-		zap.String("key_id", keyID),
-		zap.Int("signers", len(sortedSigners)),
-	)
-
-	sn, err := network.NewSessionNetwork(r.Context(), n.host, sessID, sortedSigners)
-	if err != nil {
-		httpError(w, http.StatusInternalServerError, "session network: "+err.Error())
-		return
-	}
-	defer sn.Close()
-
-	if err := n.broadcastCoord(r.Context(), sortedSigners, coordMsg{
-		Type:        msgSign,
-		GroupID:     req.GroupID,
-		KeyID:       keyID,
-		SignNonce:   nonce,
-		Signers:     sortedSigners,
-		MessageHash: msgHash,
-		Auth:        authProof,
-	}); err != nil {
-		httpError(w, http.StatusInternalServerError, "coordinate: "+err.Error())
-		return
-	}
-
-	sig, err := n.km.RunSign(r.Context(), SignParams{
-		Host:        n.host,
-		SN:          sn,
-		SessionID:   sessID,
-		GroupID:     req.GroupID,
-		KeyID:       keyID,
-		Signers:     sortedSigners,
-		MessageHash: msgHash,
-	})
-	if err != nil {
-		n.log.Error("sign failed",
-			zap.String("group_id", req.GroupID),
-			zap.String("key_id", keyID),
-			zap.Error(err))
-		httpError(w, http.StatusInternalServerError, "sign: "+err.Error())
-		return
-	}
-
-	ethSig, err := sig.SigEthereum()
-	if err != nil {
-		httpError(w, http.StatusInternalServerError, "encode signature: "+err.Error())
-		return
-	}
-
-	n.log.Info("sign complete",
-		zap.String("group_id", req.GroupID),
-		zap.String("key_id", keyID),
-	)
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]any{
-		"group_id":           req.GroupID,
-		"key_id":             keyID,
-		"ethereum_signature": "0x" + hex.EncodeToString(ethSig),
-	})
-}
-
-// httpErr is a typed HTTP error used by validateSessionRequest so both the
-// status code and message can be returned without writing to the response.
-type httpErr struct {
-	code int
-	msg  string
-}
-
-// validateSessionRequest validates a session-based auth request (used by both
-// handleKeygen and handleSign). It returns the AuthProof to include in the
-// coord message and the resolved keyID. On error it returns an httpErr.
-func (n *Node) validateSessionRequest(
-	sessionPubHex, requestSigHex string,
-	groupID, keyID, keySuffix string,
-	nonce string, timestamp uint64,
-	messageHash []byte,
-) (*AuthProof, string, *httpErr) {
-	sessionPubBytes, err := hex.DecodeString(strings.TrimPrefix(sessionPubHex, "0x"))
-	if err != nil || len(sessionPubBytes) != 33 {
-		return nil, "", &httpErr{http.StatusBadRequest, "session_pub must be 33 hex-encoded bytes"}
-	}
-	reqSigBytes, err := hex.DecodeString(strings.TrimPrefix(requestSigHex, "0x"))
-	if err != nil || len(reqSigBytes) != 64 {
-		return nil, "", &httpErr{http.StatusBadRequest, "request_sig must be 64 hex-encoded bytes"}
-	}
-	if nonce == "" {
-		return nil, "", &httpErr{http.StatusBadRequest, "nonce is required"}
-	}
-	if timestamp == 0 {
-		return nil, "", &httpErr{http.StatusBadRequest, "timestamp is required"}
-	}
-
-	// Look up session.
-	pubHex := sessionPubToHex(sessionPubBytes)
-	info, ok := n.sessions.Get(pubHex)
-	if !ok {
-		return nil, "", &httpErr{http.StatusUnauthorized, "session not found; call POST /v1/auth first"}
-	}
-	if time.Now().After(info.Exp) {
-		n.sessions.Delete(pubHex)
-		return nil, "", &httpErr{http.StatusUnauthorized, "session expired; re-authenticate"}
-	}
-
-	// Derive the logical key_id (what the client signs over).
-	var logicalKeyID string
-	if info.Identity != "" {
-		logicalKeyID = info.Identity
-		if keySuffix != "" {
-			logicalKeyID = info.Identity + ":" + keySuffix
-		}
-	} else {
-		logicalKeyID = info.Iss + ":" + info.Sub
-		if keySuffix != "" {
-			logicalKeyID = info.Iss + ":" + info.Sub + ":" + keySuffix
-		}
-	}
-
-	// Verify request signature against the logical key_id (no namespace prefix).
-	n.log.Debug("validateSessionRequest",
-		zap.String("group_id", groupID),
-		zap.String("logical_key_id", logicalKeyID),
-		zap.String("nonce", nonce),
-		zap.Uint64("timestamp", timestamp),
-		zap.Int("message_hash_len", len(messageHash)))
-	if err := verifyRequestSignature(
-		sessionPubBytes, reqSigBytes,
-		groupID, logicalKeyID, nonce, timestamp,
-		messageHash,
-	); err != nil {
-		return nil, "", &httpErr{http.StatusUnauthorized, "invalid request signature: " + err.Error()}
-	}
-
-	// Add namespace prefix after signature verification. The prefix is internal
-	// — clients never see it — and prevents cross-path key_id collisions.
-	var resolvedKeyID string
-	if info.Identity != "" {
-		resolvedKeyID = "authkey:" + logicalKeyID
-	} else {
-		resolvedKeyID = "oauth:" + logicalKeyID
-	}
-
-	// Check nonce uniqueness.
-	if err := n.sessions.CheckNonce(nonce); err != nil {
-		return nil, "", &httpErr{http.StatusConflict, "nonce already used"}
-	}
-
-	// Check timestamp freshness.
-	ts := time.Unix(int64(timestamp), 0)
-	if time.Since(ts).Abs() > timestampWindow {
-		return nil, "", &httpErr{http.StatusBadRequest, "timestamp too old or in the future"}
-	}
-
-	ap := &AuthProof{
-		Proof:         info.Proof,
-		Sub:           info.Sub,
-		Iss:           info.Iss,
-		Exp:           uint64(info.Exp.Unix()),
-		Aud:           info.Aud,
-		Azp:           info.Azp,
-		JWKSModulus:   info.JWKSModulus,
-		SessionPub:    sessionPubBytes,
-		RequestSig:    reqSigBytes,
-		Nonce:         nonce,
-		Timestamp:     timestamp,
-		AuthKeyPub:    info.AuthKeyPub,
-		CertSignature: info.CertSignature,
-		Identity:      info.Identity,
-	}
-	return ap, resolvedKeyID, nil
-}
-
 // stripKeyNamespace removes the internal "oauth:" or "authkey:" prefix from a
 // resolved key_id, returning the logical key_id that clients sign over.
 func stripKeyNamespace(keyID string) string {
@@ -1111,153 +424,51 @@ func stripKeyNamespace(keyID string) string {
 	return keyID
 }
 
-// handleStartReshare handles POST /admin/reshare. Creates a same-committee
-// reshare job (key refresh) and starts the coordinator. Requires admin auth.
-func (n *Node) handleStartReshare(w http.ResponseWriter, r *http.Request) {
-	var req struct {
-		AdminAuth
-		Concurrency int `json:"concurrency"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		httpError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
-		return
-	}
-	groupID := strings.ToLower(req.GroupID)
-	if groupID == "" {
-		httpError(w, http.StatusBadRequest, "group_id is required")
-		return
-	}
-	req.AdminAuth.GroupID = groupID
-
-	if n.auth.HasAuthKeys(groupID) {
-		if err := n.auth.ValidateAdminAuth(groupID, &req.AdminAuth); err != nil {
-			httpError(w, http.StatusUnauthorized, "admin auth failed: "+err.Error())
-			return
+// parseDelegationIdentity extracts iss and sub from a delegation token's
+// sub-key ID. The key_id format is "oauth:<iss>:<sub>[:<suffix>]".
+// Returns (iss, sub) where sub is just the user identifier (not the full path).
+func parseDelegationIdentity(keyID string) (iss, sub string) {
+	// Strip "oauth:" prefix if present.
+	id := strings.TrimPrefix(keyID, "oauth:")
+	// Split into at most 3 parts: iss components may contain colons (e.g. https://foo.bar),
+	// but the sub is always the last component before the optional suffix.
+	// The iss is everything from the original JWT issuer (a URL like https://accounts.google.com).
+	// We reconstruct by finding the sub (user ID) after the issuer.
+	//
+	// Key ID format examples:
+	//   oauth:https://accounts.google.com:user123:scope_suffix
+	//   oauth:https://normal-elk-24.clerk.accounts.dev:user_3DPU...:403fada9
+	//
+	// The issuer ends before the first non-URL-like segment. Since issuer is
+	// always a URL (https://...) and sub is never a URL, we split after "https://...:"
+	// by finding the issuer from the session's original JWT claims.
+	//
+	// Simpler approach: the issuer always starts with "https://" and the sub
+	// follows after the issuer's domain path.
+	const prefix = "https://"
+	if !strings.HasPrefix(id, prefix) {
+		// Fallback: first colon-separated segment is iss, rest is sub.
+		parts := strings.SplitN(id, ":", 2)
+		if len(parts) == 2 {
+			return parts[0], parts[1]
 		}
+		return "", id
 	}
-	concurrency := req.Concurrency
-	if concurrency < 1 {
-		concurrency = 1
+	// Skip "https://" then find the next ":" — that's the end of the issuer domain.
+	rest := id[len(prefix):]
+	idx := strings.Index(rest, ":")
+	if idx < 0 {
+		return id, ""
 	}
-
-	// Check if a job already exists.
-	n.reshareJobsMu.RLock()
-	existingJob := n.reshareJobs[groupID]
-	n.reshareJobsMu.RUnlock()
-	if existingJob != nil {
-		httpError(w, http.StatusConflict, "reshare already in progress for this group")
-		return
+	iss = id[:len(prefix)+idx]
+	afterIss := rest[idx+1:]
+	// afterIss is "sub[:suffix]" — take just the sub.
+	if colonIdx := strings.Index(afterIss, ":"); colonIdx >= 0 {
+		sub = afterIss[:colonIdx]
+	} else {
+		sub = afterIss
 	}
-
-	// Look up group membership.
-	n.groupsMu.RLock()
-	grp, ok := n.groups[groupID]
-	n.groupsMu.RUnlock()
-	if !ok {
-		httpError(w, http.StatusNotFound, "unknown group")
-		return
-	}
-
-	// Check if there are any keys to reshare.
-	keyCount := 0
-	if keyIDs, err := n.km.ListKeys(groupID); err == nil {
-		keyCount = len(keyIDs)
-	}
-	if keyCount == 0 {
-		httpError(w, http.StatusBadRequest, "no keys to reshare for this group")
-		return
-	}
-
-	// Create a same-committee reshare job (key refresh).
-	members := make([]tss.PartyID, len(grp.Members))
-	copy(members, grp.Members)
-	if err := n.createReshareJob(groupID, "refresh", members, members, grp.Threshold); err != nil {
-		httpError(w, http.StatusInternalServerError, "create reshare job: "+err.Error())
-		return
-	}
-
-	if err := n.startCoordinator(groupID, concurrency); err != nil {
-		httpError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-
-	n.reshareJobsMu.RLock()
-	job := n.reshareJobs[groupID]
-	n.reshareJobsMu.RUnlock()
-	done, _ := n.reshareStore.CountKeysDone(groupID)
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"group_id":    groupID,
-		"keys_total":  len(job.KeysTotal),
-		"keys_done":   done,
-		"concurrency": concurrency,
-		"status":      "started",
-	})
-}
-
-// handleReshareStatus handles POST /admin/reshare/status. Returns current
-// reshare status for a group. Requires admin auth.
-func (n *Node) handleReshareStatus(w http.ResponseWriter, r *http.Request) {
-	var req AdminAuth
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		httpError(w, http.StatusBadRequest, "decode body: "+err.Error())
-		return
-	}
-	groupID := strings.ToLower(req.GroupID)
-	if groupID == "" {
-		httpError(w, http.StatusBadRequest, "group_id is required")
-		return
-	}
-
-	if n.auth.HasAuthKeys(groupID) {
-		if err := n.auth.ValidateAdminAuth(groupID, &req); err != nil {
-			httpError(w, http.StatusUnauthorized, "admin auth failed: "+err.Error())
-			return
-		}
-	}
-
-	n.reshareJobsMu.RLock()
-	job := n.reshareJobs[groupID]
-	n.reshareJobsMu.RUnlock()
-
-	if job == nil {
-		// Check if we know about this group at all.
-		n.groupsMu.RLock()
-		_, known := n.groups[groupID]
-		n.groupsMu.RUnlock()
-		status := "none"
-		if known {
-			status = "active"
-		}
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]interface{}{
-			"group_id": groupID,
-			"status":   status,
-		})
-		return
-	}
-
-	done, _ := n.reshareStore.CountKeysDone(groupID)
-	n.reshareCoordMu.Lock()
-	isCoord := n.reshareCoord[groupID]
-	n.reshareCoordMu.Unlock()
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"group_id":       groupID,
-		"status":         "resharing",
-		"keys_total":     len(job.KeysTotal),
-		"keys_done":      done,
-		"keys_stale":     len(job.KeysTotal) - done,
-		"started_at":     job.StartedAt.Format(time.RFC3339),
-		"is_coordinator": isCoord,
-	})
-}
-
-func httpError(w http.ResponseWriter, code int, msg string) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(code)
-	json.NewEncoder(w).Encode(map[string]string{"error": msg})
+	return iss, sub
 }
 
 // reconnectLoop periodically re-dials any bootstrap peer that is not currently
@@ -1286,4 +497,3 @@ func (n *Node) reconnectLoop(ctx context.Context) {
 		}
 	}
 }
-

@@ -32,16 +32,15 @@ type SessionInfo struct {
 	Aud string    // JWT audience
 	Azp string    // JWT authorized party / client_id
 
-	// OAuth/ZK path: stored so coord messages can carry the proof for
-	// other participants to verify independently.
-	Proof       []byte // ZK proof bytes
-	JWKSModulus []byte // RSA modulus used in the proof
-
-	// Auth key certificate path: stored so coord messages can carry the
-	// certificate for other participants to verify independently.
+	// Auth key certificate path fields (for identity resolution).
 	AuthKeyPub    []byte // 34-byte scheme-prefixed auth key (prefix + compressed pubkey)
 	CertSignature []byte // 64 bytes (ECDSA) or 65 bytes (Schnorr)
 	Identity      string // application-defined identity
+
+	// Delegation token sessions: the session is locked to this specific
+	// key ID. Sign requests auto-resolve to this key without needing
+	// key_suffix. Empty for non-delegation sessions.
+	DelegatedKeyID string
 }
 
 // SessionStore is a thread-safe in-memory cache mapping compressed session

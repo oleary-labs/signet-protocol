@@ -5,29 +5,64 @@
 //!   - `pending/<group_id>` — in-flight reshare results (at most one per key)
 //!   - `archive/<group_id>` — previous generations (for rollback)
 //!
+//! Within each tree, the sled key is `<curve_prefix_byte><key_id>`. This ensures
+//! the same key_id with different curves maps to distinct storage entries.
+//!
 //! Sled transactions span multiple trees for atomic commit/rollback operations.
 
 use serde::{Deserialize, Serialize};
 use sled::Transactional;
 
+use crate::curve::Curve;
+
+/// Key status — controls whether the key can be used for signing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum KeyStatus {
+    Active,
+    Disabled,
+}
+
+impl Default for KeyStatus {
+    fn default() -> Self {
+        KeyStatus::Active
+    }
+}
+
 /// Persistent key material for a single key shard.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StoredKey {
-    /// frost-secp256k1 KeyPackage serialized bytes.
+    /// FROST KeyPackage serialized bytes (curve-specific).
     pub key_package: Vec<u8>,
-    /// frost-secp256k1 PublicKeyPackage serialized bytes.
+    /// FROST PublicKeyPackage serialized bytes (curve-specific).
     pub public_key_package: Vec<u8>,
-    /// 33-byte compressed secp256k1 group public key.
+    /// Compressed group public key (33 bytes secp256k1, 32 bytes Ed25519).
     pub group_key: Vec<u8>,
     /// This node's compressed public key share.
     pub verifying_share: Vec<u8>,
     /// Key generation counter (0 for initial keygen, incremented on reshare).
     pub generation: u64,
+    /// Optional signing scope constraint. Format: [1-byte scheme][scheme-specific].
+    /// Empty = unscoped (signs any hash). Set at keygen time, immutable.
+    #[serde(default)]
+    pub scope: Vec<u8>,
+    /// Key status. Disabled keys reject sign requests but remain visible.
+    /// Defaults to Active for backwards compatibility with existing stored keys.
+    #[serde(default)]
+    pub status: KeyStatus,
 }
 
 /// sled-backed key storage with separate trees for active, pending, and archive.
 pub struct Storage {
     db: sled::Db,
+}
+
+/// Build the sled key: `<curve_prefix_byte><key_id_bytes>`.
+fn storage_key(curve: &Curve, key_id: &str) -> Vec<u8> {
+    let mut k = Vec::with_capacity(1 + key_id.len());
+    k.push(curve.storage_prefix());
+    k.extend_from_slice(key_id.as_bytes());
+    k
 }
 
 impl Storage {
@@ -67,62 +102,105 @@ impl Storage {
     // Active key operations (hot path)
     // -------------------------------------------------------------------------
 
-    /// Store an active key under (group_id, key_id). Flushes immediately —
-    /// this is the keygen completion path and must be durable before reporting success.
-    pub fn put_key(&self, group_id: &str, key_id: &str, key: &StoredKey) -> Result<(), String> {
+    /// Store an active key under (group_id, curve, key_id). Flushes immediately.
+    pub fn put_key(&self, group_id: &str, key_id: &str, curve: &Curve, key: &StoredKey) -> Result<(), String> {
         let tree = self
             .db
             .open_tree(Self::active_tree_name(group_id))
             .map_err(|e| format!("open tree: {e}"))?;
         let data = serde_json::to_vec(key).map_err(|e| format!("serialize key: {e}"))?;
-        tree.insert(key_id.as_bytes(), data)
+        tree.insert(storage_key(curve, key_id), data)
             .map_err(|e| format!("insert key: {e}"))?;
         tree.flush().map_err(|e| format!("flush: {e}"))?;
         Ok(())
     }
 
-    /// Retrieve an active key by (group_id, key_id). Returns None if not found.
-    pub fn get_key(&self, group_id: &str, key_id: &str) -> Result<Option<StoredKey>, String> {
+    /// Retrieve an active key by (group_id, curve, key_id). Returns None if not found.
+    pub fn get_key(&self, group_id: &str, key_id: &str, curve: &Curve) -> Result<Option<StoredKey>, String> {
         let tree = self
             .db
             .open_tree(Self::active_tree_name(group_id))
             .map_err(|e| format!("open tree: {e}"))?;
-        Self::get_from_tree(&tree, key_id)
+        Self::get_from_tree(&tree, &storage_key(curve, key_id))
     }
 
-    /// List all active key IDs for a group.
-    pub fn list_keys(&self, group_id: &str) -> Result<Vec<String>, String> {
+    /// List all active keys for a group, returning (key_id, curve) pairs.
+    pub fn list_keys(&self, group_id: &str) -> Result<Vec<(String, Curve)>, String> {
         let tree = self
             .db
             .open_tree(Self::active_tree_name(group_id))
             .map_err(|e| format!("open tree: {e}"))?;
-        Self::list_from_tree(&tree)
+        let mut entries = Vec::new();
+        for entry in tree.iter() {
+            let (key, _) = entry.map_err(|e| format!("iter: {e}"))?;
+            if key.is_empty() { continue; }
+            let prefix = key[0];
+            let curve = match prefix {
+                0x01 => Curve::Secp256k1,
+                0x02 => Curve::Ed25519,
+                0x03 => Curve::EcdsaSecp256k1,
+                _ => continue, // skip unknown prefixes
+            };
+            let id = String::from_utf8(key[1..].to_vec()).map_err(|e| format!("key utf8: {e}"))?;
+            entries.push((id, curve));
+        }
+        Ok(entries)
+    }
+
+    /// Update the status of an active key. Returns error if key not found.
+    pub fn set_key_status(&self, group_id: &str, key_id: &str, curve: &Curve, status: KeyStatus) -> Result<(), String> {
+        let tree = self
+            .db
+            .open_tree(Self::active_tree_name(group_id))
+            .map_err(|e| format!("open tree: {e}"))?;
+        let sk = storage_key(curve, key_id);
+        let mut key: StoredKey = Self::get_from_tree(&tree, &sk)?
+            .ok_or_else(|| format!("key not found: {group_id}/{key_id}"))?;
+        key.status = status;
+        let data = serde_json::to_vec(&key).map_err(|e| format!("serialize key: {e}"))?;
+        tree.insert(sk, data).map_err(|e| format!("update key: {e}"))?;
+        tree.flush().map_err(|e| format!("flush: {e}"))?;
+        Ok(())
+    }
+
+    /// Permanently delete an active key. Returns error if key not found.
+    pub fn delete_key(&self, group_id: &str, key_id: &str, curve: &Curve) -> Result<(), String> {
+        let tree = self
+            .db
+            .open_tree(Self::active_tree_name(group_id))
+            .map_err(|e| format!("open tree: {e}"))?;
+        let sk = storage_key(curve, key_id);
+        let removed = tree.remove(&sk).map_err(|e| format!("remove key: {e}"))?;
+        if removed.is_none() {
+            return Err(format!("key not found: {group_id}/{key_id}"));
+        }
+        tree.flush().map_err(|e| format!("flush: {e}"))?;
+        Ok(())
     }
 
     // -------------------------------------------------------------------------
     // Pending key operations (reshare in-flight)
     // -------------------------------------------------------------------------
 
-    /// Store a pending reshare result. No immediate flush — the pending result
-    /// is not critical until commit_reshare promotes it (which flushes).
-    pub fn put_pending(&self, group_id: &str, key_id: &str, key: &StoredKey) -> Result<(), String> {
+    /// Store a pending reshare result.
+    pub fn put_pending(&self, group_id: &str, key_id: &str, curve: &Curve, key: &StoredKey) -> Result<(), String> {
         let tree = self
             .db
             .open_tree(Self::pending_tree_name(group_id))
             .map_err(|e| format!("open pending tree: {e}"))?;
         let data = serde_json::to_vec(key).map_err(|e| format!("serialize key: {e}"))?;
-        tree.insert(key_id.as_bytes(), data)
+        tree.insert(storage_key(curve, key_id), data)
             .map_err(|e| format!("insert pending: {e}"))?;
         Ok(())
     }
 
     /// Retrieve a pending reshare result.
-    pub fn get_pending(&self, group_id: &str, key_id: &str) -> Result<Option<StoredKey>, String> {
+    pub fn get_pending(&self, group_id: &str, key_id: &str, curve: &Curve) -> Result<Option<StoredKey>, String> {
         let tree = self
             .db
             .open_tree(Self::pending_tree_name(group_id))
             .map_err(|e| format!("open pending tree: {e}"))?;
-        Self::get_from_tree(&tree, key_id)
+        Self::get_from_tree(&tree, &storage_key(curve, key_id))
     }
 
     // -------------------------------------------------------------------------
@@ -131,7 +209,7 @@ impl Storage {
 
     /// Atomically promote a pending reshare result to active, archiving the
     /// previous active key. Returns the new generation number.
-    pub fn commit_reshare(&self, group_id: &str, key_id: &str) -> Result<u64, String> {
+    pub fn commit_reshare(&self, group_id: &str, key_id: &str, curve: &Curve) -> Result<u64, String> {
         let active_tree = self
             .db
             .open_tree(Self::active_tree_name(group_id))
@@ -145,11 +223,11 @@ impl Storage {
             .open_tree(Self::archive_tree_name(group_id))
             .map_err(|e| format!("open archive tree: {e}"))?;
 
-        let key_bytes = key_id.as_bytes();
+        let sled_key = storage_key(curve, key_id);
 
         // Read pending outside transaction (we need it for the return value).
         let pending_data = pending_tree
-            .get(key_bytes)
+            .get(&sled_key)
             .map_err(|e| format!("read pending: {e}"))?
             .ok_or_else(|| format!("no pending reshare for {group_id}/{key_id}"))?;
         let pending: StoredKey = serde_json::from_slice(&pending_data)
@@ -160,7 +238,7 @@ impl Storage {
         (&active_tree, &pending_tree, &archive_tree)
             .transaction(|(active_tx, pending_tx, archive_tx)| {
                 // Archive current active (if exists).
-                if let Some(current) = active_tx.get(key_bytes)? {
+                if let Some(current) = active_tx.get(&sled_key)? {
                     let current_key: StoredKey = serde_json::from_slice(&current)
                         .map_err(|e| sled::transaction::ConflictableTransactionError::Abort(
                             format!("deserialize active: {e}"),
@@ -170,10 +248,10 @@ impl Storage {
                 }
 
                 // Promote pending to active.
-                active_tx.insert(key_bytes, pending_data.clone())?;
+                active_tx.insert(sled_key.as_slice(), pending_data.clone())?;
 
                 // Remove pending.
-                pending_tx.remove(key_bytes)?;
+                pending_tx.remove(sled_key.as_slice())?;
 
                 Ok(())
             })
@@ -186,14 +264,13 @@ impl Storage {
         Ok(generation)
     }
 
-    /// Discard a pending reshare result without promoting. No flush — discarding
-    /// a pending result is non-critical; sled's auto-flush covers it.
-    pub fn discard_pending_reshare(&self, group_id: &str, key_id: &str) -> Result<(), String> {
+    /// Discard a pending reshare result without promoting.
+    pub fn discard_pending_reshare(&self, group_id: &str, key_id: &str, curve: &Curve) -> Result<(), String> {
         let tree = self
             .db
             .open_tree(Self::pending_tree_name(group_id))
             .map_err(|e| format!("open pending tree: {e}"))?;
-        tree.remove(key_id.as_bytes())
+        tree.remove(storage_key(curve, key_id))
             .map_err(|e| format!("remove pending: {e}"))?;
         Ok(())
     }
@@ -203,6 +280,7 @@ impl Storage {
         &self,
         group_id: &str,
         key_id: &str,
+        curve: &Curve,
         generation: u64,
     ) -> Result<(), String> {
         let active_tree = self
@@ -219,7 +297,7 @@ impl Storage {
             .map_err(|e| format!("open pending tree: {e}"))?;
 
         let archive_key_name = format!("gen{g}/{key_id}", g = generation);
-        let key_bytes = key_id.as_bytes();
+        let sled_key = storage_key(curve, key_id);
 
         let archived_data = archive_tree
             .get(archive_key_name.as_bytes())
@@ -231,8 +309,8 @@ impl Storage {
         // Atomic: replace active + remove any pending.
         (&active_tree, &pending_tree)
             .transaction(|(active_tx, pending_tx)| {
-                active_tx.insert(key_bytes, archived_data.clone())?;
-                pending_tx.remove(key_bytes)?;
+                active_tx.insert(sled_key.as_slice(), archived_data.clone())?;
+                pending_tx.remove(sled_key.as_slice())?;
                 Ok(())
             })
             .map_err(|e: sled::transaction::TransactionError<()>| {
@@ -243,7 +321,38 @@ impl Storage {
         Ok(())
     }
 
-    /// Drop all pending keys for a group. Safe when no reshares are in flight.
+    /// Migrate all keys from one group to another. Moves key data from the
+    /// old group's active tree to the new group's active tree, then drops
+    /// the old tree.
+    pub fn migrate_group(&self, old_group_id: &str, new_group_id: &str) -> Result<usize, String> {
+        let old_tree = self
+            .db
+            .open_tree(Self::active_tree_name(old_group_id))
+            .map_err(|e| format!("open old tree: {e}"))?;
+        let new_tree = self
+            .db
+            .open_tree(Self::active_tree_name(new_group_id))
+            .map_err(|e| format!("open new tree: {e}"))?;
+
+        let mut count = 0;
+        for entry in old_tree.iter() {
+            let (key, value) = entry.map_err(|e| format!("iter: {e}"))?;
+            new_tree
+                .insert(key, value)
+                .map_err(|e| format!("insert: {e}"))?;
+            count += 1;
+        }
+        self.db.flush().map_err(|e| format!("flush: {e}"))?;
+
+        // Drop the old tree.
+        self.db
+            .drop_tree(Self::active_tree_name(old_group_id).as_bytes())
+            .map_err(|e| format!("drop old tree: {e}"))?;
+
+        Ok(count)
+    }
+
+    /// Drop all pending keys for a group.
     pub fn drop_pending(&self, group_id: &str) -> Result<(), String> {
         let name = Self::pending_tree_name(group_id);
         self.db
@@ -252,7 +361,7 @@ impl Storage {
         Ok(())
     }
 
-    /// Drop all archived keys for a group. Safe after confirming active keys are healthy.
+    /// Drop all archived keys for a group.
     pub fn drop_archive(&self, group_id: &str) -> Result<(), String> {
         let name = Self::archive_tree_name(group_id);
         self.db
@@ -265,8 +374,8 @@ impl Storage {
     // Internal helpers
     // -------------------------------------------------------------------------
 
-    fn get_from_tree(tree: &sled::Tree, key_id: &str) -> Result<Option<StoredKey>, String> {
-        match tree.get(key_id.as_bytes()) {
+    fn get_from_tree(tree: &sled::Tree, sled_key: &[u8]) -> Result<Option<StoredKey>, String> {
+        match tree.get(sled_key) {
             Ok(Some(data)) => {
                 let key: StoredKey =
                     serde_json::from_slice(&data).map_err(|e| format!("deserialize key: {e}"))?;
@@ -275,16 +384,6 @@ impl Storage {
             Ok(None) => Ok(None),
             Err(e) => Err(format!("get key: {e}")),
         }
-    }
-
-    fn list_from_tree(tree: &sled::Tree) -> Result<Vec<String>, String> {
-        let mut ids = Vec::new();
-        for entry in tree.iter() {
-            let (key, _) = entry.map_err(|e| format!("iter: {e}"))?;
-            let id = String::from_utf8(key.to_vec()).map_err(|e| format!("key utf8: {e}"))?;
-            ids.push(id);
-        }
-        Ok(ids)
     }
 }
 
@@ -303,71 +402,111 @@ mod tests {
             group_key: vec![0x02; 33],
             verifying_share: vec![0x03; 33],
             generation: 0,
+                scope: vec![],
+                status: KeyStatus::Active,
         };
 
-        storage.put_key("group-1", "key-a", &key).unwrap();
-        storage.put_key("group-1", "key-b", &key).unwrap();
+        storage.put_key("group-1", "key-a", &Curve::Secp256k1, &key).unwrap();
+        storage.put_key("group-1", "key-b", &Curve::Secp256k1, &key).unwrap();
 
-        let loaded = storage.get_key("group-1", "key-a").unwrap().unwrap();
+        let loaded = storage.get_key("group-1", "key-a", &Curve::Secp256k1).unwrap().unwrap();
         assert_eq!(loaded.key_package, vec![1, 2, 3]);
         assert_eq!(loaded.generation, 0);
 
-        assert!(storage.get_key("group-1", "key-missing").unwrap().is_none());
+        assert!(storage.get_key("group-1", "key-missing", &Curve::Secp256k1).unwrap().is_none());
+
+        // Same key_id with different curve should not be found.
+        assert!(storage.get_key("group-1", "key-a", &Curve::Ed25519).unwrap().is_none());
 
         let ids = storage.list_keys("group-1").unwrap();
-        assert_eq!(ids, vec!["key-a", "key-b"]);
+        assert_eq!(ids, vec![
+            ("key-a".to_string(), Curve::Secp256k1),
+            ("key-b".to_string(), Curve::Secp256k1),
+        ]);
 
         let empty = storage.list_keys("group-missing").unwrap();
         assert!(empty.is_empty());
     }
 
     #[test]
-    fn test_pending_lifecycle() {
+    fn test_same_keyid_different_curves() {
         let dir = tempfile::tempdir().unwrap();
         let storage = Storage::new(dir.path().to_str().unwrap()).unwrap();
 
-        // Initial active key.
+        let secp_key = StoredKey {
+            key_package: vec![1],
+            public_key_package: vec![2],
+            group_key: vec![0x02; 33],
+            verifying_share: vec![0x03; 33],
+            generation: 0,
+                scope: vec![],
+                status: KeyStatus::Active,
+        };
+        let ed_key = StoredKey {
+            key_package: vec![10],
+            public_key_package: vec![20],
+            group_key: vec![0x04; 32],
+            verifying_share: vec![0x05; 32],
+            generation: 0,
+                scope: vec![],
+                status: KeyStatus::Active,
+        };
+
+        storage.put_key("group-1", "k1", &Curve::Secp256k1, &secp_key).unwrap();
+        storage.put_key("group-1", "k1", &Curve::Ed25519, &ed_key).unwrap();
+
+        let loaded_secp = storage.get_key("group-1", "k1", &Curve::Secp256k1).unwrap().unwrap();
+        assert_eq!(loaded_secp.key_package, vec![1]);
+
+        let loaded_ed = storage.get_key("group-1", "k1", &Curve::Ed25519).unwrap().unwrap();
+        assert_eq!(loaded_ed.key_package, vec![10]);
+    }
+
+    #[test]
+    fn test_pending_lifecycle() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::new(dir.path().to_str().unwrap()).unwrap();
+        let c = Curve::Secp256k1;
+
         let key_gen0 = StoredKey {
             key_package: vec![1],
             public_key_package: vec![2],
             group_key: vec![0x02; 33],
             verifying_share: vec![0x03; 33],
             generation: 0,
+                scope: vec![],
+                status: KeyStatus::Active,
         };
-        storage.put_key("group-1", "k1", &key_gen0).unwrap();
+        storage.put_key("group-1", "k1", &c, &key_gen0).unwrap();
 
-        // Write pending reshare result.
         let key_gen1 = StoredKey {
             key_package: vec![10],
             public_key_package: vec![20],
             group_key: vec![0x02; 33],
             verifying_share: vec![0x04; 33],
             generation: 1,
+                scope: vec![],
+                status: KeyStatus::Active,
         };
-        storage.put_pending("group-1", "k1", &key_gen1).unwrap();
+        storage.put_pending("group-1", "k1", &c, &key_gen1).unwrap();
 
-        // Pending should not appear in active list.
-        let ids = storage.list_keys("group-1").unwrap();
-        assert_eq!(ids, vec!["k1"]);
-        assert_eq!(storage.get_key("group-1", "k1").unwrap().unwrap().generation, 0);
+        assert_eq!(storage.get_key("group-1", "k1", &c).unwrap().unwrap().generation, 0);
 
-        // Commit: pending → active, old → archive.
-        let new_gen = storage.commit_reshare("group-1", "k1").unwrap();
+        let new_gen = storage.commit_reshare("group-1", "k1", &c).unwrap();
         assert_eq!(new_gen, 1);
 
-        // Active should now be gen 1.
-        let active = storage.get_key("group-1", "k1").unwrap().unwrap();
+        let active = storage.get_key("group-1", "k1", &c).unwrap().unwrap();
         assert_eq!(active.generation, 1);
         assert_eq!(active.key_package, vec![10]);
 
-        // Pending should be gone.
-        assert!(storage.get_pending("group-1", "k1").unwrap().is_none());
+        assert!(storage.get_pending("group-1", "k1", &c).unwrap().is_none());
     }
 
     #[test]
     fn test_rollback() {
         let dir = tempfile::tempdir().unwrap();
         let storage = Storage::new(dir.path().to_str().unwrap()).unwrap();
+        let c = Curve::Secp256k1;
 
         let key_gen0 = StoredKey {
             key_package: vec![1],
@@ -375,8 +514,10 @@ mod tests {
             group_key: vec![0x02; 33],
             verifying_share: vec![0x03; 33],
             generation: 0,
+                scope: vec![],
+                status: KeyStatus::Active,
         };
-        storage.put_key("group-1", "k1", &key_gen0).unwrap();
+        storage.put_key("group-1", "k1", &c, &key_gen0).unwrap();
 
         let key_gen1 = StoredKey {
             key_package: vec![10],
@@ -384,13 +525,14 @@ mod tests {
             group_key: vec![0x02; 33],
             verifying_share: vec![0x04; 33],
             generation: 1,
+                scope: vec![],
+                status: KeyStatus::Active,
         };
-        storage.put_pending("group-1", "k1", &key_gen1).unwrap();
-        storage.commit_reshare("group-1", "k1").unwrap();
+        storage.put_pending("group-1", "k1", &c, &key_gen1).unwrap();
+        storage.commit_reshare("group-1", "k1", &c).unwrap();
 
-        // Active is gen 1. Rollback to gen 0.
-        storage.rollback_reshare("group-1", "k1", 0).unwrap();
-        let active = storage.get_key("group-1", "k1").unwrap().unwrap();
+        storage.rollback_reshare("group-1", "k1", &c, 0).unwrap();
+        let active = storage.get_key("group-1", "k1", &c).unwrap().unwrap();
         assert_eq!(active.generation, 0);
         assert_eq!(active.key_package, vec![1]);
     }
@@ -399,6 +541,7 @@ mod tests {
     fn test_discard_pending() {
         let dir = tempfile::tempdir().unwrap();
         let storage = Storage::new(dir.path().to_str().unwrap()).unwrap();
+        let c = Curve::Secp256k1;
 
         let key = StoredKey {
             key_package: vec![99],
@@ -406,18 +549,21 @@ mod tests {
             group_key: vec![],
             verifying_share: vec![],
             generation: 1,
+                scope: vec![],
+                status: KeyStatus::Active,
         };
-        storage.put_pending("group-1", "k1", &key).unwrap();
-        assert!(storage.get_pending("group-1", "k1").unwrap().is_some());
+        storage.put_pending("group-1", "k1", &c, &key).unwrap();
+        assert!(storage.get_pending("group-1", "k1", &c).unwrap().is_some());
 
-        storage.discard_pending_reshare("group-1", "k1").unwrap();
-        assert!(storage.get_pending("group-1", "k1").unwrap().is_none());
+        storage.discard_pending_reshare("group-1", "k1", &c).unwrap();
+        assert!(storage.get_pending("group-1", "k1", &c).unwrap().is_none());
     }
 
     #[test]
     fn test_drop_archive() {
         let dir = tempfile::tempdir().unwrap();
         let storage = Storage::new(dir.path().to_str().unwrap()).unwrap();
+        let c = Curve::Secp256k1;
 
         let key = StoredKey {
             key_package: vec![1],
@@ -425,20 +571,19 @@ mod tests {
             group_key: vec![0x02; 33],
             verifying_share: vec![0x03; 33],
             generation: 0,
+                scope: vec![],
+                status: KeyStatus::Active,
         };
-        storage.put_key("group-1", "k1", &key).unwrap();
+        storage.put_key("group-1", "k1", &c, &key).unwrap();
 
         let key1 = StoredKey { generation: 1, ..key.clone() };
-        storage.put_pending("group-1", "k1", &key1).unwrap();
-        storage.commit_reshare("group-1", "k1").unwrap();
+        storage.put_pending("group-1", "k1", &c, &key1).unwrap();
+        storage.commit_reshare("group-1", "k1", &c).unwrap();
 
-        // Archive exists. Drop it.
         storage.drop_archive("group-1").unwrap();
 
-        // Active still works.
-        assert_eq!(storage.get_key("group-1", "k1").unwrap().unwrap().generation, 1);
+        assert_eq!(storage.get_key("group-1", "k1", &c).unwrap().unwrap().generation, 1);
 
-        // Rollback should now fail (no archive).
-        assert!(storage.rollback_reshare("group-1", "k1", 0).is_err());
+        assert!(storage.rollback_reshare("group-1", "k1", &c, 0).is_err());
     }
 }

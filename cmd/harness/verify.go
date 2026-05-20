@@ -1,6 +1,7 @@
 package main
 
 import (
+	"crypto/ed25519"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
@@ -140,6 +141,99 @@ func frostChallenge(rCompressed, groupPubKey, message []byte) *big.Int {
 	c := new(big.Int).SetBytes(uniform)
 	c.Mod(c, secp256k1N)
 	return c
+}
+
+// VerifyECDSASignature verifies a recoverable ECDSA signature (65-byte hex: r||s||v)
+// against the group public key (33-byte compressed hex) and message hash (32-byte hex).
+func VerifyECDSASignature(sigHex, groupPubKeyHex, msgHashHex string) error {
+	sigBytes, err := decodeHex(sigHex)
+	if err != nil {
+		return fmt.Errorf("decode sig: %w", err)
+	}
+	if len(sigBytes) != 65 {
+		return fmt.Errorf("ecdsa sig must be 65 bytes, got %d", len(sigBytes))
+	}
+
+	groupKey, err := decodeHex(groupPubKeyHex)
+	if err != nil {
+		return fmt.Errorf("decode group key: %w", err)
+	}
+
+	msgHash, err := decodeHex(msgHashHex)
+	if err != nil {
+		return fmt.Errorf("decode msg hash: %w", err)
+	}
+	if len(msgHash) != 32 {
+		return fmt.Errorf("msg hash must be 32 bytes, got %d", len(msgHash))
+	}
+
+	// Verify s is in the lower half (EIP-2).
+	s := new(big.Int).SetBytes(sigBytes[32:64])
+	halfN := new(big.Int).Rsh(secp256k1N, 1)
+	if s.Cmp(halfN) > 0 {
+		return fmt.Errorf("ECDSA s not normalized (EIP-2): s > N/2")
+	}
+
+	// ecrecover and compare.
+	recovered, err := crypto.Ecrecover(msgHash, sigBytes)
+	if err != nil {
+		return fmt.Errorf("ecrecover: %w", err)
+	}
+
+	pubKey, err := crypto.DecompressPubkey(groupKey)
+	if err != nil {
+		return fmt.Errorf("decompress group key: %w", err)
+	}
+	expected := crypto.FromECDSAPub(pubKey)
+
+	if !equal(recovered, expected) {
+		recoveredAddr := common.BytesToAddress(crypto.Keccak256(recovered[1:])[12:])
+		expectedAddr := crypto.PubkeyToAddress(*pubKey)
+		return fmt.Errorf("ecrecover mismatch: got %s, want %s", recoveredAddr.Hex(), expectedAddr.Hex())
+	}
+	return nil
+}
+
+func equal(a, b []byte) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// VerifyEd25519Signature verifies a FROST Ed25519 signature (64-byte hex: R||Z)
+// against the group public key (32-byte hex) and the original message (32-byte hex hash).
+func VerifyEd25519Signature(sigHex, groupPubKeyHex, msgHashHex string) error {
+	sigBytes, err := decodeHex(sigHex)
+	if err != nil {
+		return fmt.Errorf("decode sig: %w", err)
+	}
+	if len(sigBytes) != 64 {
+		return fmt.Errorf("ed25519 sig must be 64 bytes, got %d", len(sigBytes))
+	}
+	pubKey, err := decodeHex(groupPubKeyHex)
+	if err != nil {
+		return fmt.Errorf("decode group key: %w", err)
+	}
+	if len(pubKey) != 32 {
+		return fmt.Errorf("ed25519 pubkey must be 32 bytes, got %d", len(pubKey))
+	}
+	msgHash, err := decodeHex(msgHashHex)
+	if err != nil {
+		return fmt.Errorf("decode msg hash: %w", err)
+	}
+	if len(msgHash) != 32 {
+		return fmt.Errorf("msg hash must be 32 bytes, got %d", len(msgHash))
+	}
+	if !ed25519.Verify(ed25519.PublicKey(pubKey), msgHash, sigBytes) {
+		return fmt.Errorf("ed25519 signature verification failed")
+	}
+	return nil
 }
 
 // IsValidCompressedPubkey returns true if s is a valid 33-byte compressed secp256k1 point.

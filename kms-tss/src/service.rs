@@ -7,12 +7,14 @@ use tokio::sync::Mutex;
 use tonic::{Request, Response, Status};
 use tracing::{info, warn};
 
+use crate::curve::Curve;
 use crate::params;
 use crate::proto;
 use crate::proto::key_manager_server::KeyManager;
 use crate::proto::*;
-use crate::session::{OutgoingMessage, Session, StepOutput};
+use crate::session::Session;
 use crate::storage::Storage;
+use crate::types::{OutgoingMessage, StepOutput};
 
 /// Shared state for the KMS service.
 ///
@@ -22,6 +24,16 @@ use crate::storage::Storage;
 pub struct KmsService {
     storage: Arc<Storage>,
     sessions: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<Session>>>>>,
+}
+
+/// Parse a curve string from proto, defaulting to secp256k1 if empty.
+fn parse_curve(s: &str) -> Result<Curve, Status> {
+    match s {
+        "" | "secp256k1" => Ok(Curve::Secp256k1),
+        "ed25519" => Ok(Curve::Ed25519),
+        "ecdsa_secp256k1" => Ok(Curve::EcdsaSecp256k1),
+        _ => Err(Status::invalid_argument(format!("unknown curve: {s}"))),
+    }
 }
 
 impl KmsService {
@@ -46,7 +58,7 @@ impl KmsService {
     }
 
     /// Convert a session result to a proto SessionResult.
-    fn to_proto_result(r: crate::session::SessionResult) -> proto::SessionResult {
+    fn to_proto_result(r: crate::types::SessionResult) -> proto::SessionResult {
         proto::SessionResult {
             signature_r: r.signature_r.unwrap_or_default(),
             signature_z: r.signature_z.unwrap_or_default(),
@@ -231,9 +243,10 @@ impl KeyManager for KmsService {
         let key_id = &req.key_id;
         info!(group_id = %group_id, key_id = %key_id, "commit_reshare");
 
+        let curve = parse_curve(&req.curve)?;
         let generation = self
             .storage
-            .commit_reshare(&group_id, key_id)
+            .commit_reshare(&group_id, key_id, &curve)
             .map_err(|e| Status::internal(e))?;
 
         Ok(Response::new(CommitReshareResponse { generation }))
@@ -248,8 +261,9 @@ impl KeyManager for KmsService {
         let key_id = &req.key_id;
         info!(group_id = %group_id, key_id = %key_id, "discard_pending_reshare");
 
+        let curve = parse_curve(&req.curve)?;
         self.storage
-            .discard_pending_reshare(&group_id, key_id)
+            .discard_pending_reshare(&group_id, key_id, &curve)
             .map_err(|e| Status::internal(e))?;
 
         Ok(Response::new(DiscardPendingReshareResponse {}))
@@ -265,8 +279,9 @@ impl KeyManager for KmsService {
         let generation = req.generation;
         info!(group_id = %group_id, key_id = %key_id, generation = generation, "rollback_reshare");
 
+        let curve = parse_curve(&req.curve)?;
         self.storage
-            .rollback_reshare(&group_id, key_id, generation)
+            .rollback_reshare(&group_id, key_id, &curve, generation)
             .map_err(|e| Status::internal(e))?;
 
         Ok(Response::new(RollbackReshareResponse {}))
@@ -280,16 +295,23 @@ impl KeyManager for KmsService {
         let group_id = hex::encode(&req.group_id);
         let key_id = &req.key_id;
 
+        let curve = parse_curve(&req.curve)?;
         let stored = self
             .storage
-            .get_key(&group_id, key_id)
+            .get_key(&group_id, key_id, &curve)
             .map_err(|e| Status::internal(e))?
-            .ok_or_else(|| Status::not_found(format!("key not found: {group_id}/{key_id}")))?;
+            .ok_or_else(|| Status::not_found(format!("key not found: {group_id}/{key_id} curve={curve}")))?;
 
+        let status = match stored.status {
+            crate::storage::KeyStatus::Active => "active",
+            crate::storage::KeyStatus::Disabled => "disabled",
+        };
         Ok(Response::new(PublicKeyResponse {
             group_key: stored.group_key,
             verifying_share: stored.verifying_share,
             generation: stored.generation,
+            scope: stored.scope,
+            status: status.to_string(),
         }))
     }
 
@@ -299,11 +321,60 @@ impl KeyManager for KmsService {
     ) -> Result<Response<KeyListResponse>, Status> {
         let group_id = hex::encode(&request.into_inner().group_id);
 
-        let key_ids = self
+        let keys = self
             .storage
             .list_keys(&group_id)
             .map_err(|e| Status::internal(e))?;
 
-        Ok(Response::new(KeyListResponse { key_ids }))
+        let entries: Vec<KeyListEntry> = keys.into_iter()
+            .map(|(id, curve)| KeyListEntry {
+                key_id: id,
+                curve: curve.as_str().to_string(),
+            })
+            .collect();
+
+        Ok(Response::new(KeyListResponse { entries }))
+    }
+
+    async fn set_key_status(
+        &self,
+        request: Request<SetKeyStatusRequest>,
+    ) -> Result<Response<SetKeyStatusResponse>, Status> {
+        let req = request.into_inner();
+        let group_id = hex::encode(&req.group_id);
+        let key_id = &req.key_id;
+        let curve = parse_curve(&req.curve)?;
+
+        let status = match req.status.as_str() {
+            "active" => crate::storage::KeyStatus::Active,
+            "disabled" => crate::storage::KeyStatus::Disabled,
+            other => return Err(Status::invalid_argument(format!("invalid status: {other}"))),
+        };
+
+        info!(group_id = %group_id, key_id = %key_id, status = %req.status, "set_key_status");
+
+        self.storage
+            .set_key_status(&group_id, key_id, &curve, status)
+            .map_err(|e| Status::internal(e))?;
+
+        Ok(Response::new(SetKeyStatusResponse {}))
+    }
+
+    async fn delete_key(
+        &self,
+        request: Request<KeyRef>,
+    ) -> Result<Response<DeleteKeyResponse>, Status> {
+        let req = request.into_inner();
+        let group_id = hex::encode(&req.group_id);
+        let key_id = &req.key_id;
+        let curve = parse_curve(&req.curve)?;
+
+        info!(group_id = %group_id, key_id = %key_id, "delete_key");
+
+        self.storage
+            .delete_key(&group_id, key_id, &curve)
+            .map_err(|e| Status::internal(e))?;
+
+        Ok(Response::new(DeleteKeyResponse {}))
     }
 }

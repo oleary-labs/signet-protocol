@@ -3,7 +3,7 @@
 #   • anvil  (local EVM, port 8545)
 #   • SignetFactory deployed and all three nodes registered on-chain
 #   • A SignetGroup created with all three nodes as members
-#   • kms-frost instances (one per node, unless --no-kms)
+#   • kms-tss instances (one per node, unless --no-kms)
 #   • signetd node{1,2,3} with p2p + HTTP APIs
 #
 # Usage:
@@ -65,12 +65,12 @@ go build -o "$BUILD/signetd"     ./cmd/signetd
 go build -o "$BUILD/devnet-init" ./cmd/devnet-init
 
 if $USE_KMS; then
-    info "Building kms-frost..."
+    info "Building kms-tss..."
     command -v cargo >/dev/null 2>&1 || die "'cargo' not found — install Rust (https://rustup.rs)"
-    (cd "$REPO/kms-frost" && cargo build --release --quiet)
-    cp "$REPO/kms-frost/target/release/kms-frost" "$BUILD/kms-frost"
+    (cd "$REPO/kms-tss" && cargo build --release --quiet)
+    cp "$REPO/kms-tss/target/release/kms-tss" "$BUILD/kms-tss"
     # macOS invalidates adhoc code signatures on copy; re-sign.
-    codesign -s - "$BUILD/kms-frost" 2>/dev/null || true
+    codesign -s - "$BUILD/kms-tss" 2>/dev/null || true
 fi
 
 # --------------------------------------------------------------------------
@@ -224,9 +224,12 @@ info "Creating signing group..."
 # auth policy and requests are unauthenticated (the existing devnet behavior).
 if $USE_AUTH; then
     GOOGLE_ISS="https://accounts.google.com"
-    GOOGLE_CLIENT_ID="${GOOGLE_CLIENT_ID:-203385367894-0uhir5bt81bsg1gcflfg6tdt1m3eeo0s.apps.googleusercontent.com}"
-    ISSUERS="[(${GOOGLE_ISS},[${GOOGLE_CLIENT_ID}])]"
-    echo "    issuer: ${GOOGLE_ISS} (client_id: ${GOOGLE_CLIENT_ID})"
+    CID1="203385367894-0uhir5bt81bsg1gcflfg6tdt1m3eeo0s.apps.googleusercontent.com"
+    CID2="203385367894-30dkghcu30d4sjacullkc1q49epnvnrt.apps.googleusercontent.com"
+    ISSUERS="[(${GOOGLE_ISS},[${CID1},${CID2}])]"
+    echo "    issuer: ${GOOGLE_ISS}"
+    echo "      client_id: ${CID1}"
+    echo "      client_id: ${CID2}"
 else
     ISSUERS="[]"
 fi
@@ -301,7 +304,7 @@ if $USE_KMS; then
         # Remove stale socket.
         rm -f "$KMS_SOCK"
 
-        RUST_LOG=kms_frost=info "$BUILD/kms-frost" "$KMS_SOCK" "$KMS_DATA" \
+        RUST_LOG=kms_tss=info "$BUILD/kms-tss" "$KMS_SOCK" "$KMS_DATA" \
             > "$DEVNET/kms${i}.log" 2>&1 &
         echo "KMS${i}_PID=$!" >> "$PIDS_FILE"
     done
@@ -380,7 +383,7 @@ echo "  AcctFactory: $ACCOUNT_FACTORY"
 echo "  Validator  : $FROST_VALIDATOR"
 fi
 if $USE_KMS; then
-echo "  KMS       : Rust kms-frost (devnet/kms{1,2,3}.sock)"
+echo "  KMS       : Rust kms-tss (devnet/kms{1,2,3}.sock)"
 else
 echo "  KMS       : disabled (in-process Go TSS)"
 fi

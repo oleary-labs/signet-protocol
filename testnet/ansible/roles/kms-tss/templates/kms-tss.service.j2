@@ -1,5 +1,5 @@
 [Unit]
-Description=Signet FROST Key Management Service
+Description=Signet TSS Key Management Service
 Before=signetd.service
 
 [Service]
@@ -11,11 +11,11 @@ ExecStart={{ kms_bin }} {{ kms_socket }} {{ kms_data_dir }}
 Restart=on-failure
 RestartSec=3
 LimitNOFILE=65536
-Environment=RUST_LOG=kms_frost={{ log_level | default('info') }}
+Environment=RUST_LOG=kms_tss={{ log_level | default('info') }}
 
 StandardOutput=journal
 StandardError=journal
-SyslogIdentifier=kms-frost
+SyslogIdentifier=kms-tss
 
 [Install]
 WantedBy=multi-user.target

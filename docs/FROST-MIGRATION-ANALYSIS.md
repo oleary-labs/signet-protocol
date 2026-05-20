@@ -1,7 +1,7 @@
 # FROST Migration Analysis
 
 > **Historical document — migration complete.** FROST replaced LSS for keygen and signing.
-> The production implementation now uses ZcashFoundation/frost (Rust) in the `kms-frost`
+> The production implementation now uses ZcashFoundation/frost (Rust) in the `kms-tss`
 > KMS process, rather than `bytemare/frost` (Go) as originally planned here. The Go
 > `bytemare/frost` path is retained as a development fallback (`--no-kms`).
 >

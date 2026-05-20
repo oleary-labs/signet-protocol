@@ -46,7 +46,7 @@ func TestReshareStore_JobLifecycle(t *testing.T) {
 		NewParties:   []tss.PartyID{"p2", "p3", "p4"},
 		OldThreshold: 2,
 		NewThreshold: 2,
-		KeysTotal:    []string{"k1", "k2", "k3"},
+		KeysTotal:    []KeyEntry{{KeyID: "k1", Curve: CurveSecp256k1}, {KeyID: "k2", Curve: CurveSecp256k1}, {KeyID: "k3", Curve: CurveSecp256k1}},
 		StartedAt:    now,
 		EventType:    "node_added",
 	}

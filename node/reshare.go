@@ -195,7 +195,7 @@ func (n *Node) isKeyStale(groupID, keyID string) bool {
 		return false
 	}
 	for _, k := range job.KeysTotal {
-		if k == keyID {
+		if k.KeyID == keyID {
 			done, _ := n.reshareStore.IsKeyDone(groupID, keyID)
 			return !done
 		}
@@ -243,7 +243,7 @@ func (n *Node) waitForReshare(ctx context.Context, groupID, keyID string) error 
 	// Run the reshare in the foreground (caller is the sign handler).
 	// runReshareSession closes the per-key channel on all exit paths, so
 	// we don't need to call completeReshareKey here.
-	err := n.runReshareSession(ctx, groupID, keyID)
+	err := n.runReshareSession(ctx, groupID, keyID, CurveSecp256k1) // on-demand reshare defaults to secp256k1
 	if err != nil {
 		return fmt.Errorf("on-demand reshare: %w", err)
 	}
@@ -254,7 +254,7 @@ func (n *Node) waitForReshare(ctx context.Context, groupID, keyID string) error 
 // loop and on-demand path. The caller must have registered the key channel via
 // tryRegisterReshareKey before calling this; runReshareSession is responsible
 // for closing that channel on all exit paths (success or error).
-func (n *Node) runReshareSession(ctx context.Context, groupID, keyID string) (err error) {
+func (n *Node) runReshareSession(ctx context.Context, groupID, keyID string, curve Curve) (err error) {
 	// Guarantee channel cleanup on every return path. This is critical: if we
 	// fail to close the channel, coordinatorLoop and waitForReshare waiters
 	// hang forever.
@@ -321,7 +321,7 @@ func (n *Node) runReshareSession(ctx context.Context, groupID, keyID string) (er
 		if lkm, ok := n.km.(*LocalKeyManager); ok {
 			if cfg, err := lkm.loadConfig(groupID, keyID); err == nil && cfg != nil && cfg.Generation > 0 {
 				targetGen := cfg.Generation - 1
-				if err := n.km.RollbackReshare(groupID, keyID, targetGen); err != nil {
+				if err := n.km.RollbackReshare(groupID, keyID, curve, targetGen); err != nil {
 					return fmt.Errorf("coordinator self-rollback to gen %d: %w", targetGen, err)
 				}
 				n.log.Warn("reshare: coordinator rolled back previously committed key",
@@ -334,7 +334,7 @@ func (n *Node) runReshareSession(ctx context.Context, groupID, keyID string) (er
 	}
 
 	// Discard any stale pending from a previous failed attempt.
-	n.km.DiscardPendingReshare(groupID, keyID)
+	n.km.DiscardPendingReshare(groupID, keyID, CurveSecp256k1)
 
 	result, err := n.km.RunReshare(sessCtx, ReshareParams{
 		Host:         n.host,
@@ -346,10 +346,11 @@ func (n *Node) runReshareSession(ctx context.Context, groupID, keyID string) (er
 		NewParties:   job.NewParties,
 		OldThreshold: job.OldThreshold,
 		NewThreshold: job.NewThreshold,
+		Curve:        curve,
 	})
 	if err != nil {
 		// Protocol failed — discard any pending result so old share stays active.
-		n.km.DiscardPendingReshare(groupID, keyID)
+		n.km.DiscardPendingReshare(groupID, keyID, CurveSecp256k1)
 		return fmt.Errorf("protocol: %w", err)
 	}
 
@@ -368,12 +369,12 @@ func (n *Node) runReshareSession(ctx context.Context, groupID, keyID string) (er
 		// At least one participant failed to commit. Discard our own pending
 		// result so all nodes stay on the current generation. The coordinator
 		// retry loop will attempt the reshare again for this key.
-		n.km.DiscardPendingReshare(groupID, keyID)
+		n.km.DiscardPendingReshare(groupID, keyID, CurveSecp256k1)
 		return fmt.Errorf("commit aborted (participant failure): %w", commitErr)
 	}
 
 	// All participants committed — safe to commit locally.
-	if err := n.km.CommitReshare(groupID, keyID); err != nil {
+	if err := n.km.CommitReshare(groupID, keyID, CurveSecp256k1); err != nil {
 		n.log.Error("reshare: local commit failed",
 			zap.String("group_id", groupID),
 			zap.String("key_id", keyID),
@@ -461,11 +462,11 @@ func (n *Node) coordinatorLoop(groupID string, job *ReshareJob, concurrency int)
 	}
 
 	// Collect keys that need processing.
-	pending := make([]string, 0, len(job.KeysTotal))
-	for _, keyID := range job.KeysTotal {
-		done, _ := n.reshareStore.IsKeyDone(groupID, keyID)
+	pending := make([]KeyEntry, 0, len(job.KeysTotal))
+	for _, ke := range job.KeysTotal {
+		done, _ := n.reshareStore.IsKeyDone(groupID, ke.KeyID)
 		if !done {
-			pending = append(pending, keyID)
+			pending = append(pending, ke)
 		}
 	}
 
@@ -480,39 +481,39 @@ func (n *Node) coordinatorLoop(groupID string, job *ReshareJob, concurrency int)
 			time.Sleep(backoff)
 		}
 
-		var failed []string
+		var failed []KeyEntry
 		var failedMu sync.Mutex
 
 		sem := make(chan struct{}, concurrency)
 		var wg sync.WaitGroup
 
-		for _, keyID := range pending {
-			done, _ := n.reshareStore.IsKeyDone(groupID, keyID)
+		for _, ke := range pending {
+			done, _ := n.reshareStore.IsKeyDone(groupID, ke.KeyID)
 			if done {
 				continue
 			}
-			if !n.tryRegisterReshareKey(groupID, keyID) {
+			if !n.tryRegisterReshareKey(groupID, ke.KeyID) {
 				continue
 			}
 
 			sem <- struct{}{}
 			wg.Add(1)
 
-			go func(kid string) {
+			go func(ke KeyEntry) {
 				defer wg.Done()
 				defer func() { <-sem }()
 
-				err := n.runReshareSession(n.ctx, groupID, kid)
+				err := n.runReshareSession(n.ctx, groupID, ke.KeyID, ke.Curve)
 				if err != nil {
 					n.log.Error("reshare: coordinator key failed",
 						zap.String("group_id", groupID),
-						zap.String("key_id", kid),
+						zap.String("key_id", ke.KeyID),
 						zap.Error(err))
 					failedMu.Lock()
-					failed = append(failed, kid)
+					failed = append(failed, ke)
 					failedMu.Unlock()
 				}
-			}(keyID)
+			}(ke)
 		}
 
 		wg.Wait()
@@ -608,6 +609,7 @@ func (n *Node) runReshareBatch(ctx context.Context, groupID string, job *Reshare
 			NewParties:   job.NewParties,
 			OldThreshold: job.OldThreshold,
 			NewThreshold: job.NewThreshold,
+			Curve:        CurveSecp256k1, // batch reshare is chain-triggered, secp256k1 only for now
 		})
 		sessCancel()
 		sn.Close()

@@ -22,10 +22,10 @@ import (
 func startKMS(t *testing.T, socketPath, dataDir string) {
 	t.Helper()
 
-	kmsDir := filepath.Join("..", "kms-frost")
-	kmsBin := filepath.Join(kmsDir, "target", "debug", "kms-frost")
+	kmsDir := filepath.Join("..", "kms-tss")
+	kmsBin := filepath.Join(kmsDir, "target", "debug", "kms-tss")
 	if _, err := os.Stat(kmsBin); os.IsNotExist(err) {
-		t.Skip("kms-frost binary not built; run 'cargo build' in kms-frost/ first")
+		t.Skip("kms-tss binary not built; run 'cargo build' in kms-tss/ first")
 	}
 
 	cmd := exec.Command(kmsBin, socketPath, dataDir)
@@ -82,8 +82,8 @@ func TestRemoteKeyManager_Connection(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ListKeys: %v", err)
 	}
-	if len(listResp.KeyIds) != 0 {
-		t.Fatalf("expected empty key list, got: %v", listResp.KeyIds)
+	if len(listResp.Entries) != 0 {
+		t.Fatalf("expected empty key list, got: %v", listResp.Entries)
 	}
 
 	// AbortSession for non-existent session succeeds (idempotent).

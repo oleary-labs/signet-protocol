@@ -2,6 +2,8 @@
 
 use serde::Deserialize;
 
+use crate::curve::Curve;
+
 /// Parameters for a keygen (DKG) session.
 #[derive(Debug, Clone, Deserialize)]
 pub struct KeygenParams {
@@ -10,6 +12,17 @@ pub struct KeygenParams {
     pub party_id: String,
     pub party_ids: Vec<String>,
     pub threshold: u16,
+    /// Curve for this keygen. Defaults to secp256k1 if absent (backwards compat).
+    #[serde(default = "default_curve")]
+    pub curve: Curve,
+    /// Optional signing scope constraint. Set at keygen, stored with the key.
+    /// Format: [1-byte scheme][scheme-specific bytes]. Empty = unscoped.
+    #[serde(default)]
+    pub scope: Vec<u8>,
+}
+
+fn default_curve() -> Curve {
+    Curve::Secp256k1
 }
 
 /// Parameters for a signing session.
@@ -20,6 +33,9 @@ pub struct SignParams {
     pub party_id: String,
     pub signer_ids: Vec<String>,
     pub message: Vec<u8>,
+    /// Curve for this signing session. Defaults to secp256k1 if absent.
+    #[serde(default = "default_curve")]
+    pub curve: Curve,
 }
 
 /// Decode CBOR bytes into keygen params.

@@ -150,7 +150,7 @@ func (lkm *LocalKeyManager) RunReshare(ctx context.Context, p ReshareParams) (*R
 
 // CommitReshare promotes a pending reshare result to active. The current
 // active config is archived as a historical version before being overwritten.
-func (lkm *LocalKeyManager) CommitReshare(groupID, keyID string) error {
+func (lkm *LocalKeyManager) CommitReshare(groupID, keyID string, _ Curve) error {
 	if lkm.versions == nil {
 		return nil // no version store — RunReshare already wrote directly
 	}
@@ -191,7 +191,7 @@ func (lkm *LocalKeyManager) CommitReshare(groupID, keyID string) error {
 
 // DiscardPendingReshare removes a pending reshare result without promoting it.
 // The active key is untouched.
-func (lkm *LocalKeyManager) DiscardPendingReshare(groupID, keyID string) error {
+func (lkm *LocalKeyManager) DiscardPendingReshare(groupID, keyID string, _ Curve) error {
 	if lkm.versions == nil {
 		return nil
 	}
@@ -200,7 +200,7 @@ func (lkm *LocalKeyManager) DiscardPendingReshare(groupID, keyID string) error {
 
 // RollbackReshare restores a previous version as the active key. Used when a
 // retry discovers that this node committed a reshare but other nodes didn't.
-func (lkm *LocalKeyManager) RollbackReshare(groupID, keyID string, generation uint64) error {
+func (lkm *LocalKeyManager) RollbackReshare(groupID, keyID string, _ Curve, generation uint64) error {
 	if lkm.versions == nil {
 		return fmt.Errorf("no version store available")
 	}
@@ -226,7 +226,7 @@ func (lkm *LocalKeyManager) RollbackReshare(groupID, keyID string, generation ui
 }
 
 // GetKeyInfo returns public metadata for a stored key, or (nil, nil) if not found.
-func (lkm *LocalKeyManager) GetKeyInfo(groupID, keyID string) (*KeyInfo, error) {
+func (lkm *LocalKeyManager) GetKeyInfo(groupID, keyID string, _ Curve) (*KeyInfo, error) {
 	cfg, err := lkm.loadConfig(groupID, keyID)
 	if err != nil {
 		return nil, err
@@ -238,8 +238,17 @@ func (lkm *LocalKeyManager) GetKeyInfo(groupID, keyID string) (*KeyInfo, error) 
 }
 
 // ListKeys returns all key IDs stored under groupID.
-func (lkm *LocalKeyManager) ListKeys(groupID string) ([]string, error) {
-	return lkm.store.List(groupID)
+func (lkm *LocalKeyManager) ListKeys(groupID string) ([]KeyEntry, error) {
+	ids, err := lkm.store.List(groupID)
+	if err != nil {
+		return nil, err
+	}
+	// LocalKeyManager only supports secp256k1 (bytemare/frost).
+	entries := make([]KeyEntry, len(ids))
+	for i, id := range ids {
+		entries[i] = KeyEntry{KeyID: id, Curve: CurveSecp256k1}
+	}
+	return entries, nil
 }
 
 // ListGroups returns all group IDs that have at least one stored key.
@@ -289,6 +298,16 @@ func configToKeyInfo(cfg *tss.Config) *KeyInfo {
 		Parties:  cfg.Parties,
 		Threshold: cfg.Threshold,
 	}
+}
+
+// SetKeyStatus changes a key's status. Not yet implemented for LocalKeyManager.
+func (lkm *LocalKeyManager) SetKeyStatus(groupID, keyID string, curve Curve, status string) error {
+	return fmt.Errorf("SetKeyStatus not implemented for LocalKeyManager")
+}
+
+// DeleteKey permanently removes a key. Not yet implemented for LocalKeyManager.
+func (lkm *LocalKeyManager) DeleteKey(groupID, keyID string, curve Curve) error {
+	return fmt.Errorf("DeleteKey not implemented for LocalKeyManager")
 }
 
 // Ensure LocalKeyManager implements KeyManager at compile time.

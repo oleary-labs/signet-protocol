@@ -2,13 +2,13 @@
 
 ## Overview
 
-The Rust `kms-frost` process handles all FROST threshold cryptography (keygen and signing) over a gRPC Unix domain socket, replacing the in-process Go TSS implementation as the default for production use. The Go implementation is retained for testing and development (`--no-kms` flag).
+The Rust `kms-tss` process handles all FROST threshold cryptography (keygen and signing) over a gRPC Unix domain socket, replacing the in-process Go TSS implementation as the default for production use. The Go implementation is retained for testing and development (`--no-kms` flag).
 
 ## Architecture
 
 ```
 ┌──────────────┐     gRPC/UDS      ┌──────────────┐
-│   signetd    │ ◄────────────────► │  kms-frost   │
+│   signetd    │ ◄────────────────► │  kms-tss   │
 │  (Go node)   │  ProcessMessage    │   (Rust)     │
 │              │  bidi stream       │              │
 │  libp2p p2p  │                    │  sled store  │
@@ -16,7 +16,7 @@ The Rust `kms-frost` process handles all FROST threshold cryptography (keygen an
 └──────────────┘                    └──────────────┘
 ```
 
-Each node runs a dedicated `kms-frost` instance. The node's `RemoteKeyManager` bridges the libp2p session network with the KMS's `ProcessMessage` bidirectional gRPC stream:
+Each node runs a dedicated `kms-tss` instance. The node's `RemoteKeyManager` bridges the libp2p session network with the KMS's `ProcessMessage` bidirectional gRPC stream:
 
 1. **StartSession** — node sends CBOR-encoded params, KMS returns initial outgoing FROST messages
 2. **ProcessMessage stream** — peer messages from libp2p are forwarded to the KMS; KMS responses are forwarded back to peers
@@ -94,10 +94,10 @@ devnet/start.sh --no-kms
 
 ## Files Changed
 
-- `kms-frost/src/session.rs` — consuming state machine, out-of-order buffering, test suite (12 tests)
-- `kms-frost/src/service.rs` — gRPC service with bidi streaming
-- `kms-frost/src/storage.rs` — group ID normalization
-- `kms-frost/src/params.rs` — `Clone` derives for restore closures
+- `kms-tss/src/session.rs` — consuming state machine, out-of-order buffering, test suite (12 tests)
+- `kms-tss/src/service.rs` — gRPC service with bidi streaming
+- `kms-tss/src/storage.rs` — group ID normalization
+- `kms-tss/src/params.rs` — `Clone` derives for restore closures
 - `node/remote_keymanager.go` — bridge deadlock fix, payload fix, group ID fix, NotFound mapping, PartyID
 - `node/node.go` — pass peer ID to RemoteKeyManager
 - `devnet/start.sh` — KMS build, launch, socket wait, `--no-kms` flag

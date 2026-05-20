@@ -1,17 +1,24 @@
 # CLAUDE.md
 
-<!-- TODO: Update references to circuits/jwt_auth/ — circuit source has moved to the signet-circuits repo. VK is now embedded via the Go module at github.com/signet-protocol/signet-circuits/packages/go. -->
-
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
 ## Project Overview
 
-Signet: threshold signing research using FROST (RFC 9591) on secp256k1. The project includes smart contracts, a Go node with libp2p networking, an HTTP API, blockchain integration, and a ZK-based authentication layer.
+Signet: threshold signing protocol with a multi-scheme KMS. The Rust KMS (`kms-tss/`) hosts three signing schemes over a single gRPC interface:
+- FROST Schnorr / secp256k1 (RFC 9591)
+- FROST Schnorr / Ed25519
+- Threshold ECDSA / secp256k1 (DJNPO20, 4-round robust)
+
+The Go node (`signetd`) exposes an HTTP API on `/v1/*` with a `curve` parameter that selects the scheme. The stack also includes Foundry smart contracts, libp2p networking, and a ZK-based JWT authentication layer.
+
+For the canonical recent-changes summary, see `docs/TESTNET-1-CHANGES.md`.
+For the canonical curve-string reference (all consumers speak these strings to the HTTP API), see `docs/CURVES.md`.
 
 - Main module: `signet` (Go)
-- TSS (Threshold Signature Scheme): `signet/tss` — thin adapter over `github.com/bytemare/frost` + `github.com/bytemare/dkg`
-- Smart contracts: `contracts/` (Foundry, Solidity 0.8.24)
-- ZK circuit: `circuits/jwt_auth/` (Noir + Barretenberg)
+- KMS (primary): `kms-tss/` — Rust gRPC service implementing FROST + ECDSA via `frost-core`, `frost-ed25519`, `frost-secp256k1`, `k256`
+- KMS (fallback): `signet/tss` — Go in-process FROST adapter over `github.com/bytemare/frost` + `github.com/bytemare/dkg`, enabled via `--no-kms` for development
+- Smart contracts: `contracts/` (Foundry, Solidity 0.8.24): SignetFactory, SignetGroup, FROSTVerifier
+- ZK circuit: lives in the `signet-circuits` repo. Embedded here via Go module `github.com/oleary-labs/signet-circuits/packages/go v0.3.0` (see `go.mod`)
 
 ## Build and Test Commands
 
@@ -26,12 +33,18 @@ go vet ./...                     # lint
 forge test                       # all Foundry tests (55 tests)
 forge build                      # compile contracts
 
-# ZK circuit (requires nargo + bb)
-cd circuits/jwt_auth
-nargo compile --force
-nargo execute bench_witness
-bb prove -b target/jwt_auth.json -w target/bench_witness.gz -o target/proof --write_vk
-bb verify -k target/proof/vk -p target/proof/proof -i target/proof/public_inputs
+# ZK circuit (circuit source + toolchain live in the signet-circuits repo)
+# To bump the embedded circuit + VK:
+#   1. Cut a new tag in signet-circuits (e.g. packages/go/v0.4.0)
+#   2. cd here and: go get github.com/oleary-labs/signet-circuits/packages/go@v0.4.0
+#   3. go mod tidy
+# To build proofs locally for testing, do it in the signet-circuits repo with
+# the pinned nargo + bb from its toolchain.json; this repo only consumes the
+# compiled VK at runtime.
+
+# Rust KMS (requires Rust toolchain)
+cd kms-tss
+cargo build --release
 ```
 
 ## Claude Code Instructions

@@ -2,6 +2,7 @@ package node
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"strings"
@@ -34,6 +35,10 @@ const (
 	msgReshareComplete coordMsgType = 4
 	msgReshareBatch    coordMsgType = 5
 	msgReshareCommit   coordMsgType = 6
+	msgDelegateSign    coordMsgType = 7
+	msgAuth            coordMsgType = 8  // forward auth proof to establish session on participants
+	msgSetKeyStatus    coordMsgType = 9  // set key status (active/disabled) across all nodes
+	msgDeleteKey       coordMsgType = 10 // permanently delete a key across all nodes
 )
 
 // coordMsg is sent from the initiating node to each other participant to start
@@ -58,9 +63,32 @@ type coordMsg struct {
 	Signers     []tss.PartyID `cbor:"7,keyasint,omitempty"`
 	MessageHash []byte     `cbor:"8,keyasint,omitempty"`
 
-	// Auth: structured auth proof with ZK proof or auth key certificate,
-	// plus session key binding.
+	// Auth: full auth proof — only used in msgAuth to establish sessions
+	// on participants. Keygen/sign/delegate use SessionAuth instead.
 	Auth *AuthProof `cbor:"10,keyasint,omitempty"`
+
+	// Session: lightweight session credential for keygen/sign/delegate.
+	// Participants verify the request signature against a cached session.
+	Session *SessionAuth `cbor:"21,keyasint,omitempty"`
+
+	// Curve: "secp256k1", "ed25519", or "ecdsa_secp256k1". Empty defaults to "secp256k1".
+	Curve string `cbor:"16,keyasint,omitempty"`
+
+	// Scope: signing scope constraint bytes (keygen only). Empty = unscoped.
+	Scope []byte `cbor:"18,keyasint,omitempty"`
+
+	// SignPayload: structured signing payload for scoped keys (sign only).
+	// JSON-encoded SignPayload. Participants verify scope independently.
+	SignPayload []byte `cbor:"19,keyasint,omitempty"`
+
+	// DelegateSubKey: the sub-key ID being delegated (msgDelegateSign only).
+	// The client's request signature is over this key ID, not the parent
+	// key in KeyID. Each participant verifies auth against this field and
+	// checks that it's under the same identity namespace as KeyID.
+	DelegateSubKey string `cbor:"20,keyasint,omitempty"`
+
+	// Key lifecycle: status for msgSetKeyStatus ("active" or "disabled").
+	KeyStatus string `cbor:"22,keyasint,omitempty"`
 
 	// Reshare only: old and new committee definitions.
 	OldParties   []tss.PartyID `cbor:"11,keyasint,omitempty"`
@@ -115,38 +143,144 @@ func (n *Node) handleCoordStream(s libp2pnet.Stream) {
 		return
 	}
 
-	// User-facing operations (keygen, sign) require auth if the group has
-	// an auth policy. Reshare operations are peer-authorized: the receiving
-	// node validates that the sender is a group member and that a local
-	// reshare job exists (checked inside each reshare case below).
-	requiresUserAuth := msg.Type == msgKeygen || msg.Type == msgSign
-	if requiresUserAuth && n.auth.HasAuthPolicy(msg.GroupID) {
+	// ---------- msgAuth: establish session on this participant ----------
+	if msg.Type == msgAuth {
 		if msg.Auth == nil {
-			n.log.Warn("coord: missing auth",
+			n.log.Warn("coord: msgAuth missing proof")
+			s.Write([]byte{coordNACK})
+			return
+		}
+
+		var keyPrefix string
+		var sessionExp time.Time
+
+		if msg.Auth.DelegationToken != "" {
+			// Delegation token path: verify the token independently.
+			claims, err := n.VerifyDelegationToken(msg.GroupID, msg.Auth.DelegationToken)
+			if err != nil {
+				n.log.Warn("coord: delegation token invalid",
+					zap.String("group_id", msg.GroupID),
+					zap.Error(err))
+				s.Write([]byte{coordNACK})
+				return
+			}
+			// Extract iss/sub from the delegation token's sub-key ID so the
+			// session resolves through the oauth path (not authkey).
+			delIss, delSub := parseDelegationIdentity(claims.Sub)
+			msg.Auth.Iss = delIss
+			msg.Auth.Sub = delSub
+			keyPrefix = "oauth:" + delIss + ":" + delSub
+			sessionExp = time.Unix(claims.Exp, 0)
+		} else {
+			// ZK proof or auth key certificate path.
+			var err error
+			keyPrefix, err = n.auth.ValidateAuthProof(n.ctx, msg.GroupID, msg.Auth)
+			if err != nil {
+				n.log.Warn("coord: auth proof invalid",
+					zap.String("group_id", msg.GroupID),
+					zap.Error(err))
+				s.Write([]byte{coordNACK})
+				return
+			}
+			sessionExp = time.Unix(int64(msg.Auth.Exp), 0)
+		}
+
+		sessionHex := sessionPubToHex(msg.Auth.SessionPub)
+		si := &SessionInfo{
+			Sub:           msg.Auth.Sub,
+			Iss:           msg.Auth.Iss,
+			Exp:           sessionExp,
+			Aud:           msg.Auth.Aud,
+			Azp:           msg.Auth.Azp,
+			AuthKeyPub:    msg.Auth.AuthKeyPub,
+			CertSignature: msg.Auth.CertSignature,
+			Identity:      msg.Auth.Identity,
+		}
+		// For delegation token sessions, lock to the delegated sub-key.
+		if msg.Auth.DelegationToken != "" {
+			// claims was already verified above in the delegation path.
+			claims, _ := n.VerifyDelegationToken(msg.GroupID, msg.Auth.DelegationToken)
+			if claims != nil {
+				si.DelegatedKeyID = "oauth:" + claims.Sub
+			}
+		}
+		n.sessions.Put(sessionHex, si)
+		n.log.Info("coord: session established",
+			zap.String("group_id", msg.GroupID),
+			zap.String("identity", keyPrefix),
+			zap.String("session_pub", sessionHex))
+		s.Write([]byte{coordACK})
+		return
+	}
+
+	// ---------- Session auth for keygen/sign/delegate ----------
+	// These operations require a previously established session. The coord
+	// message carries a lightweight SessionAuth (session pub + request sig).
+	// No ZK proof — that was verified once during msgAuth.
+	requiresUserAuth := msg.Type == msgKeygen || msg.Type == msgSign || msg.Type == msgDelegateSign ||
+		msg.Type == msgSetKeyStatus || msg.Type == msgDeleteKey
+	if requiresUserAuth && n.auth.HasAuthPolicy(msg.GroupID) {
+		if msg.Session == nil {
+			n.log.Warn("coord: missing session auth",
 				zap.String("group_id", msg.GroupID),
 				zap.String("key_id", msg.KeyID))
 			s.Write([]byte{coordNACK})
 			return
 		}
-		keyPrefix, err := n.auth.ValidateAuthProof(n.ctx, msg.GroupID, msg.Auth)
-		if err != nil {
-			n.log.Warn("coord: invalid auth proof",
+
+		// Look up cached session.
+		sessionHex := sessionPubToHex(msg.Session.SessionPub)
+		cached, ok := n.sessions.Get(sessionHex)
+		if !ok || time.Now().After(cached.Exp) {
+			n.log.Warn("coord: session not found or expired",
 				zap.String("group_id", msg.GroupID),
-				zap.String("key_id", msg.KeyID),
-				zap.Error(err))
+				zap.String("session_pub", sessionHex))
 			s.Write([]byte{coordNACK})
 			return
 		}
-		// Verify request signature against the logical key_id (strip the
-		// internal namespace prefix since clients sign the un-prefixed key_id).
-		logicalKeyID := stripKeyNamespace(msg.KeyID)
+
+		// Build identity prefix from cached session.
+		var keyPrefix string
+		if cached.Identity != "" {
+			keyPrefix = "authkey:" + cached.Identity
+		} else {
+			keyPrefix = "oauth:" + cached.Iss + ":" + cached.Sub
+		}
+
+		// For delegate-sign, the client signed the request over the sub-key
+		// ID (authorizing delegation of that specific sub-key). Verify against
+		// the sub-key, then confirm it's under the same identity as the parent.
+		authKeyID := msg.KeyID
+		if msg.Type == msgDelegateSign {
+			if msg.DelegateSubKey == "" {
+				n.log.Warn("coord: delegate-sign missing sub-key")
+				s.Write([]byte{coordNACK})
+				return
+			}
+			authKeyID = msg.DelegateSubKey
+			parentNS := stripKeyNamespace(msg.KeyID)
+			subNS := stripKeyNamespace(msg.DelegateSubKey)
+			if !strings.HasPrefix(subNS, parentNS+":") {
+				n.log.Warn("coord: delegate sub-key not under parent namespace",
+					zap.String("parent", msg.KeyID),
+					zap.String("sub_key", msg.DelegateSubKey))
+				s.Write([]byte{coordNACK})
+				return
+			}
+		}
+
+		// Verify request signature against the logical key_id.
+		logicalKeyID := stripKeyNamespace(authKeyID)
 		var msgHash []byte
-		if msg.Type == msgSign {
+		if msg.Type == msgSign && len(msg.SignPayload) == 0 {
+			// Only include message hash for raw hash signing (unscoped).
+			// For scoped signing (payload-based), the client doesn't know
+			// the hash — it's computed by the node from the payload.
 			msgHash = msg.MessageHash
 		}
 		if err := verifyRequestSignature(
-			msg.Auth.SessionPub, msg.Auth.RequestSig,
-			msg.GroupID, logicalKeyID, msg.Auth.Nonce, msg.Auth.Timestamp,
+			msg.Session.SessionPub, msg.Session.RequestSig,
+			msg.GroupID, logicalKeyID, msg.Session.Nonce, msg.Session.Timestamp,
 			msgHash,
 		); err != nil {
 			n.log.Warn("coord: invalid request signature",
@@ -156,18 +290,18 @@ func (n *Node) handleCoordStream(s libp2pnet.Stream) {
 			return
 		}
 		// Check nonce uniqueness.
-		if err := n.sessions.CheckNonce(msg.Auth.Nonce); err != nil {
+		if err := n.sessions.CheckNonce(msg.Session.Nonce); err != nil {
 			n.log.Warn("coord: nonce replay",
 				zap.String("group_id", msg.GroupID),
-				zap.String("nonce", msg.Auth.Nonce))
+				zap.String("nonce", msg.Session.Nonce))
 			return
 		}
 		// Check timestamp freshness.
-		ts := time.Unix(int64(msg.Auth.Timestamp), 0)
+		ts := time.Unix(int64(msg.Session.Timestamp), 0)
 		if time.Since(ts).Abs() > timestampWindow {
 			n.log.Warn("coord: timestamp out of range",
 				zap.String("group_id", msg.GroupID),
-				zap.Uint64("timestamp", msg.Auth.Timestamp))
+				zap.Uint64("timestamp", msg.Session.Timestamp))
 			return
 		}
 		// KeyID must match auth identity prefix.
@@ -182,7 +316,11 @@ func (n *Node) handleCoordStream(s libp2pnet.Stream) {
 
 	switch msg.Type {
 	case msgKeygen:
-		if info, _ := n.km.GetKeyInfo(msg.GroupID, msg.KeyID); info != nil {
+		kgCurve := Curve(msg.Curve)
+		if kgCurve == "" {
+			kgCurve = CurveSecp256k1
+		}
+		if info, _ := n.km.GetKeyInfo(msg.GroupID, msg.KeyID, kgCurve); info != nil {
 			n.log.Warn("coord: keygen rejected, key already exists",
 				zap.String("group_id", msg.GroupID),
 				zap.String("key_id", msg.KeyID))
@@ -217,6 +355,10 @@ func (n *Node) handleCoordStream(s libp2pnet.Stream) {
 			n.log.Info("coord: keygen started",
 				zap.String("group_id", msg.GroupID),
 				zap.String("key_id", msg.KeyID))
+			curve := Curve(msg.Curve)
+			if curve == "" {
+				curve = CurveSecp256k1
+			}
 			_, err := n.km.RunKeygen(sessCtx, KeygenParams{
 				Host:      n.host,
 				SN:        sn,
@@ -225,6 +367,8 @@ func (n *Node) handleCoordStream(s libp2pnet.Stream) {
 				KeyID:     msg.KeyID,
 				Parties:   msg.Parties,
 				Threshold: msg.Threshold,
+				Curve:     curve,
+				Scope:     msg.Scope,
 			})
 			if err != nil {
 				n.log.Error("coord: keygen failed",
@@ -255,12 +399,18 @@ func (n *Node) handleCoordStream(s libp2pnet.Stream) {
 		go func() {
 			defer sessCancel()
 			defer sn.Close()
+
+			curve := Curve(msg.Curve)
+			if curve == "" {
+				curve = CurveSecp256k1
+			}
+
 			n.log.Info("coord: sign started",
 				zap.String("group_id", msg.GroupID),
 				zap.String("key_id", msg.KeyID))
 
 			// Wait for any pending keygen to finish before attempting to sign.
-			info, err := n.awaitKey(msg.GroupID, msg.KeyID, 10*time.Second)
+			info, err := n.awaitKey(msg.GroupID, msg.KeyID, curve, 10*time.Second)
 			if err != nil {
 				n.log.Error("coord: load config",
 					zap.String("group_id", msg.GroupID),
@@ -274,6 +424,40 @@ func (n *Node) handleCoordStream(s libp2pnet.Stream) {
 					zap.String("key_id", msg.KeyID))
 				return
 			}
+			if info.Status == "disabled" {
+				n.log.Warn("coord: sign rejected, key is disabled",
+					zap.String("group_id", msg.GroupID),
+					zap.String("key_id", msg.KeyID))
+				return
+			}
+
+			// Scope enforcement: if the key has a scope, participants
+			// independently verify the payload and compute the hash.
+			msgHashForSign := msg.MessageHash
+			if len(info.Scope) > 0 {
+				if len(msg.SignPayload) == 0 {
+					n.log.Error("coord: scoped key requires payload",
+						zap.String("group_id", msg.GroupID),
+						zap.String("key_id", msg.KeyID))
+					return
+				}
+				var payload SignPayload
+				if err := json.Unmarshal(msg.SignPayload, &payload); err != nil {
+					n.log.Error("coord: parse sign payload",
+						zap.String("group_id", msg.GroupID),
+						zap.Error(err))
+					return
+				}
+				hash, err := VerifyScopeAndHash(info.Scope, &payload)
+				if err != nil {
+					n.log.Error("coord: scope verification failed",
+						zap.String("group_id", msg.GroupID),
+						zap.String("key_id", msg.KeyID),
+						zap.Error(err))
+					return
+				}
+				msgHashForSign = hash
+			}
 
 			_, err = n.km.RunSign(sessCtx, SignParams{
 				Host:        n.host,
@@ -282,7 +466,8 @@ func (n *Node) handleCoordStream(s libp2pnet.Stream) {
 				GroupID:     msg.GroupID,
 				KeyID:       msg.KeyID,
 				Signers:     msg.Signers,
-				MessageHash: msg.MessageHash,
+				MessageHash: msgHashForSign,
+				Curve:       curve,
 			})
 			if err != nil {
 				n.log.Error("coord: sign failed",
@@ -296,7 +481,96 @@ func (n *Node) handleCoordStream(s libp2pnet.Stream) {
 				zap.String("key_id", msg.KeyID))
 		}()
 
+	case msgDelegateSign:
+		// Auth-gated sign for delegation token minting. The parent key (KeyID)
+		// signs the JWT hash. Auth was verified above against DelegateSubKey.
+		sessID := signSessionID(msg.GroupID, msg.KeyID, msg.SignNonce)
+		sessCtx, sessCancel := context.WithTimeout(n.ctx, 30*time.Second)
+		sn, err := network.NewSessionNetwork(sessCtx, n.host, sessID, msg.Signers)
+		if err != nil {
+			sessCancel()
+			n.log.Error("coord: delegate-sign session network",
+				zap.String("group_id", msg.GroupID),
+				zap.String("key_id", msg.KeyID),
+				zap.Error(err))
+			return
+		}
+		s.Write([]byte{coordACK})
+
+		go func() {
+			defer sessCancel()
+			defer sn.Close()
+
+			curve := Curve(msg.Curve)
+			if curve == "" {
+				curve = CurveSecp256k1
+			}
+
+			n.log.Info("coord: delegate-sign started",
+				zap.String("group_id", msg.GroupID),
+				zap.String("parent_key", msg.KeyID),
+				zap.String("sub_key", msg.DelegateSubKey))
+
+			info, err := n.awaitKey(msg.GroupID, msg.KeyID, curve, 10*time.Second)
+			if err != nil || info == nil {
+				n.log.Error("coord: delegate-sign parent key not found",
+					zap.String("group_id", msg.GroupID),
+					zap.String("key_id", msg.KeyID),
+					zap.Error(err))
+				return
+			}
+			if info.Status == "disabled" {
+				n.log.Warn("coord: delegate-sign rejected, parent key is disabled",
+					zap.String("group_id", msg.GroupID),
+					zap.String("key_id", msg.KeyID))
+				return
+			}
+
+			// Verify the sub-key exists on this node too.
+			subInfo, err := n.km.GetKeyInfo(msg.GroupID, msg.DelegateSubKey, curve)
+			if err != nil || subInfo == nil {
+				n.log.Error("coord: delegate-sign sub-key not found",
+					zap.String("group_id", msg.GroupID),
+					zap.String("sub_key", msg.DelegateSubKey),
+					zap.Error(err))
+				return
+			}
+			if subInfo.Status == "disabled" {
+				n.log.Warn("coord: delegate-sign rejected, sub-key is disabled",
+					zap.String("group_id", msg.GroupID),
+					zap.String("sub_key", msg.DelegateSubKey))
+				return
+			}
+
+			_, err = n.km.RunSign(sessCtx, SignParams{
+				Host:        n.host,
+				SN:          sn,
+				SessionID:   sessID,
+				GroupID:     msg.GroupID,
+				KeyID:       msg.KeyID,
+				Signers:     msg.Signers,
+				MessageHash: msg.MessageHash,
+				Curve:       curve,
+			})
+			if err != nil {
+				n.log.Error("coord: delegate-sign failed",
+					zap.String("group_id", msg.GroupID),
+					zap.String("key_id", msg.KeyID),
+					zap.Error(err))
+				return
+			}
+			n.log.Info("coord: delegate-sign complete",
+				zap.String("group_id", msg.GroupID),
+				zap.String("parent_key", msg.KeyID),
+				zap.String("sub_key", msg.DelegateSubKey))
+		}()
+
 	case msgReshare:
+		// Compute curve for reshare early — needed for storage lookups.
+		msgCurve := Curve(msg.Curve)
+		if msgCurve == "" {
+			msgCurve = CurveSecp256k1
+		}
 		// Peer authorization: verify the sender is a group member AND either
 		// the elected leader or this node independently knows a reshare is
 		// needed (has a local job). This allows the leader-driven path
@@ -356,7 +630,7 @@ func (n *Node) handleCoordStream(s libp2pnet.Stream) {
 		// with consistent key state.
 		done, _ := n.reshareStore.IsKeyDone(msg.GroupID, msg.KeyID)
 		if done {
-			info, _ := n.km.GetKeyInfo(msg.GroupID, msg.KeyID)
+			info, _ := n.km.GetKeyInfo(msg.GroupID, msg.KeyID, msgCurve)
 			if info != nil {
 				// Active key is at generation N (post-reshare). Roll back to N-1.
 				gen := uint64(0) // default: roll back to generation 0
@@ -366,7 +640,7 @@ func (n *Node) handleCoordStream(s libp2pnet.Stream) {
 						gen = cfg.Generation - 1
 					}
 				}
-				if err := n.km.RollbackReshare(msg.GroupID, msg.KeyID, gen); err != nil {
+				if err := n.km.RollbackReshare(msg.GroupID, msg.KeyID, msgCurve, gen); err != nil {
 					n.log.Error("coord: reshare rollback failed, NACKing",
 						zap.String("group_id", msg.GroupID),
 						zap.String("key_id", msg.KeyID),
@@ -395,7 +669,7 @@ func (n *Node) handleCoordStream(s libp2pnet.Stream) {
 		}
 
 		// Discard any stale pending result from a previous failed attempt.
-		n.km.DiscardPendingReshare(msg.GroupID, msg.KeyID)
+		n.km.DiscardPendingReshare(msg.GroupID, msg.KeyID, msgCurve)
 
 		allParties := msg.Parties // old ∪ new
 		sessID := reshareSessionID(msg.GroupID, msg.KeyID, msg.ReshareNonce)
@@ -439,6 +713,10 @@ func (n *Node) handleCoordStream(s libp2pnet.Stream) {
 				return
 			}
 
+			reshCurve := Curve(msg.Curve)
+			if reshCurve == "" {
+				reshCurve = CurveSecp256k1
+			}
 			result, err := n.km.RunReshare(sessCtx, ReshareParams{
 				Host:         n.host,
 				SN:           sn,
@@ -449,9 +727,10 @@ func (n *Node) handleCoordStream(s libp2pnet.Stream) {
 				NewParties:   msg.NewParties,
 				OldThreshold: msg.Threshold,
 				NewThreshold: msg.NewThreshold,
+				Curve:        reshCurve,
 			})
 			if err != nil {
-				n.km.DiscardPendingReshare(msg.GroupID, msg.KeyID)
+				n.km.DiscardPendingReshare(msg.GroupID, msg.KeyID, reshCurve)
 				n.completeReshareKey(msg.GroupID, msg.KeyID, false)
 				n.log.Error("coord: reshare failed",
 					zap.String("group_id", msg.GroupID),
@@ -511,6 +790,10 @@ func (n *Node) handleCoordStream(s libp2pnet.Stream) {
 			sessCtx, sessCancel := context.WithTimeout(n.ctx, 15*time.Second)
 			sn := n.reshareMux.Session(sessCtx, sessID, allParties)
 
+			batchCurve := Curve(msg.Curve)
+			if batchCurve == "" {
+				batchCurve = CurveSecp256k1
+			}
 			result, err := n.km.RunReshare(sessCtx, ReshareParams{
 				Host:         n.host,
 				SN:           sn,
@@ -521,6 +804,7 @@ func (n *Node) handleCoordStream(s libp2pnet.Stream) {
 				NewParties:   msg.NewParties,
 				OldThreshold: msg.Threshold,
 				NewThreshold: msg.NewThreshold,
+				Curve:        batchCurve,
 			})
 			sessCancel()
 			sn.Close()
@@ -543,6 +827,10 @@ func (n *Node) handleCoordStream(s libp2pnet.Stream) {
 		}
 
 	case msgReshareCommit:
+		commitCurve := Curve(msg.Curve)
+		if commitCurve == "" {
+			commitCurve = CurveSecp256k1
+		}
 		// Coordinator says the reshare protocol succeeded on all nodes.
 		// Wait for the participant's reshare goroutine to finish writing
 		// the pending result — the commit can arrive before the local
@@ -550,7 +838,7 @@ func (n *Node) handleCoordStream(s libp2pnet.Stream) {
 		n.waitPendingReady(msg.GroupID, msg.KeyID, 10*time.Second)
 
 		// Promote pending result to active and record completion.
-		if err := n.km.CommitReshare(msg.GroupID, msg.KeyID); err != nil {
+		if err := n.km.CommitReshare(msg.GroupID, msg.KeyID, commitCurve); err != nil {
 			n.log.Error("coord: reshare commit failed",
 				zap.String("group_id", msg.GroupID),
 				zap.String("key_id", msg.KeyID),
@@ -573,6 +861,67 @@ func (n *Node) handleCoordStream(s libp2pnet.Stream) {
 		n.log.Info("coord: reshare complete received, cleaning up",
 			zap.String("group_id", groupID))
 		n.completeReshareJob(groupID)
+		s.Write([]byte{coordACK})
+
+	case msgSetKeyStatus:
+		curve := Curve(msg.Curve)
+		if curve == "" {
+			curve = CurveSecp256k1
+		}
+		if msg.KeyStatus != "active" && msg.KeyStatus != "disabled" {
+			n.log.Warn("coord: invalid key status",
+				zap.String("status", msg.KeyStatus))
+			s.Write([]byte{coordNACK})
+			return
+		}
+		// Verify the key exists on this node.
+		info, err := n.km.GetKeyInfo(msg.GroupID, msg.KeyID, curve)
+		if err != nil || info == nil {
+			n.log.Warn("coord: set-key-status key not found",
+				zap.String("group_id", msg.GroupID),
+				zap.String("key_id", msg.KeyID))
+			s.Write([]byte{coordNACK})
+			return
+		}
+		if err := n.km.SetKeyStatus(msg.GroupID, msg.KeyID, curve, msg.KeyStatus); err != nil {
+			n.log.Error("coord: set-key-status failed",
+				zap.String("group_id", msg.GroupID),
+				zap.String("key_id", msg.KeyID),
+				zap.Error(err))
+			s.Write([]byte{coordNACK})
+			return
+		}
+		n.log.Info("coord: key status changed",
+			zap.String("group_id", msg.GroupID),
+			zap.String("key_id", msg.KeyID),
+			zap.String("status", msg.KeyStatus))
+		s.Write([]byte{coordACK})
+
+	case msgDeleteKey:
+		curve := Curve(msg.Curve)
+		if curve == "" {
+			curve = CurveSecp256k1
+		}
+		// Verify the key exists on this node.
+		info, err := n.km.GetKeyInfo(msg.GroupID, msg.KeyID, curve)
+		if err != nil || info == nil {
+			n.log.Warn("coord: delete-key key not found",
+				zap.String("group_id", msg.GroupID),
+				zap.String("key_id", msg.KeyID))
+			s.Write([]byte{coordNACK})
+			return
+		}
+		if err := n.km.DeleteKey(msg.GroupID, msg.KeyID, curve); err != nil {
+			n.log.Error("coord: delete-key failed",
+				zap.String("group_id", msg.GroupID),
+				zap.String("key_id", msg.KeyID),
+				zap.Error(err))
+			s.Write([]byte{coordNACK})
+			return
+		}
+		n.log.Info("coord: key deleted",
+			zap.String("group_id", msg.GroupID),
+			zap.String("key_id", msg.KeyID))
 		s.Write([]byte{coordACK})
 
 	default:

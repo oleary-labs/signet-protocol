@@ -1,8 +1,15 @@
 # Barretenberg WASM in Go via wazero
 
-<!-- TODO: Update file paths — circuit source and VK have moved to the signet-circuits repo. -->
-
 **Status: Deferred** — viable approach, not yet implemented.
+
+> **Note on file paths:** This doc was written when the circuit lived at
+> `circuits/jwt_auth/` inside this repo. The circuit now lives in the
+> [`signet-circuits`](https://github.com/oleary-labs/signet-circuits) repo and is
+> embedded here via Go module `github.com/oleary-labs/signet-circuits/packages/go v0.3.0`.
+> The Go module exposes the compiled circuit JSON (`circuits.JWTCircuit`), source
+> (`circuits.JWTMainNr`), and verifying key directly — so the "embed the precomputed VK
+> at build time" option in Open Questions §2 below is now the natural fit (use the
+> module's embedded `vk` rather than the old on-disk path).
 
 ## Goal
 
@@ -177,14 +184,16 @@ func (v *Verifier) VerifyUltraHonk(ctx context.Context, vk, proof, publicInputs 
    quick spike to confirm the module instantiates without errors before committing further.
 
 2. **VK format** — the node needs a copy of the circuit's verification key. Options:
-   - Embed the precomputed VK (`circuits/jwt_auth/target/proof/vk`) at build time.
-   - Recompute it at startup from the compiled circuit JSON (`jwt_auth.json`) via
-     `CircuitComputeVk`.
+   - Embed the precomputed VK shipped in the signet-circuits Go module at build time
+     (preferred — keeps VK + circuit version in lockstep via Go module versioning).
+   - Recompute it at startup from the embedded compiled circuit JSON
+     (`circuits.JWTCircuit`) via `CircuitComputeVk`.
 
 3. **Public inputs serialisation** — the `CircuitVerify` command takes public inputs as
    field elements. Need to map the `AuthProof` fields
    (`Sub`, `Iss`, `Exp`, `Aud`, `Azp`, `JWKSModulus`, `SessionPub`) to the circuit's
-   public input layout as declared in `circuits/jwt_auth/src/main.nr`.
+   public input layout as declared in the Noir source embedded as `circuits.JWTMainNr`
+   (originally `signet-circuits/circuits/jwt_auth/src/main.nr`).
 
 4. **msgpack schema** — the `api_types.js` generated file defines the exact field names.
    Replicate in Go (or generate from the circuit manifest).
@@ -196,10 +205,18 @@ func (v *Verifier) VerifyUltraHonk(ctx context.Context, vk, proof, publicInputs 
 
 ## Related Files
 
-- `circuits/jwt_auth/src/main.nr` — Noir circuit; defines public inputs
-- `circuits/jwt_auth/target/jwt_auth.json` — compiled circuit artifact
-- `circuits/jwt_auth/target/proof/vk` — precomputed verification key
-- `circuits/jwt_auth/target/proof/proof` — sample proof (for integration tests)
-- `cmd/zkbench/main.go` — end-to-end pipeline benchmark using `bb` CLI
-- `node/auth.go:288` — TODO stub for `ValidateAuthProof`
+Circuit source, compiled artifact, and verifying key all live in the `signet-circuits`
+repo and are reached via the Go module `github.com/oleary-labs/signet-circuits/packages/go`:
+
+- `circuits.JWTMainNr` — Noir source (was `circuits/jwt_auth/src/main.nr`)
+- `circuits.JWTCircuit` — compiled circuit artifact (was `circuits/jwt_auth/target/jwt_auth.json`)
+- `circuits.JWTNargoToml` — `Nargo.toml` for round-tripping witness generation
+- VK is embedded inside `packages/go/artifacts/` in the signet-circuits repo (committed)
+- Sample proofs and benchmarks live in `signet-circuits/zkbench/`
+
+In this repo:
+- `node/auth.go:288` — TODO stub for `ValidateAuthProof` (the in-process verification
+  this design doc is about)
+- `cmd/zkbench/` — historically held end-to-end pipeline benchmarks; the benchmark
+  tooling has migrated to `signet-circuits/zkbench/`
 - `node/node.go:395` — TODO stub for `POST /v1/auth` production mode

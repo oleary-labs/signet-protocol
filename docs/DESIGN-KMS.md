@@ -1,8 +1,18 @@
 # Key Management Server Design
 
 Separation of key material and cryptographic protocol execution into a standalone KMS
-process, with the Go node acting as a message router. The KMS will implement the FROST
-protocol using ZcashFoundation/frost (Rust).
+process, with the Go node acting as a message router.
+
+> **Status (Testnet 1):** Implemented as `kms-tss/` (Rust). The KMS hosts three signing
+> schemes — FROST Schnorr/secp256k1, FROST Schnorr/Ed25519, and threshold ECDSA/secp256k1
+> (DJNPO20, 4-round robust) — over a single gRPC interface. The directory was originally
+> named `kms-frost/`; it was renamed to `kms-tss/` when ECDSA was added so the name
+> reflects the multi-scheme reality. See `docs/TESTNET-1-CHANGES.md` for the change log
+> and `docs/DESIGN-MULTI-CURVE.md` for the curve dispatch logic on the node side.
+>
+> The original FROST-centric rationale below is retained because the architectural
+> motivations (TEE-readiness, separation of key material from network handlers, Rust
+> memory safety) apply equally to the ECDSA scheme — the same KMS process hosts both.
 
 ---
 
@@ -91,7 +101,7 @@ protocol but FROST message content is owned entirely by the KMS.
 
 ## 3. Why ZF FROST for the KMS
 
-ZcashFoundation/frost is the stronger long-term choice for the protocol implementation:
+ZcashFoundation/frost is the stronger long-term choice for the FROST implementation:
 
 - **Audit**: NCC Group partial audit of `frost-core` at v0.6.0. No equivalent audit
   exists for `bytemare/frost`.
@@ -107,7 +117,24 @@ ZcashFoundation/frost is the stronger long-term choice for the protocol implemen
 - **Rust memory safety**: `zeroize` on sensitive types, constant-time serialization —
   classes of vulnerabilities that require explicit discipline in Go.
 
-See `FROST-IMPLEMENTATION-COMPARISON.md` for the full analysis.
+See `FROST-IMPLEMENTATION-COMPARISON.md` for the full FROST-vs-FROST analysis.
+
+### Why the same KMS process also hosts threshold ECDSA
+
+When ECDSA was added, we kept it inside the same Rust process rather than splitting it
+into a separate service. The justification is essentially the same as for FROST:
+
+- **Shared key-material boundary.** Both schemes' shares live behind the same gRPC
+  interface and the same `sled` persistence layer. A single audit surface and a single
+  TEE attestation target is cheaper to reason about than two parallel KMSes.
+- **secp256k1 stack already present.** The Rust `k256` crate handles both ECDSA scalar
+  arithmetic and the Schnorr operations FROST already needed; little incremental code.
+- **DJNPO20 protocol fit.** The 4-round robust ECDSA protocol slots into the same
+  session/coordinator machinery as FROST round 1/2 message routing. The Go node-side
+  dispatcher only needed a `curve` parameter and per-scheme message types.
+
+The cost is a slightly larger Rust binary and a wider audit surface. The benefit is that
+adding a third scheme (e.g. BLS) later is a code addition, not a new deployment unit.
 
 ---
 

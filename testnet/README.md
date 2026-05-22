@@ -13,11 +13,11 @@
 - **Instance type:** t3.medium (2 vCPU, 4 GB)
 - **Signing group:** 2-of-3 (threshold=2)
 - **Chain:** Sepolia
-- **Auth:** Google OAuth (accounts.google.com)
+- **Auth:** trusts two OAuth issuers: `https://signet-testnet-auth.olearylabs.com` and Google (`https://accounts.google.com`)
 - **KMS:** enabled (Rust kms-tss, FROST keygen/sign/reshare)
 - **Barretenberg:** installed on each node for ZK proof verification
 - **Factory:** `0xB4c55139db4ad9c481DAA82B249F934CBbB73b91`
-- **Group:** `0xf75bfc536ecf70006361685f1ed0b005ea08b773`
+- **Bootstrap group:** `0xa5b9df9c1a5eaafb97119559ad2e942825f98429`
 
 ## Prerequisites
 

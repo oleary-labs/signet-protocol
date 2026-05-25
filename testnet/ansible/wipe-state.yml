@@ -1,0 +1,117 @@
+---
+# wipe-state.yml — Blank per-user threshold key state without touching node identity.
+#
+# Use this BEFORE a coordinated cutover when the on-disk sled schema has changed
+# (e.g., Testnet 0 → Testnet 1 added the scope field and ECDSA 0x03 curve prefix)
+# and there is no migration tooling. After this, every user re-keygens fresh
+# the next time they authenticate.
+#
+# WHAT IS PRESERVED:
+#   - node.key (libp2p identity) — peer IDs stay stable.
+#   - On-chain SignetFactory / SignetGroup state — the group contract addresses
+#     remain valid. There is no on-chain group_pub_key to worry about; the
+#     contract holds _authKeys (application keys, client-generated) which are
+#     unaffected by sled state.
+#
+# WHAT IS WIPED:
+#   - kms-tss sled DB (all FROST + ECDSA shards across all groups + users).
+#   - Any leftover LocalKeyManager bbolt files in signetd_data_dir (these
+#     only exist if a node was ever run with --no-kms; harmless in prod
+#     where use_kms=true).
+#
+# WHAT BREAKS:
+#   - Every previously-issued user key is gone. Users' OAuth identity is
+#     preserved (oauth:iss:sub) but their derived addresses will change on
+#     re-keygen. Any on-chain funds tied to old derived addresses are
+#     unrecoverable without out-of-band shard backup.
+#   - Any outstanding delegation JWTs minted by old parent keys are dead
+#     (parent key shards are gone).
+#   - Admin signing via the bootstrap group is dead until first re-keygen.
+#
+# Usage:
+#   cd testnet/ansible
+#   ansible-playbook wipe-state.yml
+#   # then:
+#   ansible-playbook deploy.yml
+#
+# Dry run first to see what would change:
+#   ansible-playbook wipe-state.yml --check --diff
+
+- name: Wipe per-user threshold state across all signet nodes
+  hosts: signet_nodes
+  become: true
+
+  tasks:
+    - name: Confirm node.key exists before wiping (safety check)
+      stat:
+        path: "{{ signetd_data_dir }}/node.key"
+      register: node_key_stat
+
+    - name: Abort if node.key is missing
+      fail:
+        msg: >
+          node.key missing on {{ inventory_hostname }} at
+          {{ signetd_data_dir }}/node.key — refusing to wipe.
+          Run init-nodes.sh to generate identities, or check signetd_data_dir.
+      when: not node_key_stat.stat.exists
+
+    - name: Stop signetd
+      systemd:
+        name: signetd
+        state: stopped
+      failed_when: false   # OK if unit doesn't exist yet on a fresh host
+
+    - name: Stop kms-tss
+      systemd:
+        name: kms-tss
+        state: stopped
+      failed_when: false
+
+    - name: Show what will be removed (kms-tss sled DB)
+      stat:
+        path: "{{ kms_data_dir }}"
+      register: kms_data_stat
+
+    - name: Report kms-tss sled DB size before wipe
+      debug:
+        msg: >
+          {{ inventory_hostname }}: kms-tss data at {{ kms_data_dir }}
+          exists={{ kms_data_stat.stat.exists }}
+          (will be removed and recreated empty)
+
+    - name: Remove kms-tss sled DB
+      file:
+        path: "{{ kms_data_dir }}"
+        state: absent
+
+    - name: Recreate empty kms-tss data dir with correct ownership
+      file:
+        path: "{{ kms_data_dir }}"
+        state: directory
+        owner: "{{ signetd_user }}"
+        group: "{{ signetd_user }}"
+        mode: "0700"
+
+    - name: Remove leftover LocalKeyManager bbolt files (if any)
+      file:
+        path: "{{ signetd_data_dir }}/{{ item }}"
+        state: absent
+      loop:
+        - keyshards.db
+        - keyshards_archive.db
+        - reshare.db
+
+    - name: Confirm node.key is still present after wipe
+      stat:
+        path: "{{ signetd_data_dir }}/node.key"
+      register: node_key_post
+
+    - name: Fail loudly if node.key vanished
+      fail:
+        msg: "node.key disappeared on {{ inventory_hostname }} during wipe — abort and inspect."
+      when: not node_key_post.stat.exists
+
+  # Services intentionally left stopped. deploy.yml will (re)start them
+  # after the new binaries land. If you only ran wipe-state.yml and want
+  # to bring services back without re-deploying:
+  #   ansible-playbook manage.yml -e action=restart

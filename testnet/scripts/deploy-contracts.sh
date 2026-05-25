@@ -39,10 +39,14 @@ command -v jq >/dev/null 2>&1 || die "'jq' not found"
 RPC="$SEPOLIA_RPC_URL"
 DEPLOYER_ADDR=$(cast wallet address "$DEPLOYER_PK")
 NUM_NODES=$(jq '.nodes | length' "$NODES_JSON")
+# Bootstrap group uses the first 3 nodes. Additional nodes are registered
+# but not included in the initial group (added later via on-chain ops).
+BOOTSTRAP_NODES="${BOOTSTRAP_NODES:-3}"
 
-info "Deployer: $DEPLOYER_ADDR"
-info "RPC:      $RPC"
-info "Nodes:    $NUM_NODES"
+info "Deployer:        $DEPLOYER_ADDR"
+info "RPC:             $RPC"
+info "Total nodes:     $NUM_NODES"
+info "Bootstrap group: $BOOTSTRAP_NODES"
 
 # --------------------------------------------------------------------------
 # 1. Deploy factory
@@ -114,12 +118,22 @@ done
 # --------------------------------------------------------------------------
 # 3. Create signing group (2-of-3: threshold=2, quorum=2) with Google OAuth
 # --------------------------------------------------------------------------
-info "Creating signing group (threshold=2, $NUM_NODES nodes, Google OAuth)..."
+info "Creating signing group (threshold=2, $BOOTSTRAP_NODES nodes)..."
 
-GOOGLE_ISS="https://accounts.google.com"
-GOOGLE_CLIENT_ID="${GOOGLE_CLIENT_ID:-203385367894-0uhir5bt81bsg1gcflfg6tdt1m3eeo0s.apps.googleusercontent.com}"
-ISSUERS="[(${GOOGLE_ISS},[${GOOGLE_CLIENT_ID}])]"
-info "  issuer: ${GOOGLE_ISS} (client_id: ${GOOGLE_CLIENT_ID})"
+# Build address list for the bootstrap group only.
+BOOTSTRAP_ADDR_LIST=""
+for i in $(seq 0 $((BOOTSTRAP_NODES - 1))); do
+    ADDR=$(jq -r ".nodes[$i].eth_address" "$NODES_JSON")
+    if [[ -n "$BOOTSTRAP_ADDR_LIST" ]]; then
+        BOOTSTRAP_ADDR_LIST="${BOOTSTRAP_ADDR_LIST},${ADDR}"
+    else
+        BOOTSTRAP_ADDR_LIST="${ADDR}"
+    fi
+done
+
+# Issuers are added post-deploy via addIssuer() — start with an empty list
+# so the group is initially unauthenticated (easier to test).
+ISSUERS="[]"
 
 GROUP_CREATED_TOPIC=$(cast keccak "GroupCreated(address,address,uint256)")
 
@@ -128,7 +142,7 @@ CREATE_RECEIPT=$(cast send \
     --rpc-url "$RPC" \
     "$FACTORY" \
     "createGroup(address[],uint256,uint256,(string,string[])[],bytes[])" \
-    "[$ADDR_LIST]" 2 600 "$ISSUERS" "[]" \
+    "[$BOOTSTRAP_ADDR_LIST]" 2 600 "$ISSUERS" "[]" \
     --json)
 
 GROUP_RAW=$(echo "$CREATE_RECEIPT" | jq -r \
@@ -138,7 +152,7 @@ GROUP="0x${GROUP_RAW: -40}"
 
 [[ -z "$GROUP" || "$GROUP" == "0x" ]] && die "Could not parse group address from receipt"
 
-info "Group: $GROUP (threshold=2, nodes=$NUM_NODES)"
+info "Group: $GROUP (threshold=2, bootstrap=$BOOTSTRAP_NODES, total=$NUM_NODES)"
 
 # --------------------------------------------------------------------------
 # 4. Write .env file

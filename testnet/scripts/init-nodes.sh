@@ -21,13 +21,17 @@ if [[ ! -x "$BUILD/devnet-init" ]]; then
     (cd "$REPO" && go build -o "$BUILD/devnet-init" ./cmd/devnet-init)
 fi
 
+# Node names — first 3 are AWS (bootstrap group), 4th is GCP (added later).
+NODE_NAMES=(node1 node2 node3 signet-testnet1)
+NODE_DIRS=()
+for name in "${NODE_NAMES[@]}"; do
+    NODE_DIRS+=("$TESTNET/data/$name")
+done
+
 # Generate identities.
 echo "==> Generating node identities..."
 mkdir -p "$TESTNET/data"
-NODE_JSON=$("$BUILD/devnet-init" \
-    "$TESTNET/data/node1" \
-    "$TESTNET/data/node2" \
-    "$TESTNET/data/node3")
+NODE_JSON=$("$BUILD/devnet-init" "${NODE_DIRS[@]}")
 
 echo "$NODE_JSON" > "$TESTNET/data/nodes.json"
 
@@ -35,15 +39,15 @@ get() { echo "$NODE_JSON" | jq -r ".nodes[$1].$2"; }
 
 # Write Ansible host_vars for each node.
 mkdir -p "$HOST_VARS"
-for i in 0 1 2; do
-    n=$((i + 1))
+for i in $(seq 0 $((${#NODE_NAMES[@]} - 1))); do
+    name="${NODE_NAMES[$i]}"
     PEER=$(get $i peer_id)
     ADDR=$(get $i eth_address)
     PK=$(get $i eth_privkey)
     PUB=$(get $i pubkey)
     DATA=$(get $i data_dir)
 
-    cat > "$HOST_VARS/node${n}.yml" <<EOF
+    cat > "$HOST_VARS/${name}.yml" <<EOF
 ---
 peer_id: "${PEER}"
 eth_address: "${ADDR}"
@@ -52,11 +56,11 @@ pubkey: "${PUB}"
 local_node_key_path: "${DATA}/node.key"
 EOF
 
-    echo "    node${n}  peer=${PEER}  eth=${ADDR}"
+    echo "    ${name}  peer=${PEER}  eth=${ADDR}"
 done
 
 echo ""
 echo "Node identities written to:"
-echo "  Data:      testnet/data/node{1..3}/"
-echo "  Host vars: testnet/ansible/host_vars/node{1..3}.yml"
+echo "  Data:      testnet/data/{${NODE_NAMES[*]}}/"
+echo "  Host vars: testnet/ansible/host_vars/{${NODE_NAMES[*]}}.yml"
 echo "  JSON:      testnet/data/nodes.json"

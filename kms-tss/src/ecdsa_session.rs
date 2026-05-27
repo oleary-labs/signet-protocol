@@ -10,18 +10,28 @@
 //! # References
 //!
 //! - **DJNPO20**: Damgård, Jakobsen, Nielsen, Pagter, Østergaard.
+//!   "Fast Threshold ECDSA with Honest Majority." IACR ePrint 2020/501.
+//!   <https://eprint.iacr.org/2020/501>
+//!   Core protocol implemented here: 4-round (3 presign + 1 sign),
+//!   degree-2t polynomial presigning avoids Beaver triple generation.
+//!   Requires N ≥ 2t+1 participants, honest majority with abort.
+//!   See `docs/DJNPO20-ECDSA-2020-501.pdf`.
+//!
+//! - **ADEO20**: Aranha, Dalskov, Escudero, Orlandi.
 //!   "Improved Threshold Signatures, Proactive Secret Sharing, and Input
-//!   Certification from LSS Isomorphisms." TCC 2020.
-//!   <https://eprint.iacr.org/2020/514>
-//!   Core protocol: degree-2t polynomial presigning avoids Beaver triple
-//!   generation. Requires N ≥ 2t+1 participants.
+//!   Certification from LSS Isomorphisms." IACR ePrint 2020/691.
+//!   <https://eprint.iacr.org/2020/691>
+//!   Formalizes "putting the share in the exponent" as a linear secret-
+//!   sharing isomorphism. The `exponent_interpolation` helper below is an
+//!   instance of this framework (Shamir over F_q to G via x → x·G).
+//!   See `docs/IMPROVED-2020-691.pdf`.
 //!
 //! - **GS21**: Groth, Shoup. "Design and Analysis of a Distributed ECDSA
 //!   Signing Service." IACR ePrint 2022/506 (originally presented 2021).
 //!   <https://eprint.iacr.org/2022/506>
 //!   Rerandomization technique for binding presignatures to signing context,
 //!   preventing Wagner-style attacks. Not yet implemented here (presignatures
-//!   are consumed inline, not stored).
+//!   are consumed inline, not stored). See `docs/GROTH-ECDSA-2022-506.pdf`.
 //!
 //! - **NEAR MPC**: Reference implementation in the NEAR threshold-signatures
 //!   crate (`crates/threshold-signatures/src/ecdsa/robust_ecdsa/`).

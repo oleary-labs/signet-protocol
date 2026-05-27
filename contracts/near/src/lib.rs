@@ -19,6 +19,9 @@ mod views;
 
 pub use types::*;
 
+#[cfg(test)]
+mod tests;
+
 /// Build a storage prefix for a per-group collection.
 fn group_prefix(group_id: &str, suffix: &str) -> Vec<u8> {
     format!("g:{}:{}", group_id, suffix).into_bytes()

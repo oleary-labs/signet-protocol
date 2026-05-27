@@ -148,9 +148,53 @@ The removal delay (currently 24h for security) would still apply to the outgoing
 ### Node layer implications
 The reshare job already carries `OldParties` and `NewParties` as independent lists. A swap produces a job where the removed node is in `OldParties` but not `NewParties`, and the added node is in `NewParties` but not `OldParties` — which is exactly what the current `tss.Reshare` protocol expects. The main work is on the contract side and event detection.
 
+## Detecting Transmission Errors with a Threshold-Signed Attestation
+
+The completion-verification question — "how does the new committee know it received the right secret?" — has a known answer from the cryptography literature: have the old committee threshold-sign an attestation of what they transmitted, and have the new committee verify it before accepting. This is the PSS-with-abort construction from Aranha-Dalskov-Escudero-Orlandi (ADEO20, IACR ePrint 2020/691, §4.3). See `docs/IMPROVED-2020-691.pdf`.
+
+### The problem this solves
+
+Our current reshare relies on the underlying Lagrange-weighting protocol (Herzberg+1995) being correct. A malicious old-committee member can introduce an additive error δ into the transmitted secret: the new committee ends up with a consistent sharing of (x + δ) rather than x. They cannot detect this from the share data alone — δ commutes with Shamir's linearity. We catch it indirectly when the new committee's reconstructed `g^{x'}` fails to match the on-chain public key `g^x`, but that check is implicit and depends on a separate on-chain lookup at the next sign attempt. The window between "shares persisted" and "first sign on the new committee" is a period during which the system believes reshare succeeded even though it did not.
+
+### The ADEO20 idea
+
+Before retiring, the old committee threshold-signs a short attestation:
+
+```
+attestation = H(domain_tag || group_id || key_id || new_committee_id || new_threshold || g^{x'})
+```
+
+where `g^{x'}` is the public key the new committee should end up with (computed by the old committee from their own shares as they're transmitting; should equal the unchanged `g^x`). The new committee verifies this signature against the old committee's public key (which they already know — it's the key being reshared) before persisting their new shares. If verification fails → abort, discard the in-flight new shares, keep the old shares marked stale, retry. If verification succeeds → unforgeability of the underlying signature scheme guarantees no adversarial old party could have introduced δ ≠ 0 without breaking the signature.
+
+ADEO20 instantiates this with Pointcheval-Sanders (pairing-based) signatures. We have no PS infrastructure, but the construction is signature-scheme agnostic — FROST-Schnorr on secp256k1 satisfies EUF-CMA, which is what the security proof requires.
+
+### What this buys us
+
+- **Integrity is self-contained.** The new committee can decide locally whether to accept the reshare without consulting the chain or any external state. Completion verification is unblocked from chain RTT.
+- **Detection is cryptographic, not heuristic.** "All new-committee members confirmed" tells you they all received *something*; the threshold-signed attestation tells you they all received the *right thing*.
+- **Closes the silent-corruption window.** Detection happens at reshare time rather than at first-sign time. A failed attestation is a clean abort with old shares intact; a silent corruption discovered at sign time is harder to recover from because the operator may not realize old shares are the recovery path.
+- **Composes with batch reshare.** The old committee can sign one attestation per key, or a Merkle root over the batch with each new-committee member verifying its relevant leaf. Either way the marginal cost per key is one signature verification.
+
+### Cost
+
+One extra threshold-sign round during reshare, with the old committee acting as signer and the new committee as verifier. For same-committee proactive refresh this is one extra FROST-Schnorr signature (≈ 2 rounds + scalar mults). For committee-change reshare it's the same. Relative to the per-key reshare round count this is small.
+
+### Choice of signing key
+
+What signing key does the old committee use to sign the attestation?
+
+- **The key being reshared.** Most economical. The new committee already knows its public key. The attestation must include a domain-separation tag (e.g. `b"signet-reshare-attestation"`) so the attestation hash is unambiguously a reshare assertion and cannot be replayed as a signature on a user-supplied message. Given domain separation this is safe and incurs no extra key management.
+- **A long-lived group-attestation key.** A separate FROST key generated once per group, used only for reshare attestations. Cleaner cryptographically (zero replay surface against user keys) but adds a second key that must itself be reshared whenever membership changes, which is the cost we're trying to manage in the first place.
+
+The first option is preferred unless replay analysis under domain separation surfaces something we missed.
+
+### Relationship to the existing invariants
+
+This is a strengthening of I1 (per-key atomicity). It does not replace the explicit "done" message from each participant — that's still needed for the coordinator to know liveness — but it changes what "done" means: a participant is done when it has verified the old committee's attestation and persisted its new share, not just when it has received its new share. I2 (old shares are the backup) becomes more obviously safe to enforce, because the abort condition is now cryptographically clean rather than dependent on a later sign-time consistency check.
+
 ## Open Questions
 
-- **Completion verification mechanism.** How does the coordinator confirm all new-committee members persisted their share? Options: (a) explicit "done" message from each participant, (b) new committee produces a test signature as proof, (c) trust the protocol — if `tss.Run` returns success on the coordinator, the protocol guarantees all parties completed. Need to understand what the FROST reshare protocol actually guarantees here.
+- **Completion verification mechanism.** How does the coordinator confirm all new-committee members persisted their share? Options: (a) explicit "done" message from each participant, (b) new committee produces a test signature as proof, (c) trust the protocol — if `tss.Run` returns success on the coordinator, the protocol guarantees all parties completed, (d) old-committee threshold-signed attestation per the ADEO20 section above. (d) is the only option that detects malicious transmission errors rather than just liveness failures; (a) is still needed alongside it for coordinator liveness. Need to understand what the FROST reshare protocol actually guarantees here.
 - **Unreachable new-committee node.** If a node in the new committee is offline, the reshare for every key is blocked. How long do we wait before escalating? The only real fix is operator intervention (remove the unreachable node on-chain), which triggers yet another reshare. Need a clear escalation path.
 - **Threshold changes.** If the new committee has a different threshold, old shares cannot produce valid signatures even with the old committee intact. This weakens the "old shares are the backup" guarantee (I2). On-demand reshare still works, but signing is blocked until the reshare completes — there's no fallback to old-committee signing.
 - **Coordinator election.** How is the batch coordinator selected? Options: (a) deterministic — lowest party ID in old∩new, (b) first node to detect the chain event, (c) explicit leader election protocol. Needs failover when the coordinator goes down.

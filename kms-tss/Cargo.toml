@@ -13,10 +13,14 @@ k256 = { version = "0.13", features = ["arithmetic", "ecdsa"] }
 ecdsa = { version = "0.16", features = ["digest", "hazmat"] }
 prost = "0.13"
 rand = "0.8"
+chacha20poly1305 = "0.10"
+getrandom = { version = "0.2", features = ["std"] }
+hkdf = "0.12"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 sled = "0.34"
+zeroize = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal", "sync"] }
 tokio-stream = "0.1"
 tonic = "0.13"

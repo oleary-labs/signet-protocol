@@ -9,17 +9,30 @@ pub mod proto {
 }
 
 mod curve;
+mod custody;
 mod ecdsa_session;
+mod encrypted_store;
 mod params;
 mod reshare;
 mod reshare_session;
-mod robust_ecdsa_spike;
 mod service;
 mod session;
 mod storage;
 mod types;
 
+fn parse_hex_key(hex_str: &str) -> Result<[u8; 32], Box<dyn std::error::Error>> {
+    let hex_str = hex_str.strip_prefix("0x").unwrap_or(hex_str);
+    let bytes = hex::decode(hex_str)?;
+    if bytes.len() != 32 {
+        return Err(format!("SIGNET_KMS_KEY must be 32 bytes (64 hex chars), got {}", bytes.len()).into());
+    }
+    let mut key = [0u8; 32];
+    key.copy_from_slice(&bytes);
+    Ok(key)
+}
+
 use proto::key_manager_server::KeyManagerServer;
+use custody::{KeyCustody, LocalKeyCustody};
 use service::KmsService;
 use storage::Storage;
 
@@ -79,10 +92,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::fs::remove_file(&socket_path)?;
     }
 
-    // Open key storage.
-    let storage = Arc::new(
-        Storage::new(data_dir).map_err(|e| format!("open storage: {e}"))?,
-    );
+    // Open key storage, optionally with at-rest encryption.
+    let storage = if let Ok(hex_key) = std::env::var("SIGNET_KMS_KEY") {
+        let kek = parse_hex_key(&hex_key)?;
+        let custody = Arc::new(LocalKeyCustody::new(kek));
+        info!("at-rest encryption enabled (KEK from SIGNET_KMS_KEY)");
+        Arc::new(Storage::new_encrypted(data_dir, custody)
+            .map_err(|e| format!("open encrypted storage: {e}"))?)
+    } else {
+        info!("at-rest encryption disabled (set SIGNET_KMS_KEY to enable)");
+        Arc::new(Storage::new(data_dir).map_err(|e| format!("open storage: {e}"))?)
+    };
 
     let uds = tokio::net::UnixListener::bind(&socket_path)?;
     let uds_stream = tokio_stream::wrappers::UnixListenerStream::new(uds);

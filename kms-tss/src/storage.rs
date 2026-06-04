@@ -10,10 +10,14 @@
 //!
 //! Sled transactions span multiple trees for atomic commit/rollback operations.
 
+use std::sync::Arc;
+
 use serde::{Deserialize, Serialize};
 use sled::Transactional;
 
+use crate::custody::KeyCustody;
 use crate::curve::Curve;
+use crate::encrypted_store;
 
 /// Key status — controls whether the key can be used for signing.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -53,8 +57,10 @@ pub struct StoredKey {
 }
 
 /// sled-backed key storage with separate trees for active, pending, and archive.
+/// Optionally encrypts values at rest via envelope encryption.
 pub struct Storage {
     db: sled::Db,
+    custody: Option<Arc<dyn KeyCustody>>,
 }
 
 /// Build the sled key: `<curve_prefix_byte><key_id_bytes>`.
@@ -66,10 +72,19 @@ fn storage_key(curve: &Curve, key_id: &str) -> Vec<u8> {
 }
 
 impl Storage {
-    /// Open (or create) a sled database at the given path.
+    /// Open (or create) a sled database at the given path. No encryption.
     pub fn new(path: &str) -> Result<Self, String> {
         let db = sled::open(path).map_err(|e| format!("open sled db: {e}"))?;
-        Ok(Storage { db })
+        Ok(Storage { db, custody: None })
+    }
+
+    /// Open (or create) a sled database with at-rest encryption.
+    pub fn new_encrypted(path: &str, custody: Arc<dyn KeyCustody>) -> Result<Self, String> {
+        let db = sled::open(path).map_err(|e| format!("open sled db: {e}"))?;
+        Ok(Storage {
+            db,
+            custody: Some(custody),
+        })
     }
 
     /// Flush all pending writes to disk.
@@ -104,24 +119,20 @@ impl Storage {
 
     /// Store an active key under (group_id, curve, key_id). Flushes immediately.
     pub fn put_key(&self, group_id: &str, key_id: &str, curve: &Curve, key: &StoredKey) -> Result<(), String> {
-        let tree = self
-            .db
-            .open_tree(Self::active_tree_name(group_id))
-            .map_err(|e| format!("open tree: {e}"))?;
-        let data = serde_json::to_vec(key).map_err(|e| format!("serialize key: {e}"))?;
-        tree.insert(storage_key(curve, key_id), data)
-            .map_err(|e| format!("insert key: {e}"))?;
+        let tree_name = Self::active_tree_name(group_id);
+        let tree = self.db.open_tree(&tree_name).map_err(|e| format!("open tree: {e}"))?;
+        let sk = storage_key(curve, key_id);
+        let data = self.seal_value(&tree_name, &sk, key)?;
+        tree.insert(sk, data).map_err(|e| format!("insert key: {e}"))?;
         tree.flush().map_err(|e| format!("flush: {e}"))?;
         Ok(())
     }
 
     /// Retrieve an active key by (group_id, curve, key_id). Returns None if not found.
     pub fn get_key(&self, group_id: &str, key_id: &str, curve: &Curve) -> Result<Option<StoredKey>, String> {
-        let tree = self
-            .db
-            .open_tree(Self::active_tree_name(group_id))
-            .map_err(|e| format!("open tree: {e}"))?;
-        Self::get_from_tree(&tree, &storage_key(curve, key_id))
+        let tree_name = Self::active_tree_name(group_id);
+        let tree = self.db.open_tree(&tree_name).map_err(|e| format!("open tree: {e}"))?;
+        self.get_from_tree(&tree_name, &tree, &storage_key(curve, key_id))
     }
 
     /// List all active keys for a group, returning (key_id, curve) pairs.
@@ -149,15 +160,13 @@ impl Storage {
 
     /// Update the status of an active key. Returns error if key not found.
     pub fn set_key_status(&self, group_id: &str, key_id: &str, curve: &Curve, status: KeyStatus) -> Result<(), String> {
-        let tree = self
-            .db
-            .open_tree(Self::active_tree_name(group_id))
-            .map_err(|e| format!("open tree: {e}"))?;
+        let tree_name = Self::active_tree_name(group_id);
+        let tree = self.db.open_tree(&tree_name).map_err(|e| format!("open tree: {e}"))?;
         let sk = storage_key(curve, key_id);
-        let mut key: StoredKey = Self::get_from_tree(&tree, &sk)?
+        let mut key: StoredKey = self.get_from_tree(&tree_name, &tree, &sk)?
             .ok_or_else(|| format!("key not found: {group_id}/{key_id}"))?;
         key.status = status;
-        let data = serde_json::to_vec(&key).map_err(|e| format!("serialize key: {e}"))?;
+        let data = self.seal_value(&tree_name, &sk, &key)?;
         tree.insert(sk, data).map_err(|e| format!("update key: {e}"))?;
         tree.flush().map_err(|e| format!("flush: {e}"))?;
         Ok(())
@@ -184,23 +193,19 @@ impl Storage {
 
     /// Store a pending reshare result.
     pub fn put_pending(&self, group_id: &str, key_id: &str, curve: &Curve, key: &StoredKey) -> Result<(), String> {
-        let tree = self
-            .db
-            .open_tree(Self::pending_tree_name(group_id))
-            .map_err(|e| format!("open pending tree: {e}"))?;
-        let data = serde_json::to_vec(key).map_err(|e| format!("serialize key: {e}"))?;
-        tree.insert(storage_key(curve, key_id), data)
-            .map_err(|e| format!("insert pending: {e}"))?;
+        let tree_name = Self::pending_tree_name(group_id);
+        let tree = self.db.open_tree(&tree_name).map_err(|e| format!("open pending tree: {e}"))?;
+        let sk = storage_key(curve, key_id);
+        let data = self.seal_value(&tree_name, &sk, key)?;
+        tree.insert(sk, data).map_err(|e| format!("insert pending: {e}"))?;
         Ok(())
     }
 
     /// Retrieve a pending reshare result.
     pub fn get_pending(&self, group_id: &str, key_id: &str, curve: &Curve) -> Result<Option<StoredKey>, String> {
-        let tree = self
-            .db
-            .open_tree(Self::pending_tree_name(group_id))
-            .map_err(|e| format!("open pending tree: {e}"))?;
-        Self::get_from_tree(&tree, &storage_key(curve, key_id))
+        let tree_name = Self::pending_tree_name(group_id);
+        let tree = self.db.open_tree(&tree_name).map_err(|e| format!("open pending tree: {e}"))?;
+        self.get_from_tree(&tree_name, &tree, &storage_key(curve, key_id))
     }
 
     // -------------------------------------------------------------------------
@@ -210,52 +215,54 @@ impl Storage {
     /// Atomically promote a pending reshare result to active, archiving the
     /// previous active key. Returns the new generation number.
     pub fn commit_reshare(&self, group_id: &str, key_id: &str, curve: &Curve) -> Result<u64, String> {
-        let active_tree = self
-            .db
-            .open_tree(Self::active_tree_name(group_id))
+        let active_tree_name = Self::active_tree_name(group_id);
+        let pending_tree_name = Self::pending_tree_name(group_id);
+        let archive_tree_name = Self::archive_tree_name(group_id);
+
+        let active_tree = self.db.open_tree(&active_tree_name)
             .map_err(|e| format!("open active tree: {e}"))?;
-        let pending_tree = self
-            .db
-            .open_tree(Self::pending_tree_name(group_id))
+        let pending_tree = self.db.open_tree(&pending_tree_name)
             .map_err(|e| format!("open pending tree: {e}"))?;
-        let archive_tree = self
-            .db
-            .open_tree(Self::archive_tree_name(group_id))
+        let archive_tree = self.db.open_tree(&archive_tree_name)
             .map_err(|e| format!("open archive tree: {e}"))?;
 
         let sled_key = storage_key(curve, key_id);
 
-        // Read pending outside transaction (we need it for the return value).
-        let pending_data = pending_tree
+        // Read and decrypt pending outside transaction.
+        let pending_raw = pending_tree
             .get(&sled_key)
             .map_err(|e| format!("read pending: {e}"))?
             .ok_or_else(|| format!("no pending reshare for {group_id}/{key_id}"))?;
-        let pending: StoredKey = serde_json::from_slice(&pending_data)
-            .map_err(|e| format!("deserialize pending: {e}"))?;
+        let pending = self.open_value(&pending_tree_name, &sled_key, &pending_raw)?;
         let generation = pending.generation;
+
+        // Re-encrypt for the active tree (different tree name = different AAD).
+        let active_data = self.seal_value(&active_tree_name, &sled_key, &pending)?;
+
+        // If there's a current active key, re-encrypt for the archive tree.
+        let archive_entry = if let Some(current_raw) = active_tree
+            .get(&sled_key)
+            .map_err(|e| format!("read active: {e}"))?
+        {
+            let current = self.open_value(&active_tree_name, &sled_key, &current_raw)?;
+            let ak = format!("gen{g}/{key_id}", g = current.generation);
+            let archive_data = self.seal_value(&archive_tree_name, ak.as_bytes(), &current)?;
+            Some((ak, archive_data))
+        } else {
+            None
+        };
 
         // Atomic transaction across all three trees.
         (&active_tree, &pending_tree, &archive_tree)
             .transaction(|(active_tx, pending_tx, archive_tx)| {
-                // Archive current active (if exists).
-                if let Some(current) = active_tx.get(&sled_key)? {
-                    let current_key: StoredKey = serde_json::from_slice(&current)
-                        .map_err(|e| sled::transaction::ConflictableTransactionError::Abort(
-                            format!("deserialize active: {e}"),
-                        ))?;
-                    let ak = format!("gen{g}/{key_id}", g = current_key.generation);
-                    archive_tx.insert(ak.as_bytes(), current)?;
+                if let Some((ref ak, ref data)) = archive_entry {
+                    archive_tx.insert(ak.as_bytes(), data.as_slice())?;
                 }
-
-                // Promote pending to active.
-                active_tx.insert(sled_key.as_slice(), pending_data.clone())?;
-
-                // Remove pending.
+                active_tx.insert(sled_key.as_slice(), active_data.as_slice())?;
                 pending_tx.remove(sled_key.as_slice())?;
-
                 Ok(())
             })
-            .map_err(|e: sled::transaction::TransactionError<String>| {
+            .map_err(|e: sled::transaction::TransactionError<()>| {
                 format!("commit transaction failed: {e:?}")
             })?;
 
@@ -374,11 +381,43 @@ impl Storage {
     // Internal helpers
     // -------------------------------------------------------------------------
 
-    fn get_from_tree(tree: &sled::Tree, sled_key: &[u8]) -> Result<Option<StoredKey>, String> {
+    /// Serialize and optionally encrypt a StoredKey value for writing to sled.
+    fn seal_value(&self, tree_name: &str, sled_key: &[u8], key: &StoredKey) -> Result<Vec<u8>, String> {
+        let plaintext = serde_json::to_vec(key).map_err(|e| format!("serialize key: {e}"))?;
+        match &self.custody {
+            Some(custody) => encrypted_store::seal_record(
+                custody.as_ref(),
+                tree_name,
+                sled_key,
+                &plaintext,
+            )
+            .map_err(|e| format!("encrypt: {e}")),
+            None => Ok(plaintext),
+        }
+    }
+
+    /// Read and optionally decrypt a StoredKey value from sled.
+    fn open_value(&self, tree_name: &str, sled_key: &[u8], data: &[u8]) -> Result<StoredKey, String> {
+        let plaintext = match &self.custody {
+            Some(custody) => {
+                let pt = encrypted_store::open_record(
+                    custody.as_ref(),
+                    tree_name,
+                    sled_key,
+                    data,
+                )
+                .map_err(|e| format!("decrypt: {e}"))?;
+                pt.to_vec()
+            }
+            None => data.to_vec(),
+        };
+        serde_json::from_slice(&plaintext).map_err(|e| format!("deserialize key: {e}"))
+    }
+
+    fn get_from_tree(&self, tree_name: &str, tree: &sled::Tree, sled_key: &[u8]) -> Result<Option<StoredKey>, String> {
         match tree.get(sled_key) {
             Ok(Some(data)) => {
-                let key: StoredKey =
-                    serde_json::from_slice(&data).map_err(|e| format!("deserialize key: {e}"))?;
+                let key = self.open_value(tree_name, sled_key, &data)?;
                 Ok(Some(key))
             }
             Ok(None) => Ok(None),

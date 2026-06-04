@@ -304,6 +304,9 @@ if $USE_KMS; then
         # Remove stale socket.
         rm -f "$KMS_SOCK"
 
+        # SIGNET_KMS_KEY enables at-rest encryption. Use a deterministic
+        # devnet-only key (NOT for production).
+        SIGNET_KMS_KEY="${SIGNET_KMS_KEY:-deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef}" \
         RUST_LOG=kms_tss=info "$BUILD/kms-tss" "$KMS_SOCK" "$KMS_DATA" \
             > "$DEVNET/kms${i}.log" 2>&1 &
         echo "KMS${i}_PID=$!" >> "$PIDS_FILE"

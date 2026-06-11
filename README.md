@@ -382,6 +382,8 @@ To avoid forwarding raw JWTs across the network:
 
 The canonical request hash is `SHA256(group_id : key_id : nonce : timestamp_8bytes_BE [: message_hash])`.
 
+For scoped (payload-based) signing, `message_hash` in the canonical request hash is the payload hash the client computes locally — for `scheme=eip712`, the EIP-712 `hashTypedData` of the typed data being sent. Every node independently recomputes this hash from the forwarded payload before accepting the session signature, so the payload cannot be substituted in transit or by the initiating node.
+
 ### ZK auth (production)
 
 The Noir circuit at `circuits/jwt_auth/` proves that a valid JWT signed by a trusted RSA key commits to a given session public key, without revealing the JWT to the network. The `bb verify` binary must be on `PATH` or at `~/.bb/bb`, and `vk_path` must point to the compiled circuit verification key.

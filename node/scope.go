@@ -31,6 +31,32 @@ type SignPayload struct {
 	TypedData json.RawMessage `json:"typed_data,omitempty"` // EIP-712 typed data (scheme=eip712)
 }
 
+// HashSignPayload computes the canonical 32-byte signing hash for a
+// structured payload, independent of any key scope. For EIP-712 this is
+// hashTypedData. The client computes the same hash locally and includes
+// it in the canonical request hash, so the session signature binds the
+// exact payload being signed — not just the request envelope. Scope
+// enforcement (domain checks) is separate; see VerifyScopeAndHash.
+func HashSignPayload(payload *SignPayload) ([]byte, error) {
+	if payload == nil {
+		return nil, fmt.Errorf("payload is nil")
+	}
+	switch payload.Scheme {
+	case "eip712":
+		var typedData apitypes.TypedData
+		if err := json.Unmarshal(payload.TypedData, &typedData); err != nil {
+			return nil, fmt.Errorf("parse typed data: %w", err)
+		}
+		hash, _, err := apitypes.TypedDataAndHash(typedData)
+		if err != nil {
+			return nil, fmt.Errorf("compute EIP-712 hash: %w", err)
+		}
+		return hash, nil
+	default:
+		return nil, fmt.Errorf("unsupported payload scheme: %q", payload.Scheme)
+	}
+}
+
 // VerifyScopeAndHash verifies the payload against the key's scope and
 // returns the 32-byte hash to sign. Every signing participant calls this
 // independently — no node trusts another's hash.

@@ -611,7 +611,21 @@ func (n *Node) handleSign(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	// payload handling is deferred until after key info is loaded (need scope).
+	// For payload-based (scoped) signing, compute the payload hash up front
+	// so session auth binds the request signature to the exact payload. The
+	// client has the typed data and computes the same hash locally (EIP-712
+	// hashTypedData). Without this, the initiator (or anyone tampering with
+	// the coord stream) could substitute any payload matching the key's
+	// scope. Scope enforcement against the key still happens below, after
+	// key info is loaded.
+	if req.Payload != nil {
+		var err error
+		msgHash, err = HashSignPayload(req.Payload)
+		if err != nil {
+			httpError(w, http.StatusBadRequest, "invalid payload: "+err.Error())
+			return
+		}
+	}
 
 	grp, ok := n.lookupGroup(w, req.GroupID)
 	if !ok {

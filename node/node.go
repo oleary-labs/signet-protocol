@@ -271,8 +271,11 @@ func New(cfg *Config, log *zap.Logger) (*Node, error) {
 	mux.HandleFunc("POST /v1/keys/delete", n.handleDeleteKey)
 
 	mux.HandleFunc("POST /admin/keys", n.handleListKeys)
-	// Reshare is triggered via on-chain events (node add/remove or
-	// requestReshare() on the group contract), not via admin API.
+	// Reshare is normally triggered via on-chain events (node add/remove or
+	// requestReshare() on the group contract). POST /admin/reshare is a manual
+	// trigger: a key refresh, or a leader-failover takeover when the elected
+	// coordinator is offline (see handleStartReshare). Requires admin auth.
+	mux.HandleFunc("POST /admin/reshare", n.handleStartReshare)
 	mux.HandleFunc("POST /admin/reshare/status", n.handleReshareStatus)
 	mux.HandleFunc("GET /debug/stats", n.handleDebugStats)
 	n.server = &http.Server{Addr: cfg.APIAddr, Handler: limitRequestBody(mux)}

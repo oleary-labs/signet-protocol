@@ -156,6 +156,50 @@ The reshare job already carries `OldParties` and `NewParties` as independent lis
 - **Coordinator election.** How is the batch coordinator selected? Options: (a) deterministic — lowest party ID in old∩new, (b) first node to detect the chain event, (c) explicit leader election protocol. Needs failover when the coordinator goes down.
 - **Batch restart after crash.** The batch must be resumable. The stale-key list in bbolt provides this — on restart, re-scan for stale keys and pick up where we left off. But need to ensure no key is in an intermediate state from a half-finished reshare (follows from I1).
 
+## Leader Failover (H5)
+
+The elected reshare coordinator is the lexicographically smallest active member
+(`reshareLeader` → `grp.Members[0]`). Chain-event-driven reshares only start if
+that node is up (`chain.go` gates `startCoordinator` on `isReshareLeader`). If
+the leader is offline, the proactive reshare never starts and hangs.
+
+### Current mitigation (manual — implemented)
+
+Two recourses exist today:
+
+1. **On-demand self-heal.** When a sign request hits a stale key, any member can
+   coordinate that key's reshare (`coord.go` `msgReshare` on-demand path). This
+   heals individual keys on next use but does not drive a proactive
+   committee/threshold change while the leader is down.
+2. **Manual takeover.** `POST /admin/reshare` (group-scoped admin auth) lets an
+   operator drive a reshare from any live node. If a job already exists locally
+   (e.g. created from a chain event whose leader is offline), it takes over that
+   job rather than creating a new one; otherwise it creates a same-committee
+   refresh. The per-node `reshareCoord` guard prevents a duplicate coordinator
+   on the same node.
+
+**Limitation:** nothing prevents two coordinators running concurrently for the
+same group across *different* nodes (e.g. the leader recovers and resumes while
+an operator has manually taken over elsewhere). Per-key generation tracking and
+rollback (I1, I7) prevent share corruption, but concurrent coordinators cause
+churn and wasted work. Operators MUST only invoke manual takeover when the
+elected leader is confirmed down.
+
+### Required future work (automatic, split-brain-safe failover)
+
+This is the proper fix (audit finding H5, deferred):
+
+- **Staggered-timeout takeover.** Candidate at sort-index *i* starts coordinating
+  after `i · T` unless it observes an active coordinator — so the leader goes
+  first and successors only step in on silence.
+- **Stand-down signal.** A starting coordinator claims the job (broadcast) so
+  lower-priority candidates cancel their pending takeover.
+- **Single-coordinator enforcement at participants.** Reject a second coordinator
+  for the same `(group, generation)` with a deterministic tiebreak (lowest index
+  wins). This is the real safety net; the timeout only reduces contention.
+- **Failure-injection tests.** Kill the leader mid-batch, partition the network,
+  and assert exactly one reshare completes per generation.
+
 ## Next Steps
 
 - [ ] Define the group reshare state machine with clear transitions

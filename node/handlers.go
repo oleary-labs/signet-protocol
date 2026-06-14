@@ -846,8 +846,23 @@ func (n *Node) handleSign(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(resp)
 }
 
-// handleStartReshare handles POST /admin/reshare. Creates a same-committee
-// reshare job (key refresh) and starts the coordinator. Requires admin auth.
+// handleStartReshare handles POST /admin/reshare. Requires (group-scoped) admin
+// auth. Two uses:
+//
+//   - Manual key refresh: when no reshare is pending, create a same-committee
+//     refresh job and coordinate it.
+//   - Leader failover (H5 mitigation): when a reshare job already exists locally
+//     — e.g. created from a chain membership event whose elected leader
+//     (lexicographically smallest member) is offline and never started
+//     coordinating — take over that existing job and drive it from this node.
+//
+// This is a manual mitigation, not automatic failover. The participant side
+// already accepts a non-leader coordinator (see the msgReshare on-demand path
+// in coord.go), but nothing prevents two coordinators running concurrently for
+// the same group across different nodes. Operators MUST only invoke this when
+// the elected leader is confirmed down. Automatic, split-brain-safe failover
+// (staggered-timeout takeover + single-coordinator enforcement) is tracked as
+// future work in docs/DESIGN-RESHARE-HARDENING.md.
 func (n *Node) handleStartReshare(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		AdminAuth
@@ -874,15 +889,6 @@ func (n *Node) handleStartReshare(w http.ResponseWriter, r *http.Request) {
 		concurrency = 1
 	}
 
-	// Check if a job already exists.
-	n.reshareJobsMu.RLock()
-	existingJob := n.reshareJobs[groupID]
-	n.reshareJobsMu.RUnlock()
-	if existingJob != nil {
-		n.httpError(w, http.StatusConflict, "reshare already in progress for this group")
-		return
-	}
-
 	// Look up group membership.
 	n.groupsMu.RLock()
 	grp, ok := n.groups[groupID]
@@ -892,26 +898,39 @@ func (n *Node) handleStartReshare(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Check if there are any keys to reshare.
-	keyCount := 0
-	if keyIDs, err := n.km.ListKeys(groupID); err == nil {
-		keyCount = len(keyIDs)
-	}
-	if keyCount == 0 {
-		n.httpError(w, http.StatusBadRequest, "no keys to reshare for this group")
-		return
-	}
+	// If a reshare job already exists, take it over (failover) rather than
+	// creating a new one. Otherwise create a same-committee refresh job. The
+	// per-node reshareCoord guard in startCoordinator still rejects a duplicate
+	// coordinator on this node (mapped to 409 below).
+	n.reshareJobsMu.RLock()
+	existingJob := n.reshareJobs[groupID]
+	n.reshareJobsMu.RUnlock()
 
-	// Create a same-committee reshare job (key refresh).
-	members := make([]tss.PartyID, len(grp.Members))
-	copy(members, grp.Members)
-	if err := n.createReshareJob(groupID, "refresh", members, members, grp.Threshold); err != nil {
-		n.httpError(w, http.StatusInternalServerError, "create reshare job: "+err.Error())
-		return
+	action := "started"
+	if existingJob == nil {
+		// Manual refresh: require keys to reshare.
+		keyCount := 0
+		if keyIDs, err := n.km.ListKeys(groupID); err == nil {
+			keyCount = len(keyIDs)
+		}
+		if keyCount == 0 {
+			n.httpError(w, http.StatusBadRequest, "no keys to reshare for this group")
+			return
+		}
+		members := make([]tss.PartyID, len(grp.Members))
+		copy(members, grp.Members)
+		if err := n.createReshareJob(groupID, "refresh", members, members, grp.Threshold); err != nil {
+			n.httpError(w, http.StatusInternalServerError, "create reshare job: "+err.Error())
+			return
+		}
+	} else {
+		action = "resumed"
 	}
 
 	if err := n.startCoordinator(groupID, concurrency); err != nil {
-		n.httpError(w, http.StatusInternalServerError, err.Error())
+		// startCoordinator returns an error when this node is already
+		// coordinating this group's reshare.
+		n.httpError(w, http.StatusConflict, err.Error())
 		return
 	}
 
@@ -925,7 +944,7 @@ func (n *Node) handleStartReshare(w http.ResponseWriter, r *http.Request) {
 		"keys_total":  len(job.KeysTotal),
 		"keys_done":   done,
 		"concurrency": concurrency,
-		"status":      "started",
+		"status":      action,
 	})
 }
 

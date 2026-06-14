@@ -167,18 +167,16 @@ Error messages were returned raw to the client (`"key not found: group=... key=.
 
 ### H5. Reshare Leader Failover Missing
 
-**File**: `node/reshare.go:48`
+**File**: `node/reshare.go`, `node/handlers.go` (`handleStartReshare`), `node/node.go`
+**Status**: ⚠️ Partially mitigated (`feat/at-rest-encryption`); automatic failover deferred
 
-If the elected reshare leader (lexicographically smallest member) is down, reshare hangs indefinitely. There is no timeout-based failover.
+If the elected reshare leader (lexicographically smallest member) is down, a chain-event-driven reshare does not start automatically.
 
-```go
-// TODO: If the elected leader is down or unresponsive, the reshare will
-// not proceed automatically...
-```
+**Impact**: A single offline node can block proactive reshares for a group. In a 5-node network with one external operator, this is a likely failure mode.
 
-**Impact**: A single offline node can block all reshares for a group indefinitely. In a 5-node network with one external operator, this is a likely failure mode.
+**Mitigation (implemented)**: `POST /admin/reshare` is now routed (it was previously an unrouted handler) as a **manual** failover. Under group-scoped admin auth (see C5), it takes over an existing stalled reshare job from any live node — or creates a same-committee refresh if none exists — rather than waiting on the dead leader. Combined with the existing on-demand self-heal (a sign request on a stale key lets any member coordinate that key), operators have a recourse. The per-node `reshareCoord` guard prevents a duplicate coordinator on the same node.
 
-**Recommendation**: Implement timeout-based failover where the next node in sort order takes over if the leader hasn't started coordination within N seconds (e.g., 60s).
+**Residual risk / deferred work**: Nothing prevents two coordinators running concurrently across *different* nodes (e.g. the leader recovers while an operator has taken over elsewhere). Per-key generation tracking + rollback (reshare invariants I1/I7) prevent share corruption, but concurrent coordinators cause churn — so operators must only invoke manual takeover when the leader is confirmed down. Automatic, split-brain-safe failover (staggered-timeout takeover + single-coordinator enforcement at participants) is the proper fix and is specified under "Leader Failover (H5)" in `docs/DESIGN-RESHARE-HARDENING.md`. Covered partially by `TestStartReshareRequiresKeys` and the admin-auth/fail-closed tests; full failover behavior needs multi-node failure-injection tests (future).
 
 ---
 
@@ -377,7 +375,7 @@ The scope lists `ecdsa_session.rs` for *signing* but omits the **key generation 
 | **P1** | ✅ Add quorum check to `executeRemoval` | Low | `contracts/SignetGroup.sol` |
 | **P1** | ✅ Sanitize error messages returned to clients | Low | `node/handlers.go` |
 | **P1** | ✅ Fix delegation parent key slicing panic | Low | `node/delegate.go` |
-| **P1** | Implement reshare leader failover | Medium | `node/reshare.go` |
+| **P1** | ⚠️ Reshare leader failover (manual mitigation; auto deferred) | Medium | `node/handlers.go`, `node/reshare.go` |
 | **P2** | Deploy behind TLS-terminating proxy | Low | `node/node.go` (or infra) |
 | **P2** | Add rate limiting | Medium | `node/node.go` (or infra) |
 | **P2** | Add DKG/keygen Rust module to audit scope | Low | `kms-tss/src/` |

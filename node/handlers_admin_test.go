@@ -12,6 +12,8 @@ import (
 
 	"github.com/ethereum/go-ethereum/crypto"
 	"go.uber.org/zap"
+
+	"signet/tss"
 )
 
 // adminTestNode builds a Node with a real GroupAuth (no auth keys configured
@@ -153,6 +155,43 @@ func TestAdminAuthIsGroupScoped(t *testing.T) {
 				t.Fatalf("group-A admin acting on group B: expected 401, got %d (body %q)", rec.Code, rec.Body.String())
 			}
 		})
+	}
+}
+
+// TestStartReshareRequiresKeys confirms the manual reshare endpoint authenticates
+// (group-scoped admin auth) and, with no existing job and no keys to reshare,
+// returns 400 — exercising the create branch without launching a coordinator.
+func TestStartReshareRequiresKeys(t *testing.T) {
+	const groupID = "0xreshare"
+
+	priv, err := crypto.GenerateKey()
+	if err != nil {
+		t.Fatalf("genkey: %v", err)
+	}
+	n := adminTestNode(t)
+	n.groups[groupID] = &GroupInfo{Threshold: 2, Members: []tss.PartyID{"a", "b", "c"}}
+	authKeyPub := append([]byte{AuthKeySchemeECDSA}, crypto.CompressPubkey(&priv.PublicKey)...)
+	n.auth.SetAuthKeys(groupID, [][]byte{authKeyPub})
+
+	nonce := "feed"
+	ts := uint64(time.Now().Unix())
+	authKeyHex, sigHex := signAdminAuth(t, priv, groupID, nonce, ts)
+
+	body, _ := json.Marshal(map[string]any{
+		"group_id":     groupID,
+		"auth_key_pub": authKeyHex,
+		"signature":    sigHex,
+		"nonce":        nonce,
+		"timestamp":    ts,
+	})
+	req := httptest.NewRequest(http.MethodPost, "/admin/reshare", bytes.NewReader(body))
+	rec := httptest.NewRecorder()
+
+	n.handleStartReshare(rec, req)
+
+	// mockKeyManager has no keys for the group → no keys to reshare.
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 (no keys), got %d (body %q)", rec.Code, rec.Body.String())
 	}
 }
 

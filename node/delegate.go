@@ -18,6 +18,27 @@ import (
 	"signet/tss"
 )
 
+// parentKeyFromResolved strips the trailing ":<suffix>" from a resolved sub-key
+// ID to recover the parent key ID. It returns ok=false (rather than panicking)
+// when resolved does not contain ":<suffix>" before its end — e.g. an empty
+// suffix, or a delegation-token session whose resolved key_id is unrelated to
+// the requested suffix. The match must be anchored at the end of the string so
+// a suffix appearing mid-ID cannot be mistaken for the tail.
+func parentKeyFromResolved(resolved, suffix string) (string, bool) {
+	if suffix == "" {
+		return "", false
+	}
+	marker := ":" + suffix
+	if !strings.HasSuffix(resolved, marker) {
+		return "", false
+	}
+	idx := len(resolved) - len(marker)
+	if idx <= 0 {
+		return "", false
+	}
+	return resolved[:idx], true
+}
+
 // jwtHeader is the JWT header for delegation tokens.
 type jwtHeader struct {
 	Alg string `json:"alg"`
@@ -116,8 +137,17 @@ func (n *Node) handleDelegate(w http.ResponseWriter, r *http.Request) {
 		}
 		authProof = ap
 		subKeyID = resolved
-		// Parent key is the base identity key (resolved without suffix).
-		parentKeyID = resolved[:len(resolved)-len(req.KeySuffix)-1]
+		// Parent key is the base identity key (resolved without the ":<suffix>"
+		// tail). parentKeyFromResolved searches for the suffix rather than
+		// slicing by length: a delegation-token session resolves to a key_id
+		// that is NOT derived from req.KeySuffix, so a crafted long suffix would
+		// otherwise produce a negative index and panic (node DoS).
+		var ok bool
+		parentKeyID, ok = parentKeyFromResolved(resolved, req.KeySuffix)
+		if !ok {
+			httpError(w, http.StatusBadRequest, "key_suffix does not match the session key")
+			return
+		}
 	} else {
 		subKeyID = req.KeyID
 		parentKeyID = req.ParentKeyID

@@ -275,9 +275,37 @@ func New(cfg *Config, log *zap.Logger) (*Node, error) {
 	// requestReshare() on the group contract), not via admin API.
 	mux.HandleFunc("POST /admin/reshare/status", n.handleReshareStatus)
 	mux.HandleFunc("GET /debug/stats", n.handleDebugStats)
-	n.server = &http.Server{Addr: cfg.APIAddr, Handler: mux}
+	n.server = &http.Server{Addr: cfg.APIAddr, Handler: limitRequestBody(mux)}
 
 	return n, nil
+}
+
+// Request body size limits. Bounds memory/CPU spent parsing untrusted POST
+// bodies. /v1/auth is unauthenticated and triggers expensive ZK verification,
+// so it gets the largest allowance (proofs are sizeable); other endpoints carry
+// small fixed-shape JSON.
+const (
+	maxBodyAuth    = 256 << 10 // 256 KiB — /v1/auth (ZK proof)
+	maxBodyDefault = 64 << 10  // 64 KiB  — keygen/sign/delegate/keys
+	maxBodyAdmin   = 32 << 10  // 32 KiB  — /admin/*
+)
+
+// limitRequestBody wraps h so each request's body is capped via
+// http.MaxBytesReader before any handler reads it. A handler reading past the
+// limit gets an error from the decoder (surfaced as 400), and the response is
+// marked non-keep-alive. GET endpoints carry no body, so the cap is a no-op.
+func limitRequestBody(h http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		limit := int64(maxBodyDefault)
+		switch {
+		case r.URL.Path == "/v1/auth":
+			limit = maxBodyAuth
+		case strings.HasPrefix(r.URL.Path, "/admin/"):
+			limit = maxBodyAdmin
+		}
+		r.Body = http.MaxBytesReader(w, r.Body, limit)
+		h.ServeHTTP(w, r)
+	})
 }
 
 // Start begins serving the HTTP API in a background goroutine.

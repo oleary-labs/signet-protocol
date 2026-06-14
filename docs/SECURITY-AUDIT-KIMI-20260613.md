@@ -132,7 +132,54 @@ The reshare coord paths (`msgReshare*`) are intentionally left unchanged — res
 
 ---
 
-### H2. No HTTP Request Body Size Limit
+### H1. Protocol Message Sender Impersonation
+
+**File**: `network/session.go:59-73` (`handleStream`), `tss/message.go`
+**Status**: ⚠️ Open — not yet addressed
+
+The libp2p `handleStream` handler reads `tss.Message` from a peer stream and enqueues it into the session's incoming channel **without verifying that `msg.From` matches the authenticated transport peer** (`s.Conn().RemotePeer()`). libp2p authenticates the transport layer (you know which peer opened the stream), but the application layer blindly trusts the `From` field embedded in the CBOR message body.
+
+```go
+func (sn *SessionNetwork) handleStream(s libp2pnet.Stream) {
+    defer s.Close()
+    msg, err := readMessage(s)
+    // ... no check that msg.From == s.Conn().RemotePeer() ...
+    select {
+    case sn.incoming <- msg:
+    // ...
+    }
+}
+```
+
+**Attack scenario**: Node A is compromised. It opens an authenticated stream to Node B (provably as A), but sends a message with `msg.From = "party-C"`. Node B forwards `From = "party-C"` to the KMS, which processes it as if it came from C.
+
+**Impact by protocol**:
+
+| Protocol | What forged `From` enables |
+|---|---|
+| **FROST Sign** | Overwrite an honest party's commitment with a malicious one, causing signature failure or nonce bias |
+| **ECDSA Sign** | Inject invalid R2/R3/R4 values attributed to an honest party, causing interpolation failure or invalid signature |
+| **FROST Keygen** | Corrupt an honest party's DKG package, causing an invalid group key |
+| **Reshare** | Inject invalid reshare values attributed to an honest party, corrupting the new committee's shares |
+
+The FROST/ECDSA libraries validate cryptographic inputs (serialization lengths, curve points, consistency checks, zero-hash rejection), but they rely on the caller's guarantee that each message was sent by the claimed party. The robustness guarantees assume "up to t malicious **participants**" — not "up to t malicious **streams that can impersonate anyone**". This collapses the effective security from t-of-n to 1-of-n for message injection.
+
+**Recommended fix** (~5 lines in `handleStream`):
+
+```go
+expectedFrom := tss.PartyID(s.Conn().RemotePeer().String())
+if msg.From != expectedFrom {
+    stdlog.Printf("[handleStream] session=%s impersonation rejected: claimed=%s actual=%s",
+        sn.sessionID, msg.From, expectedFrom)
+    return
+}
+```
+
+This binds every protocol message to the authenticated libp2p peer identity, closing the gap between transport auth and application-layer sender identity.
+
+---
+
+### H3. No HTTP Request Body Size Limit
 
 **File**: `node/node.go` (`limitRequestBody` middleware)
 **Status**: ✅ Resolved (`feat/at-rest-encryption`)
@@ -143,7 +190,7 @@ All HTTP handlers used `json.NewDecoder(r.Body)` without `http.MaxBytesReader`, 
 
 ---
 
-### H3. SignetGroup Removal Doesn't Check Quorum
+### H4. SignetGroup Removal Doesn't Check Quorum
 
 **File**: `contracts/contracts/SignetGroup.sol` (`executeRemoval`)
 **Status**: ✅ Resolved (`feat/at-rest-encryption`)
@@ -154,7 +201,7 @@ All HTTP handlers used `json.NewDecoder(r.Body)` without `http.MaxBytesReader`, 
 
 ---
 
-### H4. Error Messages Leak Internal State
+### H5. Error Messages Leak Internal State
 
 **File**: `node/handlers.go` (`(*Node).httpError`, `genericErrorMessage`, `writeJSONError`)
 **Status**: ✅ Resolved (`feat/at-rest-encryption`)
@@ -165,7 +212,7 @@ Error messages were returned raw to the client (`"key not found: group=... key=.
 
 ---
 
-### H5. Reshare Leader Failover Missing
+### H6. Reshare Leader Failover Missing
 
 **File**: `node/reshare.go`, `node/handlers.go` (`handleStartReshare`), `node/node.go`
 **Status**: ⚠️ Partially mitigated (`feat/at-rest-encryption`); automatic failover deferred
@@ -180,7 +227,7 @@ If the elected reshare leader (lexicographically smallest member) is down, a cha
 
 ---
 
-### H6. Delegation Token Parent Key Slicing Panic
+### H7. Delegation Token Parent Key Slicing Panic
 
 **File**: `node/delegate.go` (`parentKeyFromResolved`)
 **Status**: ✅ Resolved (`feat/at-rest-encryption`)
@@ -231,13 +278,20 @@ No rate limiting on any endpoint. `/v1/auth` triggers expensive `bb verify`; `/v
 
 ### M4. Peer Auto-Registration Without Allowlist
 
-**File**: `network/host.go:79-82`
+**File**: `network/host.go`
+**Status**: ⚠️ Resource angle fixed (`feat/at-rest-encryption`); impersonation angle low-risk; member allowlist deferred
 
-Any peer that connects via libp2p is auto-registered in the party mapping. There is no application-level allowlist or mutual auth beyond libp2p's transport handshake.
+Any peer that connects via libp2p was auto-registered in the party mapping, with no application-level allowlist beyond libp2p's transport handshake.
 
-**Impact**: A rogue node on the network can inject itself into peer mappings and observe connection metadata.
+**Impersonation/metadata impact (low-risk, by design):** `partyID` *is* the libp2p peer ID string, and the peer ID is the cryptographic hash of the peer's public key, authenticated by the transport handshake. A rogue peer can therefore only register *itself* — it cannot spoof a member's `partyID`. The mapping is a lookup cache, not an authorization boundary: all sensitive coord operations are independently gated by on-chain membership (reshare `senderIsMember`; keygen/sign `Parties`/`Signers` ⊆ members + threshold via H1) and session/admin auth, and TSS sessions are built from explicit member lists. So a rogue in the map gains no signing ability and cannot impersonate.
 
-**Recommendation**: Add application-level peer allowlisting based on on-chain group membership. Reject coord messages from unregistered peers.
+**Resource/availability impact (the real issue — fixed):** `Disconnected` was a no-op, so the `parties`/`peers` maps grew unboundedly as distinct (including ephemeral/rogue) peers connected and disconnected — a slow memory-exhaustion vector — and no `ConnManager` bounded concurrent connections ("zombie peers"). Resolution:
+- `Disconnected` now evicts a peer's mapping once it has no remaining connections, bounding the map to currently-connected peers (`deregisterPeer`). `self` is never evicted.
+- `PeerForParty` falls back to decoding the `partyID` (it equals the peer ID string), so the map is a pure cache and eviction never breaks message routing.
+- A libp2p `ConnManager` (low/high watermarks 96/192, 1-min grace) now bounds concurrent connections; the grace period exceeds a 30s session so active members aren't pruned mid-session.
+- Covered by `TestPeerForPartyFallback` and `TestPeerMappingEvictedOnDisconnect` in `network/host_test.go`.
+
+**Deferred — member allowlist (defense-in-depth):** Restrict registration (and/or reject coord streams) to peers in the node's **allowed set = the union of active members across *all* groups the node participates in** (not a single group — a node may belong to several). This is a layering change: the `network` package would need group-membership state from the `node` layer (e.g. an injected `isAllowedPeer(peerID) bool` predicate backed by `n.groups`). It complements H1's per-message checks and the connection-manager bounds above; tracked as future hardening.
 
 ---
 

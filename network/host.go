@@ -6,12 +6,14 @@ import (
 	"fmt"
 	"io"
 	"sync"
+	"time"
 
 	"github.com/libp2p/go-libp2p"
 	"github.com/libp2p/go-libp2p/core/crypto"
 	"github.com/libp2p/go-libp2p/core/host"
 	libp2pnet "github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
+	"github.com/libp2p/go-libp2p/p2p/net/connmgr"
 	ma "github.com/multiformats/go-multiaddr"
 
 	"signet/tss"
@@ -20,6 +22,15 @@ import (
 const (
 	// maxMessageSize is the maximum size of a length-prefixed message (10MB).
 	maxMessageSize = 10 * 1024 * 1024
+
+	// Connection-manager watermarks. The node only needs connections to its
+	// group peers (small) plus bootstrap/discovery, so these are generous: under
+	// normal operation nothing is pruned, but they cap connection growth from
+	// churning/rogue ("zombie") peers. The grace period comfortably exceeds a
+	// signing/keygen session (30s) so an active member is never pruned mid-session.
+	connMgrLowWater  = 96
+	connMgrHighWater = 192
+	connMgrGrace     = time.Minute
 )
 
 // Host wraps a libp2p host and maintains tss.PartyID <-> peer.ID mappings.
@@ -40,9 +51,18 @@ func NewHost(ctx context.Context, privKey crypto.PrivKey, listenAddr string) (*H
 		return nil, fmt.Errorf("party ID from key: %w", err)
 	}
 
+	cm, err := connmgr.NewConnManager(
+		connMgrLowWater, connMgrHighWater,
+		connmgr.WithGracePeriod(connMgrGrace),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("conn manager: %w", err)
+	}
+
 	h, err := libp2p.New(
 		libp2p.Identity(privKey),
 		libp2p.ListenAddrStrings(listenAddr),
+		libp2p.ConnectionManager(cm),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("libp2p new: %w", err)
@@ -82,7 +102,15 @@ func (n *connectionNotifee) Connected(_ libp2pnet.Network, c libp2pnet.Conn) {
 	pid := c.RemotePeer()
 	n.host.RegisterPeer(tss.PartyID(pid.String()), pid)
 }
-func (n *connectionNotifee) Disconnected(_ libp2pnet.Network, _ libp2pnet.Conn) {}
+
+// Disconnected evicts a peer's party mapping once it has no remaining
+// connections. Without this the parties/peers maps grow unboundedly as distinct
+// (including ephemeral or rogue) peers connect and disconnect over the node's
+// lifetime — a slow memory-exhaustion vector. Resolution still works for evicted
+// peers because PeerForParty falls back to decoding the partyID.
+func (n *connectionNotifee) Disconnected(_ libp2pnet.Network, c libp2pnet.Conn) {
+	n.host.deregisterPeer(c.RemotePeer())
+}
 func (n *connectionNotifee) Listen(_ libp2pnet.Network, _ ma.Multiaddr)          {}
 func (n *connectionNotifee) ListenClose(_ libp2pnet.Network, _ ma.Multiaddr)     {}
 
@@ -110,12 +138,42 @@ func (h *Host) RegisterPeer(partyID tss.PartyID, peerID peer.ID) {
 	h.peers[peerID] = partyID
 }
 
-// PeerForParty returns the peer.ID for a given tss.PartyID.
+// PeerForParty returns the peer.ID for a given tss.PartyID. The parties map is a
+// cache; since a tss.PartyID is exactly a peer.ID string, resolution falls back
+// to decoding the partyID directly when it isn't cached (e.g. a peer evicted
+// after disconnect, or a member not yet connected). This keeps the cache safe to
+// evict without breaking message routing.
 func (h *Host) PeerForParty(id tss.PartyID) (peer.ID, bool) {
 	h.mu.RLock()
-	defer h.mu.RUnlock()
 	pid, ok := h.parties[id]
-	return pid, ok
+	h.mu.RUnlock()
+	if ok {
+		return pid, true
+	}
+	decoded, err := peer.Decode(string(id))
+	if err != nil {
+		return "", false
+	}
+	return decoded, true
+}
+
+// deregisterPeer removes a peer's party mapping once it has no remaining
+// connections. Self is never removed (a node has no libp2p connection to itself).
+func (h *Host) deregisterPeer(pid peer.ID) {
+	// Keep the mapping while any other connection to this peer remains; libp2p
+	// can report Disconnected for one of several connections.
+	if h.h.Network().Connectedness(pid) == libp2pnet.Connected {
+		return
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if partyID, ok := h.peers[pid]; ok {
+		if partyID == h.self {
+			return
+		}
+		delete(h.peers, pid)
+		delete(h.parties, partyID)
+	}
 }
 
 // LibP2PHost returns the underlying libp2p host (for connect/discovery).

@@ -65,9 +65,8 @@ Implementation of the DJNPO20 robust threshold ECDSA protocol (4-round:
 3 presign + 1 sign). Based on the NEAR MPC team's analysis of the same
 protocol.
 
-- Damgård, Jakobsen, Nielsen, Pagter, Østergaard. "Improved Threshold
-  Signatures, Proactive Secret Sharing, and Input Certification from LSS
-  Isomorphisms." TCC 2020. https://eprint.iacr.org/2020/514
+- Damgård, Jakobsen, Nielsen, Pagter, Østergård. "Fast Threshold ECDSA
+  with Honest Majority." 2020. https://eprint.iacr.org/2020/501
 - NEAR MPC analysis: https://github.com/near/threshold-signatures/blob/main/docs/ecdsa/robust_ecdsa/signing.md
 
 **Build-or-reuse assessment**: We implemented DJNPO20 from the paper and

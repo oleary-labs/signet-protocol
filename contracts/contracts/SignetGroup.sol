@@ -180,6 +180,14 @@ contract SignetGroup is Initializable, ISignetGroup {
         require(req.executeAfter != 0, "no queued removal");
         require(block.timestamp >= req.executeAfter, "delay not elapsed");
 
+        // Removing this node must not drop the active set below threshold.
+        // threshold is immutable after initialization, so a quorum-breaking
+        // removal would permanently brick the group (all keys unrecoverable).
+        // The active node being removed is still counted in _activeNodes here,
+        // so the post-removal size is length - 1; require length - 1 >= threshold
+        // (equivalently length > threshold, which also avoids unsigned underflow).
+        require(_activeNodes.length > threshold, "removal would break quorum");
+
         delete _removalRequests[node];
         _removeFromActive(node);
         emit NodeRemoved(node);

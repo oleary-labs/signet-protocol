@@ -12,11 +12,30 @@ import (
 	"signet/tss"
 )
 
-// LoadOrGenerateKey loads a private key from path, or generates and saves a new secp256k1 key.
-// File format: raw protobuf bytes from crypto.MarshalPrivateKey. Perms: 0600.
-func LoadOrGenerateKey(path string) (crypto.PrivKey, error) {
+// KeyPassphraseEnv is the environment variable holding the passphrase used to
+// encrypt the node identity key at rest. When unset/empty, the key is stored in
+// the legacy plaintext format.
+const KeyPassphraseEnv = "SIGNET_NODE_KEY_PASSPHRASE"
+
+// LoadOrGenerateKey loads a private key from path, or generates and saves a new
+// secp256k1 key. Perms: 0600.
+//
+// If passphrase is non-empty, a newly generated key is encrypted at rest with
+// XChaCha20-Poly1305 under a scrypt-derived key (see keyfile.go); on load, an
+// encrypted file is decrypted with the same passphrase. An empty passphrase
+// stores/loads the legacy plaintext format (raw protobuf from
+// crypto.MarshalPrivateKey). Encrypted files are self-describing via a magic
+// prefix, so a legacy plaintext key still loads even when a passphrase is set —
+// this keeps existing nodes working while new nodes get encryption.
+func LoadOrGenerateKey(path, passphrase string) (crypto.PrivKey, error) {
 	data, err := os.ReadFile(path)
 	if err == nil {
+		if isEncryptedKeyFile(data) {
+			data, err = decryptKeyFile(data, passphrase)
+			if err != nil {
+				return nil, fmt.Errorf("decrypt key file %s: %w", path, err)
+			}
+		}
 		return crypto.UnmarshalPrivateKey(data)
 	}
 	if !os.IsNotExist(err) {
@@ -32,6 +51,13 @@ func LoadOrGenerateKey(path string) (crypto.PrivKey, error) {
 	data, err = crypto.MarshalPrivateKey(priv)
 	if err != nil {
 		return nil, fmt.Errorf("marshal key: %w", err)
+	}
+
+	if passphrase != "" {
+		data, err = encryptKeyFile(data, passphrase)
+		if err != nil {
+			return nil, fmt.Errorf("encrypt key file %s: %w", path, err)
+		}
 	}
 
 	if err := os.WriteFile(path, data, 0600); err != nil {

@@ -9,10 +9,9 @@
 //!
 //! # References
 //!
-//! - **DJNPO20**: Damgård, Jakobsen, Nielsen, Pagter, Østergaard.
-//!   "Improved Threshold Signatures, Proactive Secret Sharing, and Input
-//!   Certification from LSS Isomorphisms." TCC 2020.
-//!   <https://eprint.iacr.org/2020/514>
+//! - **DJNPO20**: Damgård, Jakobsen, Nielsen, Pagter, Østergård.
+//!   "Fast Threshold ECDSA with Honest Majority." 2020.
+//!   <https://eprint.iacr.org/2020/501>
 //!   Core protocol: degree-2t polynomial presigning avoids Beaver triple
 //!   generation. Requires N ≥ 2t+1 participants.
 //!

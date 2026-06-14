@@ -12,7 +12,7 @@
 
 This audit was conducted with the Kimi model to assess the Signet protocol's security posture ahead of a public alpha deployment. The codebase has matured significantly since the original `SECURITY-ANALYSIS-OLD.md` was written. The most critical historical vulnerability — raw JWT forwarding that collapsed the threshold trust model to 1-of-n — has been fixed via ZK proofs bound to ephemeral session keys (commit `a420f5f`). ECDSA signature formatting (EIP-2 low-S normalization and v-byte recovery) is correctly implemented.
 
-However, **several critical and high-severity issues remain** that could lead to key loss, unauthorized signing, or permanent group inoperability in a real-money alpha. The most serious gaps are in **at-rest storage encryption** (plaintext key shards and node identity keys), **authorization edge cases** in the ZK and delegation paths, **admin endpoint access control**, and **smart contract quorum protection**.
+However, **several critical and high-severity issues remain** that could lead to key loss, unauthorized signing, or permanent group inoperability in a real-money alpha. The most serious gaps are in **authorization edge cases** in the ZK and delegation paths, **admin endpoint access control**, and **smart contract quorum protection**. **At-rest storage encryption** (key shards and node identity keys) has been resolved on `feat/at-rest-encryption`.
 
 This document supersedes `SECURITY-ANALYSIS-OLD.md` as the canonical security assessment for the current codebase.
 
@@ -33,88 +33,66 @@ These issues could lead to immediate loss of funds, key compromise, or complete 
 
 ### C1. Plaintext Key Shard Storage
 
-**File**: `node/keystore.go`
-**Status**: Unchanged from `SECURITY-ANALYSIS-OLD.md` §1.1
+**File**: `kms-tss/src/storage.rs`, `kms-tss/src/encrypted_store.rs`, `kms-tss/src/custody.rs`
+**Status**: ✅ Resolved (`feat/at-rest-encryption`)
 
-Key shards (the most sensitive data in the system) are stored as **plaintext JSON** in a bbolt database. OS file permissions (`0600`) are the only protection.
+Key shards were previously stored as **plaintext JSON** in sled. OS file permissions (`0600`) were the only protection.
 
-```go
-func (s *KeyShardStore) Put(groupID, keyID string, cfg *tss.Config) error {
-    data, err := json.Marshal(cfg)  // plaintext JSON
-    // ...
-    return grp.Put([]byte(keyID), data)
-}
-```
+**Resolution**: The Rust KMS now supports envelope encryption via `Storage::new_encrypted()`. Each `StoredKey` value is sealed with a per-record random DEK (32 bytes) encrypted under a KEK via XChaCha20-Poly1305. The AAD binds each ciphertext to its addressing context (`version || kek_version || tree_name || record_key`) plus domain-separated literals (`dek/v1`, `val/v1`), preventing cross-key and cross-tree swapping attacks. The `value_aad` additionally includes `wrap_nonce || wrapped_dek`, pinning the value encryption to the exact wrapping that produced its DEK.
 
-**Impact**: If an attacker gains read access to the filesystem (container escape, backup exposure, disk theft, or insider threat), all threshold shares are immediately compromised. With `t` shares from any `t` nodes, the full private key can be reconstructed.
+KEK management is handled by the `KeyCustody` trait (`custody.rs`), with `LocalKeyCustody` as the v1 in-process implementation. KEKs are held in `Zeroizing<[u8; 32]>` wrappers, explicitly zeroed on drop. HKDF-SHA-256 derives per-purpose wrapping sub-keys. KEK rotation is supported without bulk re-encryption — old and new KEKs are retained, and `unwrap_dek` selects the correct KEK by the `kek_version` byte in each record.
 
-**Recommendation**: Encrypt shards at rest using a key derived from a hardware token (TPM/HSM), a cloud KMS, or a passphrase-based KDF. Consider an envelope encryption scheme where a master key is sealed by the platform and individual shards are encrypted with per-key DEKs.
+The Go `LocalKeyManager` (`node/local_keymanager.go`) still stores plaintext JSON in bbolt, but this path is **test/development-only** (`--no-kms` flag). Production deployments use the remote Rust KMS over gRPC, so this does not represent a production risk. See `KMS-INTEGRATION.md` for the production path.
 
 ---
 
 ### C2. Plaintext Node Identity Key
 
-**File**: `network/identity.go:17-42`
-**Status**: Unchanged from `SECURITY-ANALYSIS-OLD.md` §1.2
+**File**: `network/identity.go`, `network/keyfile.go`
+**Status**: ✅ Resolved (`feat/at-rest-encryption`)
 
-The secp256k1 private key that defines the node's identity (peer ID and Ethereum address) is written as **raw protobuf bytes** to `node.key` with `0600` permissions and no encryption.
-
-```go
-data, err = crypto.MarshalPrivateKey(priv)
-if err := os.WriteFile(path, data, 0600); err != nil { ... }
-```
+The secp256k1 private key that defines the node's identity (peer ID and Ethereum address) was previously written as **raw protobuf bytes** to `node.key` with `0600` permissions and no encryption.
 
 **Impact**: This key is the node's on-chain identity. Compromise allows full impersonation — participation in signing sessions, acceptance of group invitations, and on-chain action as the node.
 
-**Recommendation**: Encrypt the identity key with a passphrase (prompted at startup) or integrate with a platform keyring (macOS Keychain, Linux libsecret, Windows DPAPI).
+**Resolution**: When the `SIGNET_NODE_KEY_PASSPHRASE` environment variable is set, a newly generated `node.key` is sealed at rest with XChaCha20-Poly1305 under a key derived from the passphrase via scrypt (`network/keyfile.go`). This mirrors the KMS at-rest envelope (a passphrase replaces the raw KEK because the identity key is unwrapped once at startup, not per-record). The envelope is self-describing via a magic prefix, so legacy plaintext keys still load — existing nodes keep working, and operators opt into encryption by setting the env var on a fresh node. When the variable is unset, the legacy plaintext format is used (encryption disabled), matching the KMS `SIGNET_KMS_KEY` opt-in behavior. `devnet-init` honors the same variable so initialized keys match what the node expects to load.
 
 ---
 
 ### C3. ZK Auth Path Missing Client ID / Audience Validation
 
-**File**: `node/auth.go:643-710` (`ValidateAuthProof`)
+**File**: `node/auth.go` (`ValidateAuthProof`)
+**Status**: ✅ Resolved (`feat/at-rest-encryption`)
 
-The ZK proof verification path validates expiry, issuer trust, `sub` presence, JWKS modulus match, and ZK proof validity via `bb verify`. **However, it does NOT validate `Aud` (audience) or `Azp` (authorized party) against expected values.**
+The ZK proof verification path validated expiry, issuer trust, `sub` presence, JWKS modulus match, and ZK proof validity via `bb verify`, but did **not** validate `Aud` (audience) or `Azp` (authorized party) against expected values.
 
-This means a valid JWT from the right issuer but for a **different application** (wrong `aud`/`azp`) will authenticate successfully against Signet.
+This meant a valid JWT from the right issuer but for a **different application** (wrong `aud`/`azp`) would authenticate successfully against Signet.
 
-**Impact**: Cross-application token replay. A JWT obtained for app A can be used against Signet group B if both trust the same OAuth issuer.
+**Impact**: Cross-application token replay. A JWT obtained for app A could be used against Signet group B if both trust the same OAuth issuer.
 
-**Recommendation**: Add `Aud` and `Azp` validation in `ValidateAuthProof`, matching the logic already present in `ValidateJWTForSession` (lines 614-621). If `ClientIds` are configured for the issuer, require that `azp` or `aud` matches and reject if absent.
+**Resolution**: `ValidateAuthProof` now enforces the group's `ClientIds` allowlist on the ZK path, mirroring `ValidateJWTForSession`. The client identity is resolved with `azp → aud` precedence; if the issuer has `ClientIds` configured and the identity is absent or not in the allowlist, the proof is rejected. This is sound because `proof.Aud`/`proof.Azp` are ZK public inputs (`expected_aud`/`expected_azp`): a successful `bb verify` cryptographically binds them to the real JWT, so a prover cannot claim an allowlisted client while holding a token for a different one. The check runs before `bb verify` for fail-fast rejection; the binding is what makes it sound. Covered by `TestValidateAuthProofClientIDAllowlist` in `node/auth_test.go`.
 
 ---
 
 ### C4. Delegation Token Session Bypasses Key Disable Check
 
-**File**: `node/handlers.go:216-288` (`handleAuth` delegation path)
+**File**: `node/handlers.go` (`handleAuth` delegation path)
+**Status**: ✅ Resolved (`feat/at-rest-encryption`)
 
-When a delegation token is presented, the code checks if the delegated sub-key exists across all curves:
+When a delegation token was presented, the `handleAuth` delegation path checked only that the delegated sub-key *existed* (across all curves), not that it was active. A disabled sub-key could therefore still establish a delegation session.
 
-```go
-for _, curve := range []Curve{CurveSecp256k1, CurveEcdsaSecp256k1, CurveEd25519} {
-    if info, _ := n.km.GetKeyInfo(req.GroupID, internalSubKey, curve); info != nil {
-        keyExists = true
-        break
-    }
-}
-```
+**Impact**: A user who disables a compromised sub-key could still establish a delegation session for it. Note the participant-side delegate-sign handler (`coord.go`) already rejects disabled sub-keys at signing time, so actual signing was blocked there — but the originating node still accepted the session and forwarded it, contradicting the disable lifecycle.
 
-However, it **does not check `info.Status == "disabled"`**. A disabled key can still establish a delegation session and be used for signing.
-
-**Impact**: The key disable/enable lifecycle is completely bypassed for delegation tokens. A user who disables a compromised sub-key will find it still usable via delegation.
-
-**Recommendation**: Add `info.Status == "disabled"` check and reject with `http.StatusForbidden` if the sub-key is disabled.
+**Resolution**: The `handleAuth` delegation path now reads `info.Status` and rejects a disabled sub-key with `http.StatusForbidden` ("delegated sub-key is disabled") before creating or forwarding the session. This fails fast at the originating node and aligns the auth path with the existing participant-side enforcement (defense-in-depth).
 
 ---
 
 ### C5. Admin Endpoints Unprotected for Groups Without Auth Keys
 
-**Files**:
-- `node/handlers.go:34-100` (`handleListKeys`)
-- `node/handlers.go:836-917` (`handleStartReshare`)
-- `node/handlers.go:919-975` (`handleReshareStatus`)
+**Files**: `node/handlers.go` — `handleListKeys`, `handleStartReshare`, `handleReshareStatus`
+**Status**: ✅ Resolved (`feat/at-rest-encryption`)
 
-These endpoints only validate `AdminAuth` if `n.auth.HasAuthKeys(groupID)` returns true:
+These endpoints only validated `AdminAuth` if `n.auth.HasAuthKeys(groupID)` returned true:
 
 ```go
 if n.auth.HasAuthKeys(req.GroupID) {
@@ -125,11 +103,13 @@ if n.auth.HasAuthKeys(req.GroupID) {
 }
 ```
 
-For groups that have **only OAuth issuers** (no auth keys configured), these admin endpoints require **no authentication at all**.
+For groups that had **only OAuth issuers** (no auth keys configured), these admin endpoints required **no authentication at all**.
 
-**Impact**: Anyone with network access can list all keys for a group, trigger reshares, and query reshare status for OAuth-only groups. This leaks key metadata and could be used to disrupt operations.
+**Impact**: Anyone with network access could list all keys for a group, trigger reshares, and query reshare status for OAuth-only groups. This leaks key metadata and could be used to disrupt operations.
 
-**Recommendation**: Require admin auth for all groups that have any auth policy. OAuth sessions should not grant admin privileges by default. Alternatively, introduce an operator key mechanism (as noted in `PRODUCTION-GAPS.md`) and require it for all admin endpoints.
+**Resolution**: The `if HasAuthKeys` gate was removed from all three handlers — `ValidateAdminAuth` is now always required (fail closed). A group with no trusted authorization keys has no admin principal, so admin requests are rejected with `401`. OAuth sessions do not grant admin privileges. Covered by `TestAdminEndpointsFailClosed` (all three endpoints reject unauthenticated requests), `TestReshareStatusAllowsValidAdminKey` (valid trusted-key path still works), and `TestReshareStatusRejectsUntrustedAdminKey` in `node/handlers_admin_test.go`.
+
+**Operational note**: OAuth-only groups must register an on-chain authorization key to use admin endpoints (list keys / reshare). A node-level operator-key mechanism (per `PRODUCTION-GAPS.md`) was considered but deferred; fail-closed was chosen as the minimal, unambiguous fix for the alpha.
 
 ---
 
@@ -139,114 +119,81 @@ These issues could lead to unauthorized access, DoS, or operational disruption.
 
 ### H1. Coord Message Parameters Trusted from Initiator
 
-**File**: `node/coord.go:338-512`
+**File**: `node/coord.go` (`msgKeygen` / `msgSign` handlers, `groupState` / `checkKeygenParams` / `checkSignerSet`)
+**Status**: ✅ Resolved (`feat/at-rest-encryption`)
 
-Participants in a signing session trust initiator-supplied `Parties`, `Threshold`, `Signers`, and `MessageHash` from the coord message. While scope enforcement and session signature binding mitigate some manipulation, a compromised or malicious initiator could:
+Participants in a keygen/signing session trusted initiator-supplied `Parties`, `Threshold`, and `Signers` from the coord message. The `MessageHash` was already protected — scoped keys recompute the hash from the forwarded payload and the session signature binds it, and unscoped keys are forbidden from carrying a payload (`coord.go`). But the party/signer set and threshold were not checked against on-chain state, so a malicious initiator could supply an off-chain party set, include a non-member signer, or set a lower threshold.
 
-- Supply a manipulated `Parties` list (e.g., including a colluding node not in the on-chain group)
-- Set a lower `Threshold` than the group contract specifies
-- Forward a `MessageHash` that differs from what the API caller intended (mitigated by session sig binding for scoped keys, but not for raw `message_hash` signing)
+**Resolution**: Participants now validate parameters against their own on-chain-derived state (`n.groups`) before acting:
+- **keygen** (`checkKeygenParams`): `msg.Threshold` must equal the group threshold exactly, the party set must be non-empty, and every party must be an active member (subset allowed). Rejected with `coordNACK`.
+- **sign** (`checkSignerSet`): every signer must be an active member, and the count of *distinct* signers must be ≥ the group threshold (duplicates can't inflate the count). Rejected (session aborts).
 
-**Impact**: Protocol parameter manipulation by a malicious initiator. Could reduce effective threshold or include unauthorized signers.
-
-**Recommendation**: Participants should independently verify `Parties`, `Threshold`, and group membership from their own local `n.groups` state (populated from on-chain events) rather than trusting the initiator's message. Reject coord messages where parameters don't match local on-chain state.
+The reshare coord paths (`msgReshare*`) are intentionally left unchanged — reshare legitimately changes committee/threshold and is gated by the deterministic leader election and on-chain-driven job creation. Pure helpers are covered by `TestCheckKeygenParams`, `TestCheckSignerSet`, and `TestGroupState` in `node/coord_params_test.go`; the full keygen/sign/reshare integration suite still passes.
 
 ---
 
 ### H2. No HTTP Request Body Size Limit
 
-**File**: `node/handlers.go` (all POST handlers)
+**File**: `node/node.go` (`limitRequestBody` middleware)
+**Status**: ✅ Resolved (`feat/at-rest-encryption`)
 
-All HTTP handlers use `json.NewDecoder(r.Body)` without `http.MaxBytesReader`:
+All HTTP handlers used `json.NewDecoder(r.Body)` without `http.MaxBytesReader`, allowing DoS via arbitrarily large POST bodies — especially on `/v1/auth`, which is unauthenticated and triggers expensive ZK verification.
 
-```go
-if err := json.NewDecoder(r.Body).Decode(&req); err != nil { ... }
-```
-
-**Impact**: DoS via arbitrarily large POST bodies. An attacker can exhaust memory and CPU during JSON parsing, especially on `/v1/auth` which is unauthenticated and triggers expensive ZK verification.
-
-**Recommendation**: Wrap `r.Body` with `http.MaxBytesReader(w, r.Body, maxSize)` before decoding. Suggested limits:
-- `/v1/auth`: 256KB
-- `/v1/keygen`, `/v1/sign`: 64KB
-- Admin endpoints: 32KB
+**Resolution**: A `limitRequestBody` middleware wraps the mux and applies `http.MaxBytesReader` per path before any handler reads the body: 256 KiB for `/v1/auth` (ZK proofs are sizeable), 32 KiB for `/admin/*`, and a 64 KiB default for everything else (keygen/sign/delegate/keys). Over-limit bodies surface as a decode error (400). GET endpoints carry no body, so the cap is a no-op. Covered by `TestLimitRequestBody` in `node/httplimit_test.go`.
 
 ---
 
 ### H3. SignetGroup Removal Doesn't Check Quorum
 
-**File**: `contracts/contracts/SignetGroup.sol:178`
+**File**: `contracts/contracts/SignetGroup.sol` (`executeRemoval`)
+**Status**: ✅ Resolved (`feat/at-rest-encryption`)
 
-`executeRemoval` removes a node without checking if the remaining active set drops below `threshold`:
+`executeRemoval` removed a node without checking whether the remaining active set would drop below `threshold`. Since `threshold` is immutable after initialization, a quorum-breaking removal permanently bricks the group — all keys unrecoverable.
 
-```solidity
-function executeRemoval(address node) external {
-    RemovalRequest memory req = _removalRequests[node];
-    require(req.executeAfter != 0, "no queued removal");
-    require(block.timestamp >= req.executeAfter, "delay not elapsed");
-    delete _removalRequests[node];
-    _removeFromActive(node);
-    emit NodeRemoved(node);
-}
-```
-
-**Impact**: A group can be rendered permanently inoperable if enough nodes are removed. Since `threshold` is immutable after initialization (`SECURITY-ANALYSIS-OLD.md` §5), there is no recovery path — all keys in the group are lost.
-
-**Recommendation**: Add `require(_activeNodes.length - 1 >= threshold, "removal would break quorum")` before `_removeFromActive`.
+**Resolution**: Added `require(_activeNodes.length > threshold, "removal would break quorum")` before `_removeFromActive`. The node being removed is still counted in `_activeNodes` at this point, so the post-removal size is `length - 1`; `length > threshold` is the equivalent integer form and avoids unsigned underflow. `testIsOperational` was updated to the new invariant, and `testExecuteRemoval_RevertsIfBreaksQuorum` was added. All 74 Foundry tests pass.
 
 ---
 
 ### H4. Error Messages Leak Internal State
 
-**File**: `node/handlers.go:1115-1119` (`httpError`)
+**File**: `node/handlers.go` (`(*Node).httpError`, `genericErrorMessage`, `writeJSONError`)
+**Status**: ✅ Resolved (`feat/at-rest-encryption`)
 
-Error messages are returned raw to the client:
+Error messages were returned raw to the client (`"key not found: group=... key=..."`, `"list keys: ..."`, etc.), enabling enumeration of valid group/key IDs and disclosure of internal error conditions.
 
-```go
-func httpError(w http.ResponseWriter, code int, msg string) {
-    json.NewEncoder(w).Encode(map[string]string{"error": msg})
-}
-```
-
-Examples observed: `"load config: ..."`, `"key not found: group=... key=..."`, `"list keys: ..."`.
-
-**Impact**: Information leakage aids reconnaissance for targeted attacks. An attacker can enumerate valid group IDs, key IDs, and internal error conditions.
-
-**Recommendation**: Return generic error messages to clients (e.g., `"internal error"`, `"invalid request"`) and log detailed errors server-side with zap.
+**Resolution**: `httpError` is now a method on `*Node`. For `401`/`403`/`404`/`500` it logs the full detail server-side (`n.log.Warn` with code + detail) and returns a generic client message (`unauthorized` / `forbidden` / `not found` / `internal error`). Other codes — `400` validation, `409` conflict, and `503` transient retry signals (e.g. "key reshare pending") — carry useful, non-sensitive detail and are returned as-is. All 90 call sites were converted to `n.httpError`; the two free helper functions (`normalizeGroupID`, `parseCurve`, which emit only descriptive 400s) use a raw `writeJSONError`. Covered by `TestHTTPErrorSanitization` and `TestGenericErrorMessage` in `node/httperror_test.go`; full handler suite still passes.
 
 ---
 
 ### H5. Reshare Leader Failover Missing
 
-**File**: `node/reshare.go:48`
+**File**: `node/reshare.go`, `node/handlers.go` (`handleStartReshare`), `node/node.go`
+**Status**: ⚠️ Partially mitigated (`feat/at-rest-encryption`); automatic failover deferred
 
-If the elected reshare leader (lexicographically smallest member) is down, reshare hangs indefinitely. There is no timeout-based failover.
+If the elected reshare leader (lexicographically smallest member) is down, a chain-event-driven reshare does not start automatically.
 
-```go
-// TODO: If the elected leader is down or unresponsive, the reshare will
-// not proceed automatically...
-```
+**Impact**: A single offline node can block proactive reshares for a group. In a 5-node network with one external operator, this is a likely failure mode.
 
-**Impact**: A single offline node can block all reshares for a group indefinitely. In a 5-node network with one external operator, this is a likely failure mode.
+**Mitigation (implemented)**: `POST /admin/reshare` is now routed (it was previously an unrouted handler) as a **manual** failover. Under group-scoped admin auth (see C5), it takes over an existing stalled reshare job from any live node — or creates a same-committee refresh if none exists — rather than waiting on the dead leader. Combined with the existing on-demand self-heal (a sign request on a stale key lets any member coordinate that key), operators have a recourse. The per-node `reshareCoord` guard prevents a duplicate coordinator on the same node.
 
-**Recommendation**: Implement timeout-based failover where the next node in sort order takes over if the leader hasn't started coordination within N seconds (e.g., 60s).
+**Residual risk / deferred work**: Nothing prevents two coordinators running concurrently across *different* nodes (e.g. the leader recovers while an operator has taken over elsewhere). Per-key generation tracking + rollback (reshare invariants I1/I7) prevent share corruption, but concurrent coordinators cause churn — so operators must only invoke manual takeover when the leader is confirmed down. Automatic, split-brain-safe failover (staggered-timeout takeover + single-coordinator enforcement at participants) is the proper fix and is specified under "Leader Failover (H5)" in `docs/DESIGN-RESHARE-HARDENING.md`. Covered partially by `TestStartReshareRequiresKeys` and the admin-auth/fail-closed tests; full failover behavior needs multi-node failure-injection tests (future).
 
 ---
 
 ### H6. Delegation Token Parent Key Slicing Panic
 
-**File**: `node/delegate.go:120`
+**File**: `node/delegate.go` (`parentKeyFromResolved`)
+**Status**: ✅ Resolved (`feat/at-rest-encryption`)
 
-String slicing assumes `req.KeySuffix` is shorter than `resolved`:
+String slicing assumed `req.KeySuffix` was shorter than `resolved`:
 
 ```go
 parentKeyID = resolved[:len(resolved)-len(req.KeySuffix)-1]
 ```
 
-If `len(req.KeySuffix) >= len(resolved)`, this **panics** with an out-of-bounds slice.
+For a delegation-token session, `validateSessionRequest` returns a `resolved` key_id that is **not** derived from `req.KeySuffix`, so a crafted long suffix made the index negative → **panic (node DoS)**.
 
-**Impact**: Node panic via crafted request. While `req.KeySuffix` is validated as non-empty earlier, there is no length bound check.
-
-**Recommendation**: Add bounds check before slicing, or use `strings.LastIndex(resolved, ":"+req.KeySuffix)` to find the parent key safely.
+**Resolution**: Extracted `parentKeyFromResolved`, which anchors the `":<suffix>"` match at the end of `resolved` (`strings.HasSuffix`) and returns `ok=false` for an empty/absent/oversized suffix; the handler then rejects with `400` instead of slicing by length. This also cleanly blocks delegation-of-delegation. Covered by `TestParentKeyFromResolved` in `node/delegate_test.go`.
 
 ---
 
@@ -418,17 +365,17 @@ The scope lists `ecdsa_session.rs` for *signing* but omits the **key generation 
 
 | Priority | Issue | Effort | File(s) |
 |---|---|---|---|
-| **P0** | Encrypt key shards at rest | Medium | `node/keystore.go` |
-| **P0** | Encrypt node identity key | Medium | `network/identity.go` |
+| **P0** | ✅ Encrypt key shards at rest | Medium | `kms-tss/src/encrypted_store.rs`, `kms-tss/src/custody.rs` |
+| **P0** | ✅ Encrypt node identity key | Medium | `network/identity.go`, `network/keyfile.go` |
 | **P0** | Add `Aud`/`Azp` validation to ZK auth path | Low | `node/auth.go` |
 | **P0** | Fix delegation token to check key disabled status | Low | `node/handlers.go` |
-| **P0** | Require admin auth for all groups | Low | `node/handlers.go` |
-| **P1** | Validate coord message params against local on-chain state | Medium | `node/coord.go` |
-| **P1** | Add HTTP request body size limits | Low | `node/handlers.go` |
-| **P1** | Add quorum check to `executeRemoval` | Low | `contracts/SignetGroup.sol` |
-| **P1** | Sanitize error messages returned to clients | Low | `node/handlers.go` |
-| **P1** | Fix delegation parent key slicing panic | Low | `node/delegate.go` |
-| **P1** | Implement reshare leader failover | Medium | `node/reshare.go` |
+| **P0** | ✅ Require admin auth for all groups | Low | `node/handlers.go` |
+| **P1** | ✅ Validate coord message params against local on-chain state | Medium | `node/coord.go` |
+| **P1** | ✅ Add HTTP request body size limits | Low | `node/node.go` |
+| **P1** | ✅ Add quorum check to `executeRemoval` | Low | `contracts/SignetGroup.sol` |
+| **P1** | ✅ Sanitize error messages returned to clients | Low | `node/handlers.go` |
+| **P1** | ✅ Fix delegation parent key slicing panic | Low | `node/delegate.go` |
+| **P1** | ⚠️ Reshare leader failover (manual mitigation; auto deferred) | Medium | `node/handlers.go`, `node/reshare.go` |
 | **P2** | Deploy behind TLS-terminating proxy | Low | `node/node.go` (or infra) |
 | **P2** | Add rate limiting | Medium | `node/node.go` (or infra) |
 | **P2** | Add DKG/keygen Rust module to audit scope | Low | `kms-tss/src/` |
@@ -439,6 +386,6 @@ The scope lists `ecdsa_session.rs` for *signing* but omits the **key generation 
 
 The Signet protocol has **strong architectural security**: ZK auth eliminates the critical JWT-forwarding vulnerability, session binding prevents replay, and scope enforcement prevents cross-domain signing. The contract layer uses standard patterns correctly.
 
-The remaining risks are primarily **operational and implementation-level**: plaintext storage, missing auth checks on edge cases, DoS vectors, and contract quorum protection. These are all addressable before a production deployment and should be prioritized for the public alpha.
+The remaining risks are primarily **operational and implementation-level**: missing auth checks on edge cases, DoS vectors, and contract quorum protection. These are all addressable before a production deployment and should be prioritized for the public alpha. **At-rest encryption** (key shards via Rust KMS envelope encryption, node identity key via passphrase-protected XChaCha20-Poly1305) has been implemented and verified.
 
 The total additional scope recommended above adds approximately **1-2 days of auditor/reviewer time** and closes the gap between "signing protocol is correct" and "alpha deployment is safe."

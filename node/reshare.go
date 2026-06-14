@@ -45,12 +45,15 @@ func (n *Node) isReshareLeader(groupID string) bool {
 	return leader == tss.PartyID(n.host.Self())
 }
 
-// TODO: If the elected leader is down or unresponsive, the reshare will
-// not proceed automatically. Currently this requires manual intervention
-// (e.g. admin API /admin/reshare) or the on-demand reshare path which is
-// triggered when a sign request hits a stale key. A future enhancement
-// could add a timeout-based fallback where the next node in sort order
-// takes over if the leader hasn't started coordination within N seconds.
+// Leader failover (H5): if the elected leader is down, a chain-event-driven
+// reshare does not start automatically. Two manual recourses exist today:
+//   - the on-demand path (a sign request on a stale key lets any member
+//     coordinate that key — see coord.go msgReshare), and
+//   - POST /admin/reshare, which takes over an existing stalled job (or starts
+//     a refresh) from any live node under admin auth (see handleStartReshare).
+// Automatic, split-brain-safe failover (staggered-timeout takeover + single-
+// coordinator enforcement) is deferred; see the "Leader Failover (H5)" section
+// of docs/DESIGN-RESHARE-HARDENING.md.
 
 // reshareState holds all reshare-related fields on the Node struct.
 // These are embedded directly into Node in initReshareState.

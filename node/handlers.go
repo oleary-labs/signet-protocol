@@ -45,7 +45,7 @@ func (n *Node) handleListKeys(w http.ResponseWriter, r *http.Request) {
 
 	var req AdminAuth
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		httpError(w, http.StatusBadRequest, "decode body: "+err.Error())
+		n.httpError(w, http.StatusBadRequest, "decode body: "+err.Error())
 		return
 	}
 	groupID, ok := normalizeGroupID(w, req.GroupID)
@@ -54,16 +54,17 @@ func (n *Node) handleListKeys(w http.ResponseWriter, r *http.Request) {
 	}
 	req.GroupID = groupID
 
-	if n.auth.HasAuthKeys(req.GroupID) {
-		if err := n.auth.ValidateAdminAuth(req.GroupID, &req); err != nil {
-			httpError(w, http.StatusUnauthorized, "admin auth failed: "+err.Error())
-			return
-		}
+	// Admin auth is always required. Groups without trusted authorization keys
+	// have no admin principal, so this fails closed (a key list / metadata leak
+	// otherwise). OAuth sessions do not grant admin privileges.
+	if err := n.auth.ValidateAdminAuth(req.GroupID, &req); err != nil {
+		n.httpError(w, http.StatusUnauthorized, "admin auth failed: "+err.Error())
+		return
 	}
 
 	keyIDs, err := n.km.ListKeys(req.GroupID)
 	if err != nil {
-		httpError(w, http.StatusInternalServerError, "list keys: "+err.Error())
+		n.httpError(w, http.StatusInternalServerError, "list keys: "+err.Error())
 		return
 	}
 
@@ -132,11 +133,11 @@ func (n *Node) handleAuth(w http.ResponseWriter, r *http.Request) {
 		DelegationToken string `json:"delegation_token,omitempty"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		httpError(w, http.StatusBadRequest, "decode body: "+err.Error())
+		n.httpError(w, http.StatusBadRequest, "decode body: "+err.Error())
 		return
 	}
 	if req.SessionPub == "" {
-		httpError(w, http.StatusBadRequest, "session_pub is required")
+		n.httpError(w, http.StatusBadRequest, "session_pub is required")
 		return
 	}
 	groupID, ok := normalizeGroupID(w, req.GroupID)
@@ -147,7 +148,7 @@ func (n *Node) handleAuth(w http.ResponseWriter, r *http.Request) {
 
 	sessionPubBytes, err := hex.DecodeString(strings.TrimPrefix(req.SessionPub, "0x"))
 	if err != nil || len(sessionPubBytes) != 33 {
-		httpError(w, http.StatusBadRequest, "session_pub must be 33 hex-encoded bytes")
+		n.httpError(w, http.StatusBadRequest, "session_pub must be 33 hex-encoded bytes")
 		return
 	}
 
@@ -159,7 +160,7 @@ func (n *Node) handleAuth(w http.ResponseWriter, r *http.Request) {
 
 		identity, err := n.auth.ValidateAuthCertificate(req.GroupID, cert)
 		if err != nil {
-			httpError(w, http.StatusUnauthorized, "certificate verification failed: "+err.Error())
+			n.httpError(w, http.StatusUnauthorized, "certificate verification failed: "+err.Error())
 			return
 		}
 
@@ -216,23 +217,35 @@ func (n *Node) handleAuth(w http.ResponseWriter, r *http.Request) {
 	if req.DelegationToken != "" {
 		claims, err := n.VerifyDelegationToken(req.GroupID, req.DelegationToken)
 		if err != nil {
-			httpError(w, http.StatusUnauthorized, "delegation token verification failed: "+err.Error())
+			n.httpError(w, http.StatusUnauthorized, "delegation token verification failed: "+err.Error())
 			return
 		}
 
 		// JWT claims use unprefixed key IDs. Add "oauth:" for internal lookups.
 		internalSubKey := "oauth:" + claims.Sub
 
-		// Verify the sub-key exists.
+		// Verify the sub-key exists and is not disabled. Without the disabled
+		// check, a user who disables a compromised sub-key could still establish
+		// a delegation session and sign with it. Participants enforce the same
+		// check (see coord.go), but reject here too so the originating node fails
+		// fast instead of forwarding a doomed session.
 		keyExists := false
+		keyDisabled := false
 		for _, curve := range []Curve{CurveSecp256k1, CurveEcdsaSecp256k1, CurveEd25519} {
 			if info, _ := n.km.GetKeyInfo(req.GroupID, internalSubKey, curve); info != nil {
 				keyExists = true
+				if info.Status == "disabled" {
+					keyDisabled = true
+				}
 				break
 			}
 		}
 		if !keyExists {
-			httpError(w, http.StatusNotFound, "delegated sub-key no longer exists: "+claims.Sub)
+			n.httpError(w, http.StatusNotFound, "delegated sub-key no longer exists: "+claims.Sub)
+			return
+		}
+		if keyDisabled {
+			n.httpError(w, http.StatusForbidden, "delegated sub-key is disabled: "+claims.Sub)
 			return
 		}
 
@@ -290,26 +303,26 @@ func (n *Node) handleAuth(w http.ResponseWriter, r *http.Request) {
 
 	// OAuth/ZK proof path.
 	if req.Proof == "" {
-		httpError(w, http.StatusBadRequest, "proof or certificate is required")
+		n.httpError(w, http.StatusBadRequest, "proof or certificate is required")
 		return
 	}
 	if req.Sub == "" || req.Iss == "" || req.Exp == 0 {
-		httpError(w, http.StatusBadRequest, "sub, iss, and exp are required with ZK proof")
+		n.httpError(w, http.StatusBadRequest, "sub, iss, and exp are required with ZK proof")
 		return
 	}
 	if req.JWKSModulus == "" {
-		httpError(w, http.StatusBadRequest, "jwks_modulus is required with ZK proof")
+		n.httpError(w, http.StatusBadRequest, "jwks_modulus is required with ZK proof")
 		return
 	}
 
 	proofBytes, err := hex.DecodeString(strings.TrimPrefix(req.Proof, "0x"))
 	if err != nil || len(proofBytes) == 0 {
-		httpError(w, http.StatusBadRequest, "invalid proof hex")
+		n.httpError(w, http.StatusBadRequest, "invalid proof hex")
 		return
 	}
 	modulusBytes, err := hex.DecodeString(strings.TrimPrefix(req.JWKSModulus, "0x"))
 	if err != nil || len(modulusBytes) == 0 {
-		httpError(w, http.StatusBadRequest, "invalid jwks_modulus hex")
+		n.httpError(w, http.StatusBadRequest, "invalid jwks_modulus hex")
 		return
 	}
 
@@ -326,7 +339,7 @@ func (n *Node) handleAuth(w http.ResponseWriter, r *http.Request) {
 
 	sub, err := n.auth.ValidateAuthProof(r.Context(), req.GroupID, ap)
 	if err != nil {
-		httpError(w, http.StatusUnauthorized, "proof verification failed: "+err.Error())
+		n.httpError(w, http.StatusUnauthorized, "proof verification failed: "+err.Error())
 		return
 	}
 
@@ -399,7 +412,7 @@ func (n *Node) handleKeygen(w http.ResponseWriter, r *http.Request) {
 		Timestamp  uint64 `json:"timestamp"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		httpError(w, http.StatusBadRequest, "decode body: "+err.Error())
+		n.httpError(w, http.StatusBadRequest, "decode body: "+err.Error())
 		return
 	}
 	curve, ok := parseCurve(w, req.Curve)
@@ -413,18 +426,18 @@ func (n *Node) handleKeygen(w http.ResponseWriter, r *http.Request) {
 		var err error
 		scopeBytes, err = hex.DecodeString(strings.TrimPrefix(req.Scope, "0x"))
 		if err != nil {
-			httpError(w, http.StatusBadRequest, "invalid scope hex: "+err.Error())
+			n.httpError(w, http.StatusBadRequest, "invalid scope hex: "+err.Error())
 			return
 		}
 		if len(scopeBytes) < 1 {
-			httpError(w, http.StatusBadRequest, "scope must be at least 1 byte (scheme prefix)")
+			n.httpError(w, http.StatusBadRequest, "scope must be at least 1 byte (scheme prefix)")
 			return
 		}
 		// Derive key_suffix from scope hash — same scope = same key.
 		scopeHash := sha256.Sum256(scopeBytes)
 		derivedSuffix := hex.EncodeToString(scopeHash[:8])
 		if req.KeySuffix != "" && req.KeySuffix != derivedSuffix {
-			httpError(w, http.StatusBadRequest, "key_suffix conflicts with scope-derived suffix")
+			n.httpError(w, http.StatusBadRequest, "key_suffix conflicts with scope-derived suffix")
 			return
 		}
 		req.KeySuffix = derivedSuffix
@@ -477,7 +490,7 @@ func (n *Node) handleKeygen(w http.ResponseWriter, r *http.Request) {
 
 	sn, err := network.NewSessionNetwork(r.Context(), n.host, sessID, sortedParties)
 	if err != nil {
-		httpError(w, http.StatusInternalServerError, "session network: "+err.Error())
+		n.httpError(w, http.StatusInternalServerError, "session network: "+err.Error())
 		return
 	}
 	defer sn.Close()
@@ -492,7 +505,7 @@ func (n *Node) handleKeygen(w http.ResponseWriter, r *http.Request) {
 		Scope:     scopeBytes,
 		Session:   authProof,
 	}); err != nil {
-		httpError(w, http.StatusInternalServerError, "coordinate: "+err.Error())
+		n.httpError(w, http.StatusInternalServerError, "coordinate: "+err.Error())
 		return
 	}
 
@@ -512,7 +525,7 @@ func (n *Node) handleKeygen(w http.ResponseWriter, r *http.Request) {
 			zap.String("group_id", req.GroupID),
 			zap.String("key_id", keyID),
 			zap.Error(err))
-		httpError(w, http.StatusInternalServerError, "keygen: "+err.Error())
+		n.httpError(w, http.StatusInternalServerError, "keygen: "+err.Error())
 		return
 	}
 
@@ -530,7 +543,7 @@ func (n *Node) handleKeygen(w http.ResponseWriter, r *http.Request) {
 	if curve.IsSecp256k1() {
 		ethAddr, err := network.EthereumAddressFromGroupKey(info.GroupKey)
 		if err != nil {
-			httpError(w, http.StatusInternalServerError, "eth addr: "+err.Error())
+			n.httpError(w, http.StatusInternalServerError, "eth addr: "+err.Error())
 			return
 		}
 		resp["ethereum_address"] = "0x" + hex.EncodeToString(ethAddr[:])
@@ -576,7 +589,7 @@ func (n *Node) handleSign(w http.ResponseWriter, r *http.Request) {
 		Timestamp   uint64       `json:"timestamp"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		httpError(w, http.StatusBadRequest, "decode body: "+err.Error())
+		n.httpError(w, http.StatusBadRequest, "decode body: "+err.Error())
 		return
 	}
 	signCurve, ok := parseCurve(w, req.Curve)
@@ -590,11 +603,11 @@ func (n *Node) handleSign(w http.ResponseWriter, r *http.Request) {
 	}
 	req.GroupID = groupID
 	if req.MessageHash == "" && req.Payload == nil {
-		httpError(w, http.StatusBadRequest, "message_hash or payload is required")
+		n.httpError(w, http.StatusBadRequest, "message_hash or payload is required")
 		return
 	}
 	if req.MessageHash != "" && req.Payload != nil {
-		httpError(w, http.StatusBadRequest, "message_hash and payload are mutually exclusive")
+		n.httpError(w, http.StatusBadRequest, "message_hash and payload are mutually exclusive")
 		return
 	}
 
@@ -603,11 +616,11 @@ func (n *Node) handleSign(w http.ResponseWriter, r *http.Request) {
 		var err error
 		msgHash, err = hex.DecodeString(strings.TrimPrefix(req.MessageHash, "0x"))
 		if err != nil {
-			httpError(w, http.StatusBadRequest, "invalid message_hash: "+err.Error())
+			n.httpError(w, http.StatusBadRequest, "invalid message_hash: "+err.Error())
 			return
 		}
 		if len(msgHash) != 32 {
-			httpError(w, http.StatusBadRequest, "message_hash must be exactly 32 bytes (64 hex chars)")
+			n.httpError(w, http.StatusBadRequest, "message_hash must be exactly 32 bytes (64 hex chars)")
 			return
 		}
 	}
@@ -622,7 +635,7 @@ func (n *Node) handleSign(w http.ResponseWriter, r *http.Request) {
 		var err error
 		msgHash, err = HashSignPayload(req.Payload)
 		if err != nil {
-			httpError(w, http.StatusBadRequest, "invalid payload: "+err.Error())
+			n.httpError(w, http.StatusBadRequest, "invalid payload: "+err.Error())
 			return
 		}
 	}
@@ -648,22 +661,22 @@ func (n *Node) handleSign(w http.ResponseWriter, r *http.Request) {
 			zap.String("group_id", req.GroupID),
 			zap.String("key_id", keyID))
 		if err := n.waitForReshare(r.Context(), req.GroupID, keyID); err != nil {
-			httpError(w, http.StatusServiceUnavailable, "key reshare pending: "+err.Error())
+			n.httpError(w, http.StatusServiceUnavailable, "key reshare pending: "+err.Error())
 			return
 		}
 	}
 
 	keyInfo, err := n.km.GetKeyInfo(req.GroupID, keyID, signCurve)
 	if err != nil {
-		httpError(w, http.StatusInternalServerError, "load config: "+err.Error())
+		n.httpError(w, http.StatusInternalServerError, "load config: "+err.Error())
 		return
 	}
 	if keyInfo == nil {
-		httpError(w, http.StatusNotFound, fmt.Sprintf("key not found: group=%s key=%s", req.GroupID, keyID))
+		n.httpError(w, http.StatusNotFound, fmt.Sprintf("key not found: group=%s key=%s", req.GroupID, keyID))
 		return
 	}
 	if keyInfo.Status == "disabled" {
-		httpError(w, http.StatusForbidden, "key is disabled")
+		n.httpError(w, http.StatusForbidden, "key is disabled")
 		return
 	}
 
@@ -671,29 +684,29 @@ func (n *Node) handleSign(w http.ResponseWriter, r *http.Request) {
 	// If the key is unscoped, require message_hash.
 	if len(keyInfo.Scope) > 0 {
 		if req.Payload == nil {
-			httpError(w, http.StatusBadRequest, "this key has a scope; use payload instead of message_hash")
+			n.httpError(w, http.StatusBadRequest, "this key has a scope; use payload instead of message_hash")
 			return
 		}
 		hash, err := VerifyScopeAndHash(keyInfo.Scope, req.Payload)
 		if err != nil {
-			httpError(w, http.StatusBadRequest, "scope verification failed: "+err.Error())
+			n.httpError(w, http.StatusBadRequest, "scope verification failed: "+err.Error())
 			return
 		}
 		msgHash = hash
 	} else if req.Payload != nil {
-		httpError(w, http.StatusBadRequest, "this key is unscoped; use message_hash instead of payload")
+		n.httpError(w, http.StatusBadRequest, "this key is unscoped; use message_hash instead of payload")
 		return
 	}
 
 	sortedSigners := tss.NewPartyIDSlice(grp.Members)
 	if !sortedSigners.Contains(keyInfo.PartyID) {
-		httpError(w, http.StatusBadRequest, "this node is not a member of group "+req.GroupID)
+		n.httpError(w, http.StatusBadRequest, "this node is not a member of group "+req.GroupID)
 		return
 	}
 
 	nonce, err := randomNonce()
 	if err != nil {
-		httpError(w, http.StatusInternalServerError, "generate nonce: "+err.Error())
+		n.httpError(w, http.StatusInternalServerError, "generate nonce: "+err.Error())
 		return
 	}
 	sessID := signSessionID(req.GroupID, keyID, nonce)
@@ -706,7 +719,7 @@ func (n *Node) handleSign(w http.ResponseWriter, r *http.Request) {
 
 	sn, err := network.NewSessionNetwork(r.Context(), n.host, sessID, sortedSigners)
 	if err != nil {
-		httpError(w, http.StatusInternalServerError, "session network: "+err.Error())
+		n.httpError(w, http.StatusInternalServerError, "session network: "+err.Error())
 		return
 	}
 	defer sn.Close()
@@ -732,7 +745,7 @@ func (n *Node) handleSign(w http.ResponseWriter, r *http.Request) {
 		var err error
 		signPayloadBytes, err = json.Marshal(req.Payload)
 		if err != nil {
-			httpError(w, http.StatusInternalServerError, "serialize payload: "+err.Error())
+			n.httpError(w, http.StatusInternalServerError, "serialize payload: "+err.Error())
 			return
 		}
 	}
@@ -748,7 +761,7 @@ func (n *Node) handleSign(w http.ResponseWriter, r *http.Request) {
 		SignPayload: signPayloadBytes,
 		Session:     authProof,
 	}); err != nil {
-		httpError(w, http.StatusInternalServerError, "coordinate: "+err.Error())
+		n.httpError(w, http.StatusInternalServerError, "coordinate: "+err.Error())
 		return
 	}
 
@@ -767,7 +780,7 @@ func (n *Node) handleSign(w http.ResponseWriter, r *http.Request) {
 			zap.String("group_id", req.GroupID),
 			zap.String("key_id", keyID),
 			zap.Error(err))
-		httpError(w, http.StatusInternalServerError, "sign: "+err.Error())
+		n.httpError(w, http.StatusInternalServerError, "sign: "+err.Error())
 		return
 	}
 
@@ -803,7 +816,7 @@ func (n *Node) handleSign(w http.ResponseWriter, r *http.Request) {
 		copy(ecdsaSig, rawSig)
 		pubKey, err := crypto.DecompressPubkey(keyInfo.GroupKey)
 		if err != nil {
-			httpError(w, http.StatusInternalServerError, "decompress group key: "+err.Error())
+			n.httpError(w, http.StatusInternalServerError, "decompress group key: "+err.Error())
 			return
 		}
 		expectedPub := crypto.FromECDSAPub(pubKey)
@@ -820,7 +833,7 @@ func (n *Node) handleSign(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		if !vFound {
-			httpError(w, http.StatusInternalServerError, "ECDSA recovery failed: could not determine v byte")
+			n.httpError(w, http.StatusInternalServerError, "ECDSA recovery failed: could not determine v byte")
 			return
 		}
 		resp["ecdsa_signature"] = "0x" + hex.EncodeToString(ecdsaSig)
@@ -833,15 +846,30 @@ func (n *Node) handleSign(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(resp)
 }
 
-// handleStartReshare handles POST /admin/reshare. Creates a same-committee
-// reshare job (key refresh) and starts the coordinator. Requires admin auth.
+// handleStartReshare handles POST /admin/reshare. Requires (group-scoped) admin
+// auth. Two uses:
+//
+//   - Manual key refresh: when no reshare is pending, create a same-committee
+//     refresh job and coordinate it.
+//   - Leader failover (H5 mitigation): when a reshare job already exists locally
+//     — e.g. created from a chain membership event whose elected leader
+//     (lexicographically smallest member) is offline and never started
+//     coordinating — take over that existing job and drive it from this node.
+//
+// This is a manual mitigation, not automatic failover. The participant side
+// already accepts a non-leader coordinator (see the msgReshare on-demand path
+// in coord.go), but nothing prevents two coordinators running concurrently for
+// the same group across different nodes. Operators MUST only invoke this when
+// the elected leader is confirmed down. Automatic, split-brain-safe failover
+// (staggered-timeout takeover + single-coordinator enforcement) is tracked as
+// future work in docs/DESIGN-RESHARE-HARDENING.md.
 func (n *Node) handleStartReshare(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		AdminAuth
 		Concurrency int `json:"concurrency"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		httpError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
+		n.httpError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
 		return
 	}
 	groupID, ok := normalizeGroupID(w, req.GroupID)
@@ -850,24 +878,15 @@ func (n *Node) handleStartReshare(w http.ResponseWriter, r *http.Request) {
 	}
 	req.AdminAuth.GroupID = groupID
 
-	if n.auth.HasAuthKeys(groupID) {
-		if err := n.auth.ValidateAdminAuth(groupID, &req.AdminAuth); err != nil {
-			httpError(w, http.StatusUnauthorized, "admin auth failed: "+err.Error())
-			return
-		}
+	// Admin auth is always required (fail closed). Groups without trusted
+	// authorization keys have no admin principal and cannot trigger reshares.
+	if err := n.auth.ValidateAdminAuth(groupID, &req.AdminAuth); err != nil {
+		n.httpError(w, http.StatusUnauthorized, "admin auth failed: "+err.Error())
+		return
 	}
 	concurrency := req.Concurrency
 	if concurrency < 1 {
 		concurrency = 1
-	}
-
-	// Check if a job already exists.
-	n.reshareJobsMu.RLock()
-	existingJob := n.reshareJobs[groupID]
-	n.reshareJobsMu.RUnlock()
-	if existingJob != nil {
-		httpError(w, http.StatusConflict, "reshare already in progress for this group")
-		return
 	}
 
 	// Look up group membership.
@@ -875,30 +894,43 @@ func (n *Node) handleStartReshare(w http.ResponseWriter, r *http.Request) {
 	grp, ok := n.groups[groupID]
 	n.groupsMu.RUnlock()
 	if !ok {
-		httpError(w, http.StatusNotFound, "unknown group")
+		n.httpError(w, http.StatusNotFound, "unknown group")
 		return
 	}
 
-	// Check if there are any keys to reshare.
-	keyCount := 0
-	if keyIDs, err := n.km.ListKeys(groupID); err == nil {
-		keyCount = len(keyIDs)
-	}
-	if keyCount == 0 {
-		httpError(w, http.StatusBadRequest, "no keys to reshare for this group")
-		return
-	}
+	// If a reshare job already exists, take it over (failover) rather than
+	// creating a new one. Otherwise create a same-committee refresh job. The
+	// per-node reshareCoord guard in startCoordinator still rejects a duplicate
+	// coordinator on this node (mapped to 409 below).
+	n.reshareJobsMu.RLock()
+	existingJob := n.reshareJobs[groupID]
+	n.reshareJobsMu.RUnlock()
 
-	// Create a same-committee reshare job (key refresh).
-	members := make([]tss.PartyID, len(grp.Members))
-	copy(members, grp.Members)
-	if err := n.createReshareJob(groupID, "refresh", members, members, grp.Threshold); err != nil {
-		httpError(w, http.StatusInternalServerError, "create reshare job: "+err.Error())
-		return
+	action := "started"
+	if existingJob == nil {
+		// Manual refresh: require keys to reshare.
+		keyCount := 0
+		if keyIDs, err := n.km.ListKeys(groupID); err == nil {
+			keyCount = len(keyIDs)
+		}
+		if keyCount == 0 {
+			n.httpError(w, http.StatusBadRequest, "no keys to reshare for this group")
+			return
+		}
+		members := make([]tss.PartyID, len(grp.Members))
+		copy(members, grp.Members)
+		if err := n.createReshareJob(groupID, "refresh", members, members, grp.Threshold); err != nil {
+			n.httpError(w, http.StatusInternalServerError, "create reshare job: "+err.Error())
+			return
+		}
+	} else {
+		action = "resumed"
 	}
 
 	if err := n.startCoordinator(groupID, concurrency); err != nil {
-		httpError(w, http.StatusInternalServerError, err.Error())
+		// startCoordinator returns an error when this node is already
+		// coordinating this group's reshare.
+		n.httpError(w, http.StatusConflict, err.Error())
 		return
 	}
 
@@ -912,7 +944,7 @@ func (n *Node) handleStartReshare(w http.ResponseWriter, r *http.Request) {
 		"keys_total":  len(job.KeysTotal),
 		"keys_done":   done,
 		"concurrency": concurrency,
-		"status":      "started",
+		"status":      action,
 	})
 }
 
@@ -921,7 +953,7 @@ func (n *Node) handleStartReshare(w http.ResponseWriter, r *http.Request) {
 func (n *Node) handleReshareStatus(w http.ResponseWriter, r *http.Request) {
 	var req AdminAuth
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		httpError(w, http.StatusBadRequest, "decode body: "+err.Error())
+		n.httpError(w, http.StatusBadRequest, "decode body: "+err.Error())
 		return
 	}
 	groupID, ok := normalizeGroupID(w, req.GroupID)
@@ -929,11 +961,11 @@ func (n *Node) handleReshareStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if n.auth.HasAuthKeys(groupID) {
-		if err := n.auth.ValidateAdminAuth(groupID, &req); err != nil {
-			httpError(w, http.StatusUnauthorized, "admin auth failed: "+err.Error())
-			return
-		}
+	// Admin auth is always required (fail closed). Groups without trusted
+	// authorization keys have no admin principal.
+	if err := n.auth.ValidateAdminAuth(groupID, &req); err != nil {
+		n.httpError(w, http.StatusUnauthorized, "admin auth failed: "+err.Error())
+		return
 	}
 
 	n.reshareJobsMu.RLock()
@@ -1112,10 +1144,47 @@ func (n *Node) validateSessionRequest(
 	return sa, resolvedKeyID, nil
 }
 
-func httpError(w http.ResponseWriter, code int, msg string) {
+// writeJSONError writes a raw JSON error body. Prefer (*Node).httpError, which
+// sanitizes sensitive status codes and logs detail server-side; this raw writer
+// is for the free helper functions below (which only emit descriptive 400s).
+func writeJSONError(w http.ResponseWriter, code int, msg string) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
 	json.NewEncoder(w).Encode(map[string]string{"error": msg})
+}
+
+// httpError writes an error response, sanitizing the client-facing message for
+// status codes that would otherwise leak internal state (H4). For 401/403/404
+// and 5xx, the detailed msg is logged server-side and the client receives a
+// generic message — this prevents enumeration of valid group/key IDs and the
+// disclosure of internal error conditions. Other codes (notably 400/409) carry
+// useful, non-sensitive validation detail and are returned as-is.
+func (n *Node) httpError(w http.ResponseWriter, code int, msg string) {
+	if generic, sanitize := genericErrorMessage(code); sanitize {
+		n.log.Warn("http error", zap.Int("code", code), zap.String("detail", msg))
+		writeJSONError(w, code, generic)
+		return
+	}
+	writeJSONError(w, code, msg)
+}
+
+// genericErrorMessage returns the sanitized client message for a status code and
+// whether sanitization applies. Codes not listed are returned verbatim.
+func genericErrorMessage(code int) (string, bool) {
+	switch code {
+	case http.StatusUnauthorized:
+		return "unauthorized", true
+	case http.StatusForbidden:
+		return "forbidden", true
+	case http.StatusNotFound:
+		return "not found", true
+	case http.StatusInternalServerError:
+		return "internal error", true
+	default:
+		// Other codes (400 validation, 409 conflict, 503 transient retry
+		// signals like "reshare pending") carry useful, non-sensitive detail.
+		return "", false
+	}
 }
 
 // normalizeGroupID lowercases raw and writes a 400 + returns false if empty.
@@ -1124,7 +1193,7 @@ func httpError(w http.ResponseWriter, code int, msg string) {
 func normalizeGroupID(w http.ResponseWriter, raw string) (string, bool) {
 	g := strings.ToLower(raw)
 	if g == "" {
-		httpError(w, http.StatusBadRequest, "group_id is required")
+		writeJSONError(w, http.StatusBadRequest, "group_id is required")
 		return "", false
 	}
 	return g, true
@@ -1138,7 +1207,7 @@ func parseCurve(w http.ResponseWriter, raw string) (Curve, bool) {
 	}
 	c, ok := Curve(raw).Normalize()
 	if !ok {
-		httpError(w, http.StatusBadRequest, "unsupported curve: "+raw)
+		writeJSONError(w, http.StatusBadRequest, "unsupported curve: "+raw)
 		return "", false
 	}
 	return c, true
@@ -1151,7 +1220,7 @@ func (n *Node) lookupGroup(w http.ResponseWriter, groupID string) (*GroupInfo, b
 	grp, ok := n.groups[groupID]
 	n.groupsMu.RUnlock()
 	if !ok {
-		httpError(w, http.StatusNotFound, "group not found: "+groupID)
+		n.httpError(w, http.StatusNotFound, "group not found: "+groupID)
 		return nil, false
 	}
 	return grp, true
@@ -1172,13 +1241,13 @@ func (n *Node) applySessionAuth(
 ) (string, *SessionAuth, bool) {
 	if !n.auth.HasAuthPolicy(groupID) {
 		if keyID == "" {
-			httpError(w, http.StatusBadRequest, "key_id is required")
+			n.httpError(w, http.StatusBadRequest, "key_id is required")
 			return "", nil, false
 		}
 		return keyID, nil, true
 	}
 	if sessionPub == "" {
-		httpError(w, http.StatusUnauthorized, "authorization required (session_pub)")
+		n.httpError(w, http.StatusUnauthorized, "authorization required (session_pub)")
 		return "", nil, false
 	}
 	ap, resolvedKeyID, herr := n.validateSessionRequest(
@@ -1196,7 +1265,7 @@ func (n *Node) applySessionAuth(
 			zap.String("nonce", nonce),
 			zap.Int("code", herr.code),
 			zap.String("error", herr.msg))
-		httpError(w, herr.code, herr.msg)
+		n.httpError(w, herr.code, herr.msg)
 		return "", nil, false
 	}
 	return resolvedKeyID, ap, true
@@ -1232,7 +1301,7 @@ func (n *Node) handleSetKeyStatus(w http.ResponseWriter, r *http.Request, status
 		Timestamp  uint64 `json:"timestamp"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		httpError(w, http.StatusBadRequest, "decode body: "+err.Error())
+		n.httpError(w, http.StatusBadRequest, "decode body: "+err.Error())
 		return
 	}
 	curve, ok := parseCurve(w, req.Curve)
@@ -1262,11 +1331,11 @@ func (n *Node) handleSetKeyStatus(w http.ResponseWriter, r *http.Request, status
 	// Verify the key exists locally before broadcasting.
 	info, err := n.km.GetKeyInfo(req.GroupID, keyID, curve)
 	if err != nil {
-		httpError(w, http.StatusInternalServerError, "load key: "+err.Error())
+		n.httpError(w, http.StatusInternalServerError, "load key: "+err.Error())
 		return
 	}
 	if info == nil {
-		httpError(w, http.StatusNotFound, "key not found")
+		n.httpError(w, http.StatusNotFound, "key not found")
 		return
 	}
 
@@ -1280,13 +1349,13 @@ func (n *Node) handleSetKeyStatus(w http.ResponseWriter, r *http.Request, status
 		KeyStatus: status,
 		Session:   sessionAuth,
 	}); err != nil {
-		httpError(w, http.StatusInternalServerError, "coordinate: "+err.Error())
+		n.httpError(w, http.StatusInternalServerError, "coordinate: "+err.Error())
 		return
 	}
 
 	// Apply locally (initiator is excluded from broadcastCoord).
 	if err := n.km.SetKeyStatus(req.GroupID, keyID, curve, status); err != nil {
-		httpError(w, http.StatusInternalServerError, "set key status: "+err.Error())
+		n.httpError(w, http.StatusInternalServerError, "set key status: "+err.Error())
 		return
 	}
 
@@ -1321,7 +1390,7 @@ func (n *Node) handleDeleteKey(w http.ResponseWriter, r *http.Request) {
 		Timestamp  uint64 `json:"timestamp"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		httpError(w, http.StatusBadRequest, "decode body: "+err.Error())
+		n.httpError(w, http.StatusBadRequest, "decode body: "+err.Error())
 		return
 	}
 	curve, ok := parseCurve(w, req.Curve)
@@ -1351,11 +1420,11 @@ func (n *Node) handleDeleteKey(w http.ResponseWriter, r *http.Request) {
 	// Verify the key exists locally before broadcasting.
 	info, err := n.km.GetKeyInfo(req.GroupID, keyID, curve)
 	if err != nil {
-		httpError(w, http.StatusInternalServerError, "load key: "+err.Error())
+		n.httpError(w, http.StatusInternalServerError, "load key: "+err.Error())
 		return
 	}
 	if info == nil {
-		httpError(w, http.StatusNotFound, "key not found")
+		n.httpError(w, http.StatusNotFound, "key not found")
 		return
 	}
 
@@ -1368,13 +1437,13 @@ func (n *Node) handleDeleteKey(w http.ResponseWriter, r *http.Request) {
 		Curve:   string(curve),
 		Session: sessionAuth,
 	}); err != nil {
-		httpError(w, http.StatusInternalServerError, "coordinate: "+err.Error())
+		n.httpError(w, http.StatusInternalServerError, "coordinate: "+err.Error())
 		return
 	}
 
 	// Apply locally (initiator is excluded from broadcastCoord).
 	if err := n.km.DeleteKey(req.GroupID, keyID, curve); err != nil {
-		httpError(w, http.StatusInternalServerError, "delete key: "+err.Error())
+		n.httpError(w, http.StatusInternalServerError, "delete key: "+err.Error())
 		return
 	}
 

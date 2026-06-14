@@ -78,6 +78,11 @@ fi
 # --------------------------------------------------------------------------
 info "Initialising node keys..."
 
+# SIGNET_NODE_KEY_PASSPHRASE enables at-rest encryption of each node's identity
+# key (data/node*/node.key). Exported so both devnet-init (below) and signetd
+# use the same passphrase. Deterministic devnet-only value — NOT for production.
+export SIGNET_NODE_KEY_PASSPHRASE="${SIGNET_NODE_KEY_PASSPHRASE:-devnet-node-key-passphrase}"
+
 NODE_JSON=$("$BUILD/devnet-init" data/node1 data/node2 data/node3)
 
 get() { echo "$NODE_JSON" | jq -r ".nodes[$1].$2"; }
@@ -304,6 +309,9 @@ if $USE_KMS; then
         # Remove stale socket.
         rm -f "$KMS_SOCK"
 
+        # SIGNET_KMS_KEY enables at-rest encryption. Use a deterministic
+        # devnet-only key (NOT for production).
+        SIGNET_KMS_KEY="${SIGNET_KMS_KEY:-deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef}" \
         RUST_LOG=kms_tss=info "$BUILD/kms-tss" "$KMS_SOCK" "$KMS_DATA" \
             > "$DEVNET/kms${i}.log" 2>&1 &
         echo "KMS${i}_PID=$!" >> "$PIDS_FILE"

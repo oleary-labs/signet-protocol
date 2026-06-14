@@ -64,9 +64,11 @@ func NewHost(ctx context.Context, privKey crypto.PrivKey, listenAddr string) (*H
 	return host, nil
 }
 
-// NewHostFromFile loads or generates a persistent key from keyPath, then creates a host.
-func NewHostFromFile(ctx context.Context, keyPath, listenAddr string) (*Host, error) {
-	priv, err := LoadOrGenerateKey(keyPath)
+// NewHostFromFile loads or generates a persistent key from keyPath, then creates
+// a host. If passphrase is non-empty the identity key is encrypted at rest (see
+// LoadOrGenerateKey).
+func NewHostFromFile(ctx context.Context, keyPath, listenAddr, passphrase string) (*Host, error) {
+	priv, err := LoadOrGenerateKey(keyPath, passphrase)
 	if err != nil {
 		return nil, err
 	}

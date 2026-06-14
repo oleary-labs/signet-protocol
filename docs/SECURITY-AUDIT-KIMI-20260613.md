@@ -54,19 +54,14 @@ func (s *KeyShardStore) Put(groupID, keyID string, cfg *tss.Config) error {
 
 ### C2. Plaintext Node Identity Key
 
-**File**: `network/identity.go:17-42`
-**Status**: Unchanged from `SECURITY-ANALYSIS-OLD.md` §1.2
+**File**: `network/identity.go`, `network/keyfile.go`
+**Status**: ✅ Resolved (`feat/at-rest-encryption`)
 
-The secp256k1 private key that defines the node's identity (peer ID and Ethereum address) is written as **raw protobuf bytes** to `node.key` with `0600` permissions and no encryption.
-
-```go
-data, err = crypto.MarshalPrivateKey(priv)
-if err := os.WriteFile(path, data, 0600); err != nil { ... }
-```
+The secp256k1 private key that defines the node's identity (peer ID and Ethereum address) was previously written as **raw protobuf bytes** to `node.key` with `0600` permissions and no encryption.
 
 **Impact**: This key is the node's on-chain identity. Compromise allows full impersonation — participation in signing sessions, acceptance of group invitations, and on-chain action as the node.
 
-**Recommendation**: Encrypt the identity key with a passphrase (prompted at startup) or integrate with a platform keyring (macOS Keychain, Linux libsecret, Windows DPAPI).
+**Resolution**: When the `SIGNET_NODE_KEY_PASSPHRASE` environment variable is set, a newly generated `node.key` is sealed at rest with XChaCha20-Poly1305 under a key derived from the passphrase via scrypt (`network/keyfile.go`). This mirrors the KMS at-rest envelope (a passphrase replaces the raw KEK because the identity key is unwrapped once at startup, not per-record). The envelope is self-describing via a magic prefix, so legacy plaintext keys still load — existing nodes keep working, and operators opt into encryption by setting the env var on a fresh node. When the variable is unset, the legacy plaintext format is used (encryption disabled), matching the KMS `SIGNET_KMS_KEY` opt-in behavior. `devnet-init` honors the same variable so initialized keys match what the node expects to load.
 
 ---
 
@@ -419,7 +414,7 @@ The scope lists `ecdsa_session.rs` for *signing* but omits the **key generation 
 | Priority | Issue | Effort | File(s) |
 |---|---|---|---|
 | **P0** | Encrypt key shards at rest | Medium | `node/keystore.go` |
-| **P0** | Encrypt node identity key | Medium | `network/identity.go` |
+| **P0** | ✅ Encrypt node identity key | Medium | `network/identity.go`, `network/keyfile.go` |
 | **P0** | Add `Aud`/`Azp` validation to ZK auth path | Low | `node/auth.go` |
 | **P0** | Fix delegation token to check key disabled status | Low | `node/handlers.go` |
 | **P0** | Require admin auth for all groups | Low | `node/handlers.go` |

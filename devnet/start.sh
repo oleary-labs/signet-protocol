@@ -78,6 +78,11 @@ fi
 # --------------------------------------------------------------------------
 info "Initialising node keys..."
 
+# SIGNET_NODE_KEY_PASSPHRASE enables at-rest encryption of each node's identity
+# key (data/node*/node.key). Exported so both devnet-init (below) and signetd
+# use the same passphrase. Deterministic devnet-only value — NOT for production.
+export SIGNET_NODE_KEY_PASSPHRASE="${SIGNET_NODE_KEY_PASSPHRASE:-devnet-node-key-passphrase}"
+
 NODE_JSON=$("$BUILD/devnet-init" data/node1 data/node2 data/node3)
 
 get() { echo "$NODE_JSON" | jq -r ".nodes[$1].$2"; }

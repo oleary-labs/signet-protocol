@@ -96,7 +96,8 @@ func New(cfg *Config, log *zap.Logger) (*Node, error) {
 	}
 
 	keyFile := filepath.Join(cfg.DataDir, "node.key")
-	h, err := network.NewHostFromFile(ctx, keyFile, cfg.ListenAddr)
+	keyPassphrase := os.Getenv(network.KeyPassphraseEnv)
+	h, err := network.NewHostFromFile(ctx, keyFile, cfg.ListenAddr, keyPassphrase)
 	if err != nil {
 		cancel()
 		return nil, fmt.Errorf("create host: %w", err)

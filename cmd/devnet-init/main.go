@@ -63,7 +63,9 @@ func main() {
 func summarise(dataDir string) (NodeSummary, error) {
 	keyPath := dataDir + "/node.key"
 
-	priv, err := network.LoadOrGenerateKey(keyPath)
+	// Honor the same passphrase the node uses so an init'd node.key matches what
+	// the node expects to load. Empty passphrase keeps the legacy plaintext form.
+	priv, err := network.LoadOrGenerateKey(keyPath, os.Getenv(network.KeyPassphraseEnv))
 	if err != nil {
 		return NodeSummary{}, fmt.Errorf("load/generate key: %w", err)
 	}

@@ -468,6 +468,8 @@ bb verify -k target/proof/vk -p target/proof/proof -i target/proof/public_inputs
 
 Each node's libp2p peer ID is derived from a persistent secp256k1 private key stored in `data_dir/node.key`. The same key produces the node's Ethereum address, which is registered on-chain in `SignetFactory`.
 
+Because this key is the node's on-chain identity, it can be encrypted at rest. Set the `SIGNET_NODE_KEY_PASSPHRASE` environment variable before first start: a newly generated `node.key` is then sealed with XChaCha20-Poly1305 under a scrypt-derived key, and the same passphrase is required on every subsequent start. Leaving the variable unset stores the key in the legacy plaintext format. Encrypted files are self-describing, so an existing plaintext `node.key` keeps loading after you opt in (it is not re-encrypted in place — regenerate or migrate the key to encrypt it). This mirrors the KMS at-rest encryption gated by `SIGNET_KMS_KEY`.
+
 ### Group membership
 
 Group membership is not passed in API requests. At startup, the chain client calls `getNodeGroups(myAddr)` on the factory to discover which groups this node belongs to, then loads membership and threshold from each group contract. It polls every two seconds for `NodeActivatedInGroup`, `NodeDeactivatedInGroup`, and issuer events to stay in sync with chain state.

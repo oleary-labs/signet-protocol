@@ -89,12 +89,10 @@ When a delegation token was presented, the `handleAuth` delegation path checked 
 
 ### C5. Admin Endpoints Unprotected for Groups Without Auth Keys
 
-**Files**:
-- `node/handlers.go:34-100` (`handleListKeys`)
-- `node/handlers.go:836-917` (`handleStartReshare`)
-- `node/handlers.go:919-975` (`handleReshareStatus`)
+**Files**: `node/handlers.go` — `handleListKeys`, `handleStartReshare`, `handleReshareStatus`
+**Status**: ✅ Resolved (`feat/at-rest-encryption`)
 
-These endpoints only validate `AdminAuth` if `n.auth.HasAuthKeys(groupID)` returns true:
+These endpoints only validated `AdminAuth` if `n.auth.HasAuthKeys(groupID)` returned true:
 
 ```go
 if n.auth.HasAuthKeys(req.GroupID) {
@@ -105,11 +103,13 @@ if n.auth.HasAuthKeys(req.GroupID) {
 }
 ```
 
-For groups that have **only OAuth issuers** (no auth keys configured), these admin endpoints require **no authentication at all**.
+For groups that had **only OAuth issuers** (no auth keys configured), these admin endpoints required **no authentication at all**.
 
-**Impact**: Anyone with network access can list all keys for a group, trigger reshares, and query reshare status for OAuth-only groups. This leaks key metadata and could be used to disrupt operations.
+**Impact**: Anyone with network access could list all keys for a group, trigger reshares, and query reshare status for OAuth-only groups. This leaks key metadata and could be used to disrupt operations.
 
-**Recommendation**: Require admin auth for all groups that have any auth policy. OAuth sessions should not grant admin privileges by default. Alternatively, introduce an operator key mechanism (as noted in `PRODUCTION-GAPS.md`) and require it for all admin endpoints.
+**Resolution**: The `if HasAuthKeys` gate was removed from all three handlers — `ValidateAdminAuth` is now always required (fail closed). A group with no trusted authorization keys has no admin principal, so admin requests are rejected with `401`. OAuth sessions do not grant admin privileges. Covered by `TestAdminEndpointsFailClosed` (all three endpoints reject unauthenticated requests), `TestReshareStatusAllowsValidAdminKey` (valid trusted-key path still works), and `TestReshareStatusRejectsUntrustedAdminKey` in `node/handlers_admin_test.go`.
+
+**Operational note**: OAuth-only groups must register an on-chain authorization key to use admin endpoints (list keys / reshare). A node-level operator-key mechanism (per `PRODUCTION-GAPS.md`) was considered but deferred; fail-closed was chosen as the minimal, unambiguous fix for the alpha.
 
 ---
 
@@ -402,7 +402,7 @@ The scope lists `ecdsa_session.rs` for *signing* but omits the **key generation 
 | **P0** | ✅ Encrypt node identity key | Medium | `network/identity.go`, `network/keyfile.go` |
 | **P0** | Add `Aud`/`Azp` validation to ZK auth path | Low | `node/auth.go` |
 | **P0** | Fix delegation token to check key disabled status | Low | `node/handlers.go` |
-| **P0** | Require admin auth for all groups | Low | `node/handlers.go` |
+| **P0** | ✅ Require admin auth for all groups | Low | `node/handlers.go` |
 | **P1** | Validate coord message params against local on-chain state | Medium | `node/coord.go` |
 | **P1** | Add HTTP request body size limits | Low | `node/handlers.go` |
 | **P1** | Add quorum check to `executeRemoval` | Low | `contracts/SignetGroup.sol` |

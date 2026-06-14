@@ -54,11 +54,12 @@ func (n *Node) handleListKeys(w http.ResponseWriter, r *http.Request) {
 	}
 	req.GroupID = groupID
 
-	if n.auth.HasAuthKeys(req.GroupID) {
-		if err := n.auth.ValidateAdminAuth(req.GroupID, &req); err != nil {
-			httpError(w, http.StatusUnauthorized, "admin auth failed: "+err.Error())
-			return
-		}
+	// Admin auth is always required. Groups without trusted authorization keys
+	// have no admin principal, so this fails closed (a key list / metadata leak
+	// otherwise). OAuth sessions do not grant admin privileges.
+	if err := n.auth.ValidateAdminAuth(req.GroupID, &req); err != nil {
+		httpError(w, http.StatusUnauthorized, "admin auth failed: "+err.Error())
+		return
 	}
 
 	keyIDs, err := n.km.ListKeys(req.GroupID)
@@ -862,11 +863,11 @@ func (n *Node) handleStartReshare(w http.ResponseWriter, r *http.Request) {
 	}
 	req.AdminAuth.GroupID = groupID
 
-	if n.auth.HasAuthKeys(groupID) {
-		if err := n.auth.ValidateAdminAuth(groupID, &req.AdminAuth); err != nil {
-			httpError(w, http.StatusUnauthorized, "admin auth failed: "+err.Error())
-			return
-		}
+	// Admin auth is always required (fail closed). Groups without trusted
+	// authorization keys have no admin principal and cannot trigger reshares.
+	if err := n.auth.ValidateAdminAuth(groupID, &req.AdminAuth); err != nil {
+		httpError(w, http.StatusUnauthorized, "admin auth failed: "+err.Error())
+		return
 	}
 	concurrency := req.Concurrency
 	if concurrency < 1 {
@@ -941,11 +942,11 @@ func (n *Node) handleReshareStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if n.auth.HasAuthKeys(groupID) {
-		if err := n.auth.ValidateAdminAuth(groupID, &req); err != nil {
-			httpError(w, http.StatusUnauthorized, "admin auth failed: "+err.Error())
-			return
-		}
+	// Admin auth is always required (fail closed). Groups without trusted
+	// authorization keys have no admin principal.
+	if err := n.auth.ValidateAdminAuth(groupID, &req); err != nil {
+		httpError(w, http.StatusUnauthorized, "admin auth failed: "+err.Error())
+		return
 	}
 
 	n.reshareJobsMu.RLock()

@@ -670,19 +670,43 @@ func (g *GroupAuth) ValidateAuthProof(ctx context.Context, groupID string, proof
 	issuers := g.groups[groupID]
 	g.mu.RUnlock()
 
-	trusted := false
-	for _, iss := range issuers {
-		if iss.Issuer == proof.Iss {
-			trusted = true
+	var matched *IssuerInfo
+	for i := range issuers {
+		if issuers[i].Issuer == proof.Iss {
+			matched = &issuers[i]
 			break
 		}
 	}
-	if !trusted {
+	if matched == nil {
 		return "", fmt.Errorf("untrusted issuer: %s", proof.Iss)
 	}
 
 	if proof.Sub == "" {
 		return "", fmt.Errorf("auth proof missing sub")
+	}
+
+	// Enforce the group's ClientIds allowlist against the audience/authorized
+	// party. Without this check, a valid JWT from a trusted issuer but for a
+	// different application would authenticate (cross-application token replay).
+	//
+	// proof.Aud and proof.Azp are ZK public inputs (expected_aud / expected_azp),
+	// so the bb verify below cryptographically binds them to the real JWT — a
+	// prover cannot claim an allowlisted client here while holding a token for a
+	// different one, because that proof would fail verification. Checking the
+	// allowlist first is fail-fast; the binding is what makes it sound.
+	//
+	// Client identity precedence (azp → aud) mirrors ValidateJWTForSession.
+	if len(matched.ClientIds) > 0 {
+		clientID := proof.Azp
+		if clientID == "" {
+			clientID = proof.Aud
+		}
+		if clientID == "" {
+			return "", fmt.Errorf("auth proof missing client identity (azp/aud) required by this group's allowlist")
+		}
+		if !containsString(matched.ClientIds, clientID) {
+			return "", fmt.Errorf("untrusted client_id: %s", clientID)
+		}
 	}
 
 	if len(proof.Proof) == 0 {

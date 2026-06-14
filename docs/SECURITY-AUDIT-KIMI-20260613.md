@@ -12,7 +12,7 @@
 
 This audit was conducted with the Kimi model to assess the Signet protocol's security posture ahead of a public alpha deployment. The codebase has matured significantly since the original `SECURITY-ANALYSIS-OLD.md` was written. The most critical historical vulnerability — raw JWT forwarding that collapsed the threshold trust model to 1-of-n — has been fixed via ZK proofs bound to ephemeral session keys (commit `a420f5f`). ECDSA signature formatting (EIP-2 low-S normalization and v-byte recovery) is correctly implemented.
 
-However, **several critical and high-severity issues remain** that could lead to key loss, unauthorized signing, or permanent group inoperability in a real-money alpha. The most serious gaps are in **at-rest storage encryption** (plaintext key shards and node identity keys), **authorization edge cases** in the ZK and delegation paths, **admin endpoint access control**, and **smart contract quorum protection**.
+However, **several critical and high-severity issues remain** that could lead to key loss, unauthorized signing, or permanent group inoperability in a real-money alpha. The most serious gaps are in **authorization edge cases** in the ZK and delegation paths, **admin endpoint access control**, and **smart contract quorum protection**. **At-rest storage encryption** (key shards and node identity keys) has been resolved on `feat/at-rest-encryption`.
 
 This document supersedes `SECURITY-ANALYSIS-OLD.md` as the canonical security assessment for the current codebase.
 
@@ -33,22 +33,16 @@ These issues could lead to immediate loss of funds, key compromise, or complete 
 
 ### C1. Plaintext Key Shard Storage
 
-**File**: `node/keystore.go`
-**Status**: Unchanged from `SECURITY-ANALYSIS-OLD.md` §1.1
+**File**: `kms-tss/src/storage.rs`, `kms-tss/src/encrypted_store.rs`, `kms-tss/src/custody.rs`
+**Status**: ✅ Resolved (`feat/at-rest-encryption`)
 
-Key shards (the most sensitive data in the system) are stored as **plaintext JSON** in a bbolt database. OS file permissions (`0600`) are the only protection.
+Key shards were previously stored as **plaintext JSON** in sled. OS file permissions (`0600`) were the only protection.
 
-```go
-func (s *KeyShardStore) Put(groupID, keyID string, cfg *tss.Config) error {
-    data, err := json.Marshal(cfg)  // plaintext JSON
-    // ...
-    return grp.Put([]byte(keyID), data)
-}
-```
+**Resolution**: The Rust KMS now supports envelope encryption via `Storage::new_encrypted()`. Each `StoredKey` value is sealed with a per-record random DEK (32 bytes) encrypted under a KEK via XChaCha20-Poly1305. The AAD binds each ciphertext to its addressing context (`version || kek_version || tree_name || record_key`) plus domain-separated literals (`dek/v1`, `val/v1`), preventing cross-key and cross-tree swapping attacks. The `value_aad` additionally includes `wrap_nonce || wrapped_dek`, pinning the value encryption to the exact wrapping that produced its DEK.
 
-**Impact**: If an attacker gains read access to the filesystem (container escape, backup exposure, disk theft, or insider threat), all threshold shares are immediately compromised. With `t` shares from any `t` nodes, the full private key can be reconstructed.
+KEK management is handled by the `KeyCustody` trait (`custody.rs`), with `LocalKeyCustody` as the v1 in-process implementation. KEKs are held in `Zeroizing<[u8; 32]>` wrappers, explicitly zeroed on drop. HKDF-SHA-256 derives per-purpose wrapping sub-keys. KEK rotation is supported without bulk re-encryption — old and new KEKs are retained, and `unwrap_dek` selects the correct KEK by the `kek_version` byte in each record.
 
-**Recommendation**: Encrypt shards at rest using a key derived from a hardware token (TPM/HSM), a cloud KMS, or a passphrase-based KDF. Consider an envelope encryption scheme where a master key is sealed by the platform and individual shards are encrypted with per-key DEKs.
+The Go `LocalKeyManager` (`node/local_keymanager.go`) still stores plaintext JSON in bbolt, but this path is **test/development-only** (`--no-kms` flag). Production deployments use the remote Rust KMS over gRPC, so this does not represent a production risk. See `KMS-INTEGRATION.md` for the production path.
 
 ---
 
@@ -67,15 +61,16 @@ The secp256k1 private key that defines the node's identity (peer ID and Ethereum
 
 ### C3. ZK Auth Path Missing Client ID / Audience Validation
 
-**File**: `node/auth.go:643-710` (`ValidateAuthProof`)
+**File**: `node/auth.go` (`ValidateAuthProof`)
+**Status**: ✅ Resolved (`feat/at-rest-encryption`)
 
-The ZK proof verification path validates expiry, issuer trust, `sub` presence, JWKS modulus match, and ZK proof validity via `bb verify`. **However, it does NOT validate `Aud` (audience) or `Azp` (authorized party) against expected values.**
+The ZK proof verification path validated expiry, issuer trust, `sub` presence, JWKS modulus match, and ZK proof validity via `bb verify`, but did **not** validate `Aud` (audience) or `Azp` (authorized party) against expected values.
 
-This means a valid JWT from the right issuer but for a **different application** (wrong `aud`/`azp`) will authenticate successfully against Signet.
+This meant a valid JWT from the right issuer but for a **different application** (wrong `aud`/`azp`) would authenticate successfully against Signet.
 
-**Impact**: Cross-application token replay. A JWT obtained for app A can be used against Signet group B if both trust the same OAuth issuer.
+**Impact**: Cross-application token replay. A JWT obtained for app A could be used against Signet group B if both trust the same OAuth issuer.
 
-**Recommendation**: Add `Aud` and `Azp` validation in `ValidateAuthProof`, matching the logic already present in `ValidateJWTForSession` (lines 614-621). If `ClientIds` are configured for the issuer, require that `azp` or `aud` matches and reject if absent.
+**Resolution**: `ValidateAuthProof` now enforces the group's `ClientIds` allowlist on the ZK path, mirroring `ValidateJWTForSession`. The client identity is resolved with `azp → aud` precedence; if the issuer has `ClientIds` configured and the identity is absent or not in the allowlist, the proof is rejected. This is sound because `proof.Aud`/`proof.Azp` are ZK public inputs (`expected_aud`/`expected_azp`): a successful `bb verify` cryptographically binds them to the real JWT, so a prover cannot claim an allowlisted client while holding a token for a different one. The check runs before `bb verify` for fail-fast rejection; the binding is what makes it sound. Covered by `TestValidateAuthProofClientIDAllowlist` in `node/auth_test.go`.
 
 ---
 
@@ -413,7 +408,7 @@ The scope lists `ecdsa_session.rs` for *signing* but omits the **key generation 
 
 | Priority | Issue | Effort | File(s) |
 |---|---|---|---|
-| **P0** | Encrypt key shards at rest | Medium | `node/keystore.go` |
+| **P0** | ✅ Encrypt key shards at rest | Medium | `kms-tss/src/encrypted_store.rs`, `kms-tss/src/custody.rs` |
 | **P0** | ✅ Encrypt node identity key | Medium | `network/identity.go`, `network/keyfile.go` |
 | **P0** | Add `Aud`/`Azp` validation to ZK auth path | Low | `node/auth.go` |
 | **P0** | Fix delegation token to check key disabled status | Low | `node/handlers.go` |
@@ -434,6 +429,6 @@ The scope lists `ecdsa_session.rs` for *signing* but omits the **key generation 
 
 The Signet protocol has **strong architectural security**: ZK auth eliminates the critical JWT-forwarding vulnerability, session binding prevents replay, and scope enforcement prevents cross-domain signing. The contract layer uses standard patterns correctly.
 
-The remaining risks are primarily **operational and implementation-level**: plaintext storage, missing auth checks on edge cases, DoS vectors, and contract quorum protection. These are all addressable before a production deployment and should be prioritized for the public alpha.
+The remaining risks are primarily **operational and implementation-level**: missing auth checks on edge cases, DoS vectors, and contract quorum protection. These are all addressable before a production deployment and should be prioritized for the public alpha. **At-rest encryption** (key shards via Rust KMS envelope encryption, node identity key via passphrase-protected XChaCha20-Poly1305) has been implemented and verified.
 
 The total additional scope recommended above adds approximately **1-2 days of auditor/reviewer time** and closes the gap between "signing protocol is correct" and "alpha deployment is safe."

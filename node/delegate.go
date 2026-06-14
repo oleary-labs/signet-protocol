@@ -79,11 +79,11 @@ func (n *Node) handleDelegate(w http.ResponseWriter, r *http.Request) {
 		Timestamp    uint64 `json:"timestamp"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		httpError(w, http.StatusBadRequest, "decode body: "+err.Error())
+		n.httpError(w, http.StatusBadRequest, "decode body: "+err.Error())
 		return
 	}
 	if req.ParentKeyID == "" {
-		httpError(w, http.StatusBadRequest, "parent_key_id is required")
+		n.httpError(w, http.StatusBadRequest, "parent_key_id is required")
 		return
 	}
 	groupID, ok := normalizeGroupID(w, req.GroupID)
@@ -104,7 +104,7 @@ func (n *Node) handleDelegate(w http.ResponseWriter, r *http.Request) {
 	grp, ok := n.groups[req.GroupID]
 	n.groupsMu.RUnlock()
 	if !ok {
-		httpError(w, http.StatusNotFound, "group not found: "+req.GroupID)
+		n.httpError(w, http.StatusNotFound, "group not found: "+req.GroupID)
 		return
 	}
 
@@ -115,11 +115,11 @@ func (n *Node) handleDelegate(w http.ResponseWriter, r *http.Request) {
 	var parentKeyID, subKeyID string
 	if n.auth.HasAuthPolicy(req.GroupID) {
 		if req.SessionPub == "" {
-			httpError(w, http.StatusUnauthorized, "authorization required (session_pub)")
+			n.httpError(w, http.StatusUnauthorized, "authorization required (session_pub)")
 			return
 		}
 		if req.KeySuffix == "" {
-			httpError(w, http.StatusBadRequest, "key_suffix (sub-key scope hash) is required")
+			n.httpError(w, http.StatusBadRequest, "key_suffix (sub-key scope hash) is required")
 			return
 		}
 		// Validate session against the sub-key (with suffix). The client
@@ -132,7 +132,7 @@ func (n *Node) handleDelegate(w http.ResponseWriter, r *http.Request) {
 			nil,
 		)
 		if err != nil {
-			httpError(w, err.code, err.msg)
+			n.httpError(w, err.code, err.msg)
 			return
 		}
 		authProof = ap
@@ -145,7 +145,7 @@ func (n *Node) handleDelegate(w http.ResponseWriter, r *http.Request) {
 		var ok bool
 		parentKeyID, ok = parentKeyFromResolved(resolved, req.KeySuffix)
 		if !ok {
-			httpError(w, http.StatusBadRequest, "key_suffix does not match the session key")
+			n.httpError(w, http.StatusBadRequest, "key_suffix does not match the session key")
 			return
 		}
 	} else {
@@ -154,41 +154,41 @@ func (n *Node) handleDelegate(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if subKeyID == "" {
-		httpError(w, http.StatusBadRequest, "key_id or key_suffix is required")
+		n.httpError(w, http.StatusBadRequest, "key_id or key_suffix is required")
 		return
 	}
 	if parentKeyID == "" {
-		httpError(w, http.StatusBadRequest, "parent_key_id is required")
+		n.httpError(w, http.StatusBadRequest, "parent_key_id is required")
 		return
 	}
 
 	// Verify the sub-key exists.
 	subKeyInfo, err := n.km.GetKeyInfo(req.GroupID, subKeyID, parentCurve)
 	if err != nil {
-		httpError(w, http.StatusInternalServerError, "load sub-key: "+err.Error())
+		n.httpError(w, http.StatusInternalServerError, "load sub-key: "+err.Error())
 		return
 	}
 	if subKeyInfo == nil {
-		httpError(w, http.StatusNotFound, fmt.Sprintf("sub-key not found: %s", subKeyID))
+		n.httpError(w, http.StatusNotFound, fmt.Sprintf("sub-key not found: %s", subKeyID))
 		return
 	}
 	if subKeyInfo.Status == "disabled" {
-		httpError(w, http.StatusForbidden, "sub-key is disabled")
+		n.httpError(w, http.StatusForbidden, "sub-key is disabled")
 		return
 	}
 
 	// Verify the parent key exists and load its public key.
 	parentInfo, err := n.km.GetKeyInfo(req.GroupID, parentKeyID, parentCurve)
 	if err != nil {
-		httpError(w, http.StatusInternalServerError, "load parent key: "+err.Error())
+		n.httpError(w, http.StatusInternalServerError, "load parent key: "+err.Error())
 		return
 	}
 	if parentInfo == nil {
-		httpError(w, http.StatusNotFound, fmt.Sprintf("parent key not found: %s", parentKeyID))
+		n.httpError(w, http.StatusNotFound, fmt.Sprintf("parent key not found: %s", parentKeyID))
 		return
 	}
 	if parentInfo.Status == "disabled" {
-		httpError(w, http.StatusForbidden, "parent key is disabled")
+		n.httpError(w, http.StatusForbidden, "parent key is disabled")
 		return
 	}
 
@@ -232,14 +232,14 @@ func (n *Node) handleDelegate(w http.ResponseWriter, r *http.Request) {
 	sortedSigners := tss.NewPartyIDSlice(grp.Members)
 	nonce, err := randomNonce()
 	if err != nil {
-		httpError(w, http.StatusInternalServerError, "generate nonce: "+err.Error())
+		n.httpError(w, http.StatusInternalServerError, "generate nonce: "+err.Error())
 		return
 	}
 	sessID := signSessionID(req.GroupID, parentKeyID, nonce)
 
 	sn, err := network.NewSessionNetwork(r.Context(), n.host, sessID, sortedSigners)
 	if err != nil {
-		httpError(w, http.StatusInternalServerError, "session network: "+err.Error())
+		n.httpError(w, http.StatusInternalServerError, "session network: "+err.Error())
 		return
 	}
 	defer sn.Close()
@@ -268,7 +268,7 @@ func (n *Node) handleDelegate(w http.ResponseWriter, r *http.Request) {
 		Session:        authProof,
 		DelegateSubKey: subKeyID,
 	}); err != nil {
-		httpError(w, http.StatusInternalServerError, "coordinate: "+err.Error())
+		n.httpError(w, http.StatusInternalServerError, "coordinate: "+err.Error())
 		return
 	}
 
@@ -283,7 +283,7 @@ func (n *Node) handleDelegate(w http.ResponseWriter, r *http.Request) {
 		Curve:       parentCurve,
 	})
 	if err != nil {
-		httpError(w, http.StatusInternalServerError, "sign JWT: "+err.Error())
+		n.httpError(w, http.StatusInternalServerError, "sign JWT: "+err.Error())
 		return
 	}
 

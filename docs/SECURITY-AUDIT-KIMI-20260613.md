@@ -156,21 +156,12 @@ All HTTP handlers used `json.NewDecoder(r.Body)` without `http.MaxBytesReader`, 
 
 ### H4. Error Messages Leak Internal State
 
-**File**: `node/handlers.go:1115-1119` (`httpError`)
+**File**: `node/handlers.go` (`(*Node).httpError`, `genericErrorMessage`, `writeJSONError`)
+**Status**: ✅ Resolved (`feat/at-rest-encryption`)
 
-Error messages are returned raw to the client:
+Error messages were returned raw to the client (`"key not found: group=... key=..."`, `"list keys: ..."`, etc.), enabling enumeration of valid group/key IDs and disclosure of internal error conditions.
 
-```go
-func httpError(w http.ResponseWriter, code int, msg string) {
-    json.NewEncoder(w).Encode(map[string]string{"error": msg})
-}
-```
-
-Examples observed: `"load config: ..."`, `"key not found: group=... key=..."`, `"list keys: ..."`.
-
-**Impact**: Information leakage aids reconnaissance for targeted attacks. An attacker can enumerate valid group IDs, key IDs, and internal error conditions.
-
-**Recommendation**: Return generic error messages to clients (e.g., `"internal error"`, `"invalid request"`) and log detailed errors server-side with zap.
+**Resolution**: `httpError` is now a method on `*Node`. For `401`/`403`/`404`/`500` it logs the full detail server-side (`n.log.Warn` with code + detail) and returns a generic client message (`unauthorized` / `forbidden` / `not found` / `internal error`). Other codes — `400` validation, `409` conflict, and `503` transient retry signals (e.g. "key reshare pending") — carry useful, non-sensitive detail and are returned as-is. All 90 call sites were converted to `n.httpError`; the two free helper functions (`normalizeGroupID`, `parseCurve`, which emit only descriptive 400s) use a raw `writeJSONError`. Covered by `TestHTTPErrorSanitization` and `TestGenericErrorMessage` in `node/httperror_test.go`; full handler suite still passes.
 
 ---
 
@@ -384,7 +375,7 @@ The scope lists `ecdsa_session.rs` for *signing* but omits the **key generation 
 | **P1** | ✅ Validate coord message params against local on-chain state | Medium | `node/coord.go` |
 | **P1** | ✅ Add HTTP request body size limits | Low | `node/node.go` |
 | **P1** | ✅ Add quorum check to `executeRemoval` | Low | `contracts/SignetGroup.sol` |
-| **P1** | Sanitize error messages returned to clients | Low | `node/handlers.go` |
+| **P1** | ✅ Sanitize error messages returned to clients | Low | `node/handlers.go` |
 | **P1** | ✅ Fix delegation parent key slicing panic | Low | `node/delegate.go` |
 | **P1** | Implement reshare leader failover | Medium | `node/reshare.go` |
 | **P2** | Deploy behind TLS-terminating proxy | Low | `node/node.go` (or infra) |

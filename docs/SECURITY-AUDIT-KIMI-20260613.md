@@ -76,24 +76,14 @@ This meant a valid JWT from the right issuer but for a **different application**
 
 ### C4. Delegation Token Session Bypasses Key Disable Check
 
-**File**: `node/handlers.go:216-288` (`handleAuth` delegation path)
+**File**: `node/handlers.go` (`handleAuth` delegation path)
+**Status**: ✅ Resolved (`feat/at-rest-encryption`)
 
-When a delegation token is presented, the code checks if the delegated sub-key exists across all curves:
+When a delegation token was presented, the `handleAuth` delegation path checked only that the delegated sub-key *existed* (across all curves), not that it was active. A disabled sub-key could therefore still establish a delegation session.
 
-```go
-for _, curve := range []Curve{CurveSecp256k1, CurveEcdsaSecp256k1, CurveEd25519} {
-    if info, _ := n.km.GetKeyInfo(req.GroupID, internalSubKey, curve); info != nil {
-        keyExists = true
-        break
-    }
-}
-```
+**Impact**: A user who disables a compromised sub-key could still establish a delegation session for it. Note the participant-side delegate-sign handler (`coord.go`) already rejects disabled sub-keys at signing time, so actual signing was blocked there — but the originating node still accepted the session and forwarded it, contradicting the disable lifecycle.
 
-However, it **does not check `info.Status == "disabled"`**. A disabled key can still establish a delegation session and be used for signing.
-
-**Impact**: The key disable/enable lifecycle is completely bypassed for delegation tokens. A user who disables a compromised sub-key will find it still usable via delegation.
-
-**Recommendation**: Add `info.Status == "disabled"` check and reject with `http.StatusForbidden` if the sub-key is disabled.
+**Resolution**: The `handleAuth` delegation path now reads `info.Status` and rejects a disabled sub-key with `http.StatusForbidden` ("delegated sub-key is disabled") before creating or forwarding the session. This fails fast at the originating node and aligns the auth path with the existing participant-side enforcement (defense-in-depth).
 
 ---
 

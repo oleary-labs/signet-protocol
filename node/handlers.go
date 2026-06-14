@@ -223,16 +223,28 @@ func (n *Node) handleAuth(w http.ResponseWriter, r *http.Request) {
 		// JWT claims use unprefixed key IDs. Add "oauth:" for internal lookups.
 		internalSubKey := "oauth:" + claims.Sub
 
-		// Verify the sub-key exists.
+		// Verify the sub-key exists and is not disabled. Without the disabled
+		// check, a user who disables a compromised sub-key could still establish
+		// a delegation session and sign with it. Participants enforce the same
+		// check (see coord.go), but reject here too so the originating node fails
+		// fast instead of forwarding a doomed session.
 		keyExists := false
+		keyDisabled := false
 		for _, curve := range []Curve{CurveSecp256k1, CurveEcdsaSecp256k1, CurveEd25519} {
 			if info, _ := n.km.GetKeyInfo(req.GroupID, internalSubKey, curve); info != nil {
 				keyExists = true
+				if info.Status == "disabled" {
+					keyDisabled = true
+				}
 				break
 			}
 		}
 		if !keyExists {
 			httpError(w, http.StatusNotFound, "delegated sub-key no longer exists: "+claims.Sub)
+			return
+		}
+		if keyDisabled {
+			httpError(w, http.StatusForbidden, "delegated sub-key is disabled: "+claims.Sub)
 			return
 		}
 

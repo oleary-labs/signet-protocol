@@ -237,6 +237,27 @@ contract SignetGroupTest is PubkeyHelpersGroup {
         g.executeRemoval(node1);
     }
 
+    function testExecuteRemoval_RevertsIfBreaksQuorum() public {
+        ISignetGroup g = _threeNodeGroup(); // threshold 2, 3 active nodes
+
+        vm.prank(manager); g.queueRemoval(node1);
+        vm.prank(manager); g.queueRemoval(node2);
+        vm.warp(block.timestamp + 1 days);
+
+        // First removal: 3 -> 2 active, still == threshold, allowed.
+        g.executeRemoval(node1);
+        assertEq(g.getActiveNodes().length, 2);
+
+        // Second removal would drop the active set to 1 < threshold(2): rejected,
+        // so the group cannot be bricked below quorum.
+        vm.expectRevert("removal would break quorum");
+        g.executeRemoval(node2);
+
+        // node2 remains active; the group is intact.
+        assertEq(g.getActiveNodes().length, 2);
+        assertEq(uint8(g.nodeStatus(node2)), uint8(ISignetGroup.NodeStatus.Active));
+    }
+
     // -------------------------------------------------------------------------
     // cancelRemoval
     // -------------------------------------------------------------------------
@@ -349,14 +370,19 @@ contract SignetGroupTest is PubkeyHelpersGroup {
         ISignetGroup g = _threeNodeGroup();
         assertTrue(g.isOperational());
 
-        // Remove two nodes → 1 active < 2 threshold → not operational
+        // Remove one node → 2 active == threshold → still operational.
         vm.prank(manager); g.queueRemoval(node1);
         vm.prank(manager); g.queueRemoval(node2);
         vm.warp(block.timestamp + 1 days);
         g.executeRemoval(node1);
-        g.executeRemoval(node2);
+        assertTrue(g.isOperational());
 
-        assertFalse(g.isOperational());
+        // A second removal would drop below quorum and is now rejected
+        // (executeRemoval enforces the quorum invariant), so the group cannot be
+        // driven into a non-operational state via removal.
+        vm.expectRevert("removal would break quorum");
+        g.executeRemoval(node2);
+        assertTrue(g.isOperational());
     }
 
     // -------------------------------------------------------------------------

@@ -134,6 +134,59 @@ func (n *Node) registerCoordHandler() {
 // handleCoordStream handles an incoming coordination request from an initiator.
 // It registers a session stream handler, sends a ready ACK, then runs the
 // protocol in a background goroutine.
+// groupState returns the active member set and threshold for a group from this
+// node's own on-chain-derived state (n.groups). Participants use it to validate
+// initiator-supplied protocol parameters rather than trusting the coord message
+// (H1). ok is false if the group is unknown locally.
+func (n *Node) groupState(groupID string) (members map[tss.PartyID]bool, threshold int, ok bool) {
+	n.groupsMu.RLock()
+	grp := n.groups[groupID]
+	n.groupsMu.RUnlock()
+	if grp == nil || len(grp.Members) == 0 {
+		return nil, 0, false
+	}
+	members = make(map[tss.PartyID]bool, len(grp.Members))
+	for _, p := range grp.Members {
+		members[p] = true
+	}
+	return members, grp.Threshold, true
+}
+
+// checkKeygenParams validates initiator-supplied keygen parameters against the
+// group's on-chain state: the threshold must match exactly and every party must
+// be an active member (subset allowed). Returns nil if acceptable.
+func checkKeygenParams(members map[tss.PartyID]bool, groupThreshold int, parties []tss.PartyID, msgThreshold int) error {
+	if msgThreshold != groupThreshold {
+		return fmt.Errorf("threshold mismatch: msg=%d group=%d", msgThreshold, groupThreshold)
+	}
+	if len(parties) == 0 {
+		return fmt.Errorf("empty party set")
+	}
+	for _, p := range parties {
+		if !members[p] {
+			return fmt.Errorf("party not in group: %s", p)
+		}
+	}
+	return nil
+}
+
+// checkSignerSet validates an initiator-supplied signer set: every signer must
+// be an active member and the count of distinct signers must be at least the
+// group threshold. Returns nil if acceptable.
+func checkSignerSet(members map[tss.PartyID]bool, groupThreshold int, signers []tss.PartyID) error {
+	distinct := make(map[tss.PartyID]bool, len(signers))
+	for _, s := range signers {
+		if !members[s] {
+			return fmt.Errorf("signer not in group: %s", s)
+		}
+		distinct[s] = true
+	}
+	if len(distinct) < groupThreshold {
+		return fmt.Errorf("signer set below threshold: %d < %d", len(distinct), groupThreshold)
+	}
+	return nil
+}
+
 func (n *Node) handleCoordStream(s libp2pnet.Stream) {
 	defer s.Close()
 
@@ -341,6 +394,23 @@ func (n *Node) handleCoordStream(s libp2pnet.Stream) {
 		if kgCurve == "" {
 			kgCurve = CurveSecp256k1
 		}
+
+		// H1: validate keygen parameters against local on-chain group state. A
+		// malicious initiator must not be able to pick an off-chain party set or
+		// a threshold that differs from the group contract.
+		members, threshold, ok := n.groupState(msg.GroupID)
+		if !ok {
+			n.log.Warn("coord: keygen for unknown group", zap.String("group_id", msg.GroupID))
+			s.Write([]byte{coordNACK})
+			return
+		}
+		if err := checkKeygenParams(members, threshold, msg.Parties, msg.Threshold); err != nil {
+			n.log.Warn("coord: keygen params rejected",
+				zap.String("group_id", msg.GroupID), zap.Error(err))
+			s.Write([]byte{coordNACK})
+			return
+		}
+
 		if info, _ := n.km.GetKeyInfo(msg.GroupID, msg.KeyID, kgCurve); info != nil {
 			n.log.Warn("coord: keygen rejected, key already exists",
 				zap.String("group_id", msg.GroupID),
@@ -404,6 +474,20 @@ func (n *Node) handleCoordStream(s libp2pnet.Stream) {
 		}()
 
 	case msgSign:
+		// H1: validate the signer set against local on-chain group state. A
+		// malicious initiator must not be able to include a non-member signer or
+		// drive the signer count below the group threshold.
+		members, threshold, ok := n.groupState(msg.GroupID)
+		if !ok {
+			n.log.Warn("coord: sign for unknown group", zap.String("group_id", msg.GroupID))
+			return
+		}
+		if err := checkSignerSet(members, threshold, msg.Signers); err != nil {
+			n.log.Warn("coord: signer set rejected",
+				zap.String("group_id", msg.GroupID), zap.Error(err))
+			return
+		}
+
 		sessID := signSessionID(msg.GroupID, msg.KeyID, msg.SignNonce)
 		sessCtx, sessCancel := context.WithTimeout(n.ctx, 30*time.Second)
 		sn, err := network.NewSessionNetwork(sessCtx, n.host, sessID, msg.Signers)

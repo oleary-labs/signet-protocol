@@ -119,17 +119,16 @@ These issues could lead to unauthorized access, DoS, or operational disruption.
 
 ### H1. Coord Message Parameters Trusted from Initiator
 
-**File**: `node/coord.go:338-512`
+**File**: `node/coord.go` (`msgKeygen` / `msgSign` handlers, `groupState` / `checkKeygenParams` / `checkSignerSet`)
+**Status**: ✅ Resolved (`feat/at-rest-encryption`)
 
-Participants in a signing session trust initiator-supplied `Parties`, `Threshold`, `Signers`, and `MessageHash` from the coord message. While scope enforcement and session signature binding mitigate some manipulation, a compromised or malicious initiator could:
+Participants in a keygen/signing session trusted initiator-supplied `Parties`, `Threshold`, and `Signers` from the coord message. The `MessageHash` was already protected — scoped keys recompute the hash from the forwarded payload and the session signature binds it, and unscoped keys are forbidden from carrying a payload (`coord.go`). But the party/signer set and threshold were not checked against on-chain state, so a malicious initiator could supply an off-chain party set, include a non-member signer, or set a lower threshold.
 
-- Supply a manipulated `Parties` list (e.g., including a colluding node not in the on-chain group)
-- Set a lower `Threshold` than the group contract specifies
-- Forward a `MessageHash` that differs from what the API caller intended (mitigated by session sig binding for scoped keys, but not for raw `message_hash` signing)
+**Resolution**: Participants now validate parameters against their own on-chain-derived state (`n.groups`) before acting:
+- **keygen** (`checkKeygenParams`): `msg.Threshold` must equal the group threshold exactly, the party set must be non-empty, and every party must be an active member (subset allowed). Rejected with `coordNACK`.
+- **sign** (`checkSignerSet`): every signer must be an active member, and the count of *distinct* signers must be ≥ the group threshold (duplicates can't inflate the count). Rejected (session aborts).
 
-**Impact**: Protocol parameter manipulation by a malicious initiator. Could reduce effective threshold or include unauthorized signers.
-
-**Recommendation**: Participants should independently verify `Parties`, `Threshold`, and group membership from their own local `n.groups` state (populated from on-chain events) rather than trusting the initiator's message. Reject coord messages where parameters don't match local on-chain state.
+The reshare coord paths (`msgReshare*`) are intentionally left unchanged — reshare legitimately changes committee/threshold and is gated by the deterministic leader election and on-chain-driven job creation. Pure helpers are covered by `TestCheckKeygenParams`, `TestCheckSignerSet`, and `TestGroupState` in `node/coord_params_test.go`; the full keygen/sign/reshare integration suite still passes.
 
 ---
 
@@ -382,7 +381,7 @@ The scope lists `ecdsa_session.rs` for *signing* but omits the **key generation 
 | **P0** | Add `Aud`/`Azp` validation to ZK auth path | Low | `node/auth.go` |
 | **P0** | Fix delegation token to check key disabled status | Low | `node/handlers.go` |
 | **P0** | ✅ Require admin auth for all groups | Low | `node/handlers.go` |
-| **P1** | Validate coord message params against local on-chain state | Medium | `node/coord.go` |
+| **P1** | ✅ Validate coord message params against local on-chain state | Medium | `node/coord.go` |
 | **P1** | ✅ Add HTTP request body size limits | Low | `node/node.go` |
 | **P1** | ✅ Add quorum check to `executeRemoval` | Low | `contracts/SignetGroup.sol` |
 | **P1** | Sanitize error messages returned to clients | Low | `node/handlers.go` |

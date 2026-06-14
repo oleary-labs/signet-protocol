@@ -135,43 +135,23 @@ Participants in a signing session trust initiator-supplied `Parties`, `Threshold
 
 ### H2. No HTTP Request Body Size Limit
 
-**File**: `node/handlers.go` (all POST handlers)
+**File**: `node/node.go` (`limitRequestBody` middleware)
+**Status**: ✅ Resolved (`feat/at-rest-encryption`)
 
-All HTTP handlers use `json.NewDecoder(r.Body)` without `http.MaxBytesReader`:
+All HTTP handlers used `json.NewDecoder(r.Body)` without `http.MaxBytesReader`, allowing DoS via arbitrarily large POST bodies — especially on `/v1/auth`, which is unauthenticated and triggers expensive ZK verification.
 
-```go
-if err := json.NewDecoder(r.Body).Decode(&req); err != nil { ... }
-```
-
-**Impact**: DoS via arbitrarily large POST bodies. An attacker can exhaust memory and CPU during JSON parsing, especially on `/v1/auth` which is unauthenticated and triggers expensive ZK verification.
-
-**Recommendation**: Wrap `r.Body` with `http.MaxBytesReader(w, r.Body, maxSize)` before decoding. Suggested limits:
-- `/v1/auth`: 256KB
-- `/v1/keygen`, `/v1/sign`: 64KB
-- Admin endpoints: 32KB
+**Resolution**: A `limitRequestBody` middleware wraps the mux and applies `http.MaxBytesReader` per path before any handler reads the body: 256 KiB for `/v1/auth` (ZK proofs are sizeable), 32 KiB for `/admin/*`, and a 64 KiB default for everything else (keygen/sign/delegate/keys). Over-limit bodies surface as a decode error (400). GET endpoints carry no body, so the cap is a no-op. Covered by `TestLimitRequestBody` in `node/httplimit_test.go`.
 
 ---
 
 ### H3. SignetGroup Removal Doesn't Check Quorum
 
-**File**: `contracts/contracts/SignetGroup.sol:178`
+**File**: `contracts/contracts/SignetGroup.sol` (`executeRemoval`)
+**Status**: ✅ Resolved (`feat/at-rest-encryption`)
 
-`executeRemoval` removes a node without checking if the remaining active set drops below `threshold`:
+`executeRemoval` removed a node without checking whether the remaining active set would drop below `threshold`. Since `threshold` is immutable after initialization, a quorum-breaking removal permanently bricks the group — all keys unrecoverable.
 
-```solidity
-function executeRemoval(address node) external {
-    RemovalRequest memory req = _removalRequests[node];
-    require(req.executeAfter != 0, "no queued removal");
-    require(block.timestamp >= req.executeAfter, "delay not elapsed");
-    delete _removalRequests[node];
-    _removeFromActive(node);
-    emit NodeRemoved(node);
-}
-```
-
-**Impact**: A group can be rendered permanently inoperable if enough nodes are removed. Since `threshold` is immutable after initialization (`SECURITY-ANALYSIS-OLD.md` §5), there is no recovery path — all keys in the group are lost.
-
-**Recommendation**: Add `require(_activeNodes.length - 1 >= threshold, "removal would break quorum")` before `_removeFromActive`.
+**Resolution**: Added `require(_activeNodes.length > threshold, "removal would break quorum")` before `_removeFromActive`. The node being removed is still counted in `_activeNodes` at this point, so the post-removal size is `length - 1`; `length > threshold` is the equivalent integer form and avoids unsigned underflow. `testIsOperational` was updated to the new invariant, and `testExecuteRemoval_RevertsIfBreaksQuorum` was added. All 74 Foundry tests pass.
 
 ---
 
@@ -214,19 +194,18 @@ If the elected reshare leader (lexicographically smallest member) is down, resha
 
 ### H6. Delegation Token Parent Key Slicing Panic
 
-**File**: `node/delegate.go:120`
+**File**: `node/delegate.go` (`parentKeyFromResolved`)
+**Status**: ✅ Resolved (`feat/at-rest-encryption`)
 
-String slicing assumes `req.KeySuffix` is shorter than `resolved`:
+String slicing assumed `req.KeySuffix` was shorter than `resolved`:
 
 ```go
 parentKeyID = resolved[:len(resolved)-len(req.KeySuffix)-1]
 ```
 
-If `len(req.KeySuffix) >= len(resolved)`, this **panics** with an out-of-bounds slice.
+For a delegation-token session, `validateSessionRequest` returns a `resolved` key_id that is **not** derived from `req.KeySuffix`, so a crafted long suffix made the index negative → **panic (node DoS)**.
 
-**Impact**: Node panic via crafted request. While `req.KeySuffix` is validated as non-empty earlier, there is no length bound check.
-
-**Recommendation**: Add bounds check before slicing, or use `strings.LastIndex(resolved, ":"+req.KeySuffix)` to find the parent key safely.
+**Resolution**: Extracted `parentKeyFromResolved`, which anchors the `":<suffix>"` match at the end of `resolved` (`strings.HasSuffix`) and returns `ok=false` for an empty/absent/oversized suffix; the handler then rejects with `400` instead of slicing by length. This also cleanly blocks delegation-of-delegation. Covered by `TestParentKeyFromResolved` in `node/delegate_test.go`.
 
 ---
 
@@ -404,10 +383,10 @@ The scope lists `ecdsa_session.rs` for *signing* but omits the **key generation 
 | **P0** | Fix delegation token to check key disabled status | Low | `node/handlers.go` |
 | **P0** | ✅ Require admin auth for all groups | Low | `node/handlers.go` |
 | **P1** | Validate coord message params against local on-chain state | Medium | `node/coord.go` |
-| **P1** | Add HTTP request body size limits | Low | `node/handlers.go` |
-| **P1** | Add quorum check to `executeRemoval` | Low | `contracts/SignetGroup.sol` |
+| **P1** | ✅ Add HTTP request body size limits | Low | `node/node.go` |
+| **P1** | ✅ Add quorum check to `executeRemoval` | Low | `contracts/SignetGroup.sol` |
 | **P1** | Sanitize error messages returned to clients | Low | `node/handlers.go` |
-| **P1** | Fix delegation parent key slicing panic | Low | `node/delegate.go` |
+| **P1** | ✅ Fix delegation parent key slicing panic | Low | `node/delegate.go` |
 | **P1** | Implement reshare leader failover | Medium | `node/reshare.go` |
 | **P2** | Deploy behind TLS-terminating proxy | Low | `node/node.go` (or infra) |
 | **P2** | Add rate limiting | Medium | `node/node.go` (or infra) |

@@ -272,11 +272,32 @@ func (n *Node) handleCoordStream(s libp2pnet.Stream) {
 		// Verify request signature against the logical key_id.
 		logicalKeyID := stripKeyNamespace(authKeyID)
 		var msgHash []byte
-		if msg.Type == msgSign && len(msg.SignPayload) == 0 {
-			// Only include message hash for raw hash signing (unscoped).
-			// For scoped signing (payload-based), the client doesn't know
-			// the hash — it's computed by the node from the payload.
-			msgHash = msg.MessageHash
+		if msg.Type == msgSign {
+			if len(msg.SignPayload) > 0 {
+				// Scoped signing: the client signed the request over the
+				// payload hash it computed itself (EIP-712 hashTypedData).
+				// Recompute it from the forwarded payload so the session
+				// signature binds the exact payload — a malicious initiator
+				// cannot substitute a different payload under the same scope.
+				var payload SignPayload
+				if err := json.Unmarshal(msg.SignPayload, &payload); err != nil {
+					n.log.Warn("coord: parse sign payload for auth",
+						zap.String("group_id", msg.GroupID),
+						zap.Error(err))
+					return
+				}
+				hash, err := HashSignPayload(&payload)
+				if err != nil {
+					n.log.Warn("coord: hash sign payload for auth",
+						zap.String("group_id", msg.GroupID),
+						zap.Error(err))
+					return
+				}
+				msgHash = hash
+			} else {
+				// Unscoped signing: raw message hash.
+				msgHash = msg.MessageHash
+			}
 		}
 		if err := verifyRequestSignature(
 			msg.Session.SessionPub, msg.Session.RequestSig,
@@ -457,6 +478,15 @@ func (n *Node) handleCoordStream(s libp2pnet.Stream) {
 					return
 				}
 				msgHashForSign = hash
+			} else if len(msg.SignPayload) > 0 {
+				// Unscoped key must not carry a payload: the session
+				// signature was verified against the payload hash, so
+				// signing msg.MessageHash here would let the initiator
+				// sign an arbitrary hash the client never authorized.
+				n.log.Error("coord: payload provided for unscoped key",
+					zap.String("group_id", msg.GroupID),
+					zap.String("key_id", msg.KeyID))
+				return
 			}
 
 			_, err = n.km.RunSign(sessCtx, SignParams{

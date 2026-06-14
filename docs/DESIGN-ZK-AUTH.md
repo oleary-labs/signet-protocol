@@ -116,7 +116,11 @@ For each keygen or sign operation:
      "timestamp": 1709900000
    }
    ```
-   For sign requests, `message_hash` is also included.
+   For sign requests, `message_hash` is also included. For scoped
+   (payload-based) signing, the client computes the payload hash itself
+   (EIP-712 `hashTypedData` for `scheme=eip712`) and uses that as
+   `message_hash` in the canonical request — binding the session
+   signature to the exact payload, not just the request envelope.
 
 2. **Sign the canonical request** with the session private key:
    ```

@@ -12,7 +12,7 @@
 
 This audit was conducted with the Kimi model to assess the Signet protocol's security posture ahead of a public alpha deployment. The codebase has matured significantly since the original `SECURITY-ANALYSIS-OLD.md` was written. The most critical historical vulnerability — raw JWT forwarding that collapsed the threshold trust model to 1-of-n — has been fixed via ZK proofs bound to ephemeral session keys (commit `a420f5f`). ECDSA signature formatting (EIP-2 low-S normalization and v-byte recovery) is correctly implemented.
 
-Most of the critical and high-severity findings have since been addressed on the `feat/at-rest-encryption` branch: **at-rest storage encryption** (key shards in the Rust KMS, and the node identity key), the **ZK/delegation authorization edge cases** (C3, C4), **admin endpoint access control** (C5), **coord parameter validation** (H1), **smart contract quorum protection** (H4), and the H3/H5/H7 hardening items. The most significant **still-open** item is **H2 (protocol message sender impersonation)** — the per-message `From` field is not yet bound to the authenticated libp2p peer. The Medium tier (TLS, rate limiting, JWKS refresh, etc.) is largely open. See per-finding **Status** lines below.
+All critical (C1–C5) and high-severity (H1–H7) findings have since been addressed on the `feat/at-rest-encryption` branch: **at-rest storage encryption** (key shards in the Rust KMS, and the node identity key), the **ZK/delegation authorization edge cases** (C3, C4), **admin endpoint access control** (C5), **coord parameter validation** (H1), **protocol message sender binding** (H2), **smart contract quorum protection** (H4), and the H3/H5/H7 hardening items — with H6 (reshare leader failover) partially mitigated (manual takeover; automatic failover deferred). The Medium tier (TLS, rate limiting, JWKS refresh, etc.) is largely open. See per-finding **Status** lines below.
 
 This document supersedes `SECURITY-ANALYSIS-OLD.md` as the canonical security assessment for the current codebase.
 
@@ -117,8 +117,8 @@ The reshare coord paths are intentionally unchanged — reshare legitimately cha
 
 ### H2. Protocol Message Sender Impersonation
 
-**File**: `network/session.go:59-73` (`handleStream`), `tss/message.go`
-**Status**: ⚠️ Open — not yet addressed
+**File**: `network/session.go` (`handleStream`), `network/mux.go` (`handleInbound`)
+**Status**: ✅ Resolved (`feat/at-rest-encryption`)
 
 The libp2p `handleStream` handler reads `tss.Message` from a peer stream and enqueues it into the session's incoming channel **without verifying that `msg.From` matches the authenticated transport peer** (`s.Conn().RemotePeer()`). libp2p authenticates the transport layer (you know which peer opened the stream), but the application layer blindly trusts the `From` field embedded in the CBOR message body.
 
@@ -147,18 +147,18 @@ func (sn *SessionNetwork) handleStream(s libp2pnet.Stream) {
 
 The FROST/ECDSA libraries validate cryptographic inputs (serialization lengths, curve points, consistency checks, zero-hash rejection), but they rely on the caller's guarantee that each message was sent by the claimed party. The robustness guarantees assume "up to t malicious **participants**" — not "up to t malicious **streams that can impersonate anyone**". This collapses the effective security from t-of-n to 1-of-n for message injection.
 
-**Recommended fix** (~5 lines in `handleStream`):
+**Resolution**: Both inbound protocol-message handlers now bind `msg.From` to the authenticated libp2p peer and drop any mismatch:
 
 ```go
-expectedFrom := tss.PartyID(s.Conn().RemotePeer().String())
-if msg.From != expectedFrom {
-    stdlog.Printf("[handleStream] session=%s impersonation rejected: claimed=%s actual=%s",
-        sn.sessionID, msg.From, expectedFrom)
-    return
+if expected := tss.PartyID(s.Conn().RemotePeer().String()); msg.From != expected {
+    // log + return (drop)
 }
 ```
 
-This binds every protocol message to the authenticated libp2p peer identity, closing the gap between transport auth and application-layer sender identity.
+- `SessionNetwork.handleStream` (`network/session.go`) — keygen/sign path.
+- `MuxNetwork.handleInbound` (`network/mux.go`) — reshare path (checks `env.Msg.From`).
+
+This is safe for legitimate traffic because a `tss.PartyID` is exactly the peer ID string, and every party sets `From` to its own identity when sending — so legit `From` always equals the authenticated sender. Covered by `TestSessionRejectsForgedSender` and `TestMuxRejectsForgedSender` in `network/host_test.go` (a forged-`From` message is dropped while a correctly-attributed one is delivered); the full keygen/sign/reshare integration suite still passes.
 
 ---
 

@@ -63,6 +63,16 @@ func (sn *SessionNetwork) handleStream(s libp2pnet.Stream) {
 		stdlog.Printf("[handleStream] session=%s self=%s readMessage err: %v", sn.sessionID, sn.self, err)
 		return
 	}
+	// Bind the message's claimed sender to the authenticated libp2p peer. libp2p
+	// authenticates the transport (we know which peer opened the stream), but the
+	// From field in the message body is otherwise attacker-controlled — a peer
+	// could attribute a forged protocol message to another party, corrupting an
+	// honest party's contribution (H2). Reject any mismatch.
+	if expected := tss.PartyID(s.Conn().RemotePeer().String()); msg.From != expected {
+		stdlog.Printf("[handleStream] session=%s impersonation rejected: claimed=%s actual=%s",
+			sn.sessionID, msg.From, expected)
+		return
+	}
 	stdlog.Printf("[handleStream] session=%s self=%s from=%s to=%q round=%d broadcast=%v",
 		sn.sessionID, sn.self, msg.From, msg.To, msg.Round, msg.Broadcast)
 	select {

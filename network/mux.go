@@ -149,6 +149,14 @@ func (mn *MuxNetwork) handleInbound(s libp2pnet.Stream) {
 	if err != nil {
 		return
 	}
+	// Bind the message's claimed sender to the authenticated libp2p peer. The
+	// From field is otherwise attacker-controlled — a peer could attribute a
+	// forged reshare/protocol message to another party (H2). Reject any mismatch.
+	if expected := tss.PartyID(s.Conn().RemotePeer().String()); env.Msg.From != expected {
+		log.Printf("[mux] impersonation rejected: session=%s claimed=%s actual=%s",
+			env.SessionID, env.Msg.From, expected)
+		return
+	}
 	sess := mn.getSession(env.SessionID)
 	if sess == nil {
 		return // session never appeared, drop

@@ -39,6 +39,115 @@ func eventually(d time.Duration, cond func() bool) bool {
 	return cond()
 }
 
+// connectHosts dials h2 from h1 and waits for the connection to establish.
+func connectHosts(t *testing.T, ctx context.Context, h1, h2 *Host) {
+	t.Helper()
+	if err := h1.LibP2PHost().Connect(ctx, peer.AddrInfo{
+		ID:    h2.PeerID(),
+		Addrs: h2.LibP2PHost().Addrs(),
+	}); err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+}
+
+// TestSessionRejectsForgedSender verifies the H2 fix: a SessionNetwork drops a
+// protocol message whose From field does not match the authenticated libp2p
+// peer, but accepts one with the correct From.
+func TestSessionRejectsForgedSender(t *testing.T) {
+	ctx := context.Background()
+	h1, err := NewHost(ctx, mustKey(t), "/ip4/127.0.0.1/tcp/0")
+	if err != nil {
+		t.Fatalf("h1: %v", err)
+	}
+	defer h1.Close()
+	h2, err := NewHost(ctx, mustKey(t), "/ip4/127.0.0.1/tcp/0")
+	if err != nil {
+		t.Fatalf("h2: %v", err)
+	}
+	defer h2.Close()
+	connectHosts(t, ctx, h1, h2)
+
+	const sessID = "sess-1"
+	parties := []tss.PartyID{h1.Self(), h2.Self()}
+	recv, err := NewSessionNetwork(ctx, h2, sessID, parties)
+	if err != nil {
+		t.Fatalf("recv session: %v", err)
+	}
+	defer recv.Close()
+	send, err := NewSessionNetwork(ctx, h1, sessID, parties)
+	if err != nil {
+		t.Fatalf("send session: %v", err)
+	}
+	defer send.Close()
+
+	// Legit message (From == h1) is delivered — confirms the plumbing works.
+	send.Send(&tss.Message{From: h1.Self(), To: h2.Self(), Round: 1, Data: []byte("ok")})
+	select {
+	case msg := <-recv.Incoming():
+		if msg.From != h1.Self() {
+			t.Fatalf("delivered msg has From=%s, want %s", msg.From, h1.Self())
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("legit message was not delivered")
+	}
+
+	// Forged message (From spoofs a third party) must be dropped.
+	send.Send(&tss.Message{From: "forged-party", To: h2.Self(), Round: 1, Data: []byte("evil")})
+	select {
+	case msg := <-recv.Incoming():
+		t.Fatalf("forged message was delivered: From=%s", msg.From)
+	case <-time.After(500 * time.Millisecond):
+		// expected: nothing delivered
+	}
+}
+
+// TestMuxRejectsForgedSender verifies the H2 fix on the reshare (mux) path.
+func TestMuxRejectsForgedSender(t *testing.T) {
+	ctx := context.Background()
+	h1, err := NewHost(ctx, mustKey(t), "/ip4/127.0.0.1/tcp/0")
+	if err != nil {
+		t.Fatalf("h1: %v", err)
+	}
+	defer h1.Close()
+	h2, err := NewHost(ctx, mustKey(t), "/ip4/127.0.0.1/tcp/0")
+	if err != nil {
+		t.Fatalf("h2: %v", err)
+	}
+	defer h2.Close()
+	connectHosts(t, ctx, h1, h2)
+
+	const sessID = "mux-sess-1"
+	parties := []tss.PartyID{h1.Self(), h2.Self()}
+
+	recvMux := NewMuxNetwork(ctx, h2)
+	defer recvMux.Close()
+	recv := recvMux.Session(ctx, sessID, parties)
+	defer recv.Close()
+
+	sendMux := NewMuxNetwork(ctx, h1)
+	defer sendMux.Close()
+	send := sendMux.Session(ctx, sessID, parties)
+	defer send.Close()
+
+	send.Send(&tss.Message{From: h1.Self(), To: h2.Self(), Round: 1, Data: []byte("ok")})
+	select {
+	case msg := <-recv.Incoming():
+		if msg.From != h1.Self() {
+			t.Fatalf("delivered msg has From=%s, want %s", msg.From, h1.Self())
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("legit message was not delivered")
+	}
+
+	send.Send(&tss.Message{From: "forged-party", To: h2.Self(), Round: 1, Data: []byte("evil")})
+	select {
+	case msg := <-recv.Incoming():
+		t.Fatalf("forged message was delivered: From=%s", msg.From)
+	case <-time.After(500 * time.Millisecond):
+		// expected: nothing delivered
+	}
+}
+
 // TestPeerForPartyFallback verifies that PeerForParty resolves an unregistered
 // partyID by decoding it (the map is a cache, partyID == peer.ID string), so
 // eviction never breaks routing.

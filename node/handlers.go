@@ -433,6 +433,10 @@ func (n *Node) handleKeygen(w http.ResponseWriter, r *http.Request) {
 			n.httpError(w, http.StatusBadRequest, "scope must be at least 1 byte (scheme prefix)")
 			return
 		}
+		if err := ValidateScope(scopeBytes); err != nil {
+			n.httpError(w, http.StatusBadRequest, "invalid scope: "+err.Error())
+			return
+		}
 		// Derive key_suffix from scope hash — same scope = same key.
 		scopeHash := sha256.Sum256(scopeBytes)
 		derivedSuffix := hex.EncodeToString(scopeHash[:8])

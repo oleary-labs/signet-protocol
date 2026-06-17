@@ -32,7 +32,7 @@ what payloads the key may sign. Format: `[1-byte scheme][scheme-specific bytes]`
 | Unscoped | `0x00` or absent | — | Signs any hash (backwards compat) |
 | EVM UserOp | `0x01` | `entryPoint (20) \| chainId (8) \| sender (20)` | Extract sender from packed UserOp at known offset, verify match, hash as `keccak256(abi.encode(userOp, entryPoint, chainId))` |
 | Solana tx | `0x02` | `wallet_pubkey (32)` | Extract authority from transaction message, verify match, hash per Solana conventions |
-| EIP-712 domain | `0x03` | `chainId (8) \| verifyingContract (20)` | Extract EIP-712 domain from structured payload, verify chainId + verifyingContract match scope, compute `hashTypedData` and sign |
+| EIP-712 domain+type | `0x03` | `chainId (8) \| verifyingContract (20) \| typeHash (32)` | Extract EIP-712 domain + primary type from structured payload, verify chainId + verifyingContract + `keccak256(encodeType(primaryType))` match scope, require chainId+verifyingContract to be declared in the `EIP712Domain` type, compute `hashTypedData` and sign |
 
 Keys without a scope work exactly as they do today. Keys with a scope
 reject raw hash signing — the caller must provide a structured payload.
@@ -350,15 +350,20 @@ No behavior change — just plumbing the data through.
 - Verify against scope, compute Solana transaction hash
 - Same coord message pattern as EVM
 
-### Step 8: EIP-712 Domain Scheme (x402 Payments, Permit2, etc.)
+### Step 8: EIP-712 Domain+Type Scheme (x402 Payments, Permit2, etc.)
 
-- Implement scheme `0x03` (EIP-712 domain binding)
-- Scope format: `0x03 | chainId (8 bytes, uint64 BE) | verifyingContract (20 bytes)` — 29 bytes total
+- Implement scheme `0x03` (EIP-712 domain + primary-type binding)
+- Scope format: `0x03 | chainId (8 bytes, uint64 BE) | verifyingContract (20 bytes) | typeHash (32 bytes)` — 61 bytes total
+- `typeHash = keccak256(encodeType(primaryType))` — the standard EIP-712 type hash, which commits to the primary type's *name and exact field layout* (e.g. `TransferWithAuthorization(address from,address to,uint256 value,uint256 validAfter,uint256 validBefore,bytes32 nonce)`). Binding the typeHash rather than the bare type name is collision-resistant and is the same value the verifying contract uses.
 - Caller sends structured EIP-712 payload (domain + types + message)
-- Node extracts `chainId` and `verifyingContract` from the payload's domain fields
-- Byte comparison against the scope — no ABI encoding or keccak needed
+- Node verification, in order:
+  1. Require `chainId` and `verifyingContract` to be declared fields in the payload's `EIP712Domain` type. If either is absent from the type list it is **not** part of the signed domain separator, so checking the domain struct field would be meaningless — reject. (Closes the checked-vs-signed mismatch.)
+  2. Extract `chainId` and `verifyingContract` from the domain, byte-compare against the scope.
+  3. Compute `keccak256(encodeType(payload.primaryType))` and byte-compare against the scope's typeHash.
+  4. Reject an empty/zero `verifyingContract` (defends against `HexToAddress("") → 0x0` fail-open).
 - Node computes `hashTypedData` (EIP-712 struct hash + domain separator → keccak256) and signs
-- The typed data structure (primaryType, types, message) is **unconstrained** — only the domain is checked
+- The primary **type** and **domain** are now constrained; the message **field values** (`to`, `value`, …) remain unconstrained — value-level policy is an app / smart-wallet-layer concern (and the motivation for scheme `0x01`).
+- The domain's `name` / `version` / `salt` are **not** bound. They are fixed by the verifying contract's own domain separator, so a payload with a mismatched `name`/`version` only yields a signature that verifies against *no* real contract at the bound `(chainId, verifyingContract)` — there is nothing useful to forge. The fields that determine *which contract method* a signature can drive (`chainId`, `verifyingContract`, primary type) are the ones bound.
 
 **x402 compatibility.** The x402 protocol defines three EVM payment mechanisms, all compatible with this scope:
 
@@ -368,16 +373,25 @@ No behavior change — just plumbing the data through.
 | Permit2 (`permitWitnessTransferFrom`) | Permit2 contract (`0x0000...22D4...`) | `PermitWitnessTransferFrom{...}` + `Witness{to,validAfter}` | `chainId + Permit2 address` |
 | ERC-7710 (delegation) | N/A (uses opaque permissionContext) | Not EIP-712 — payer grants a smart-account delegation out-of-band; facilitator redeems it via `delegationManager.redeemDelegations()` | Not applicable — no Signet signature at payment time. The delegation is established beforehand (e.g. via EIP-7715 session key provisioning, which *would* use scope `0x01`). |
 
-A single key scoped to `chainId:8453 + USDC:0x8335...` can sign EIP-3009
-authorizations on Base but cannot sign Permit2 authorizations (different
-verifyingContract) or authorizations on other chains (different chainId).
-To support both EIP-3009 and Permit2, create two sub-keys with different scopes.
+A single key scoped to `chainId:8453 + USDC:0x8335... + TransferWithAuthorization`
+can sign EIP-3009 authorizations on Base but cannot sign Permit2
+authorizations (different verifyingContract), authorizations on other
+chains (different chainId), **or an EIP-2612 `permit` on the very same
+USDC contract** (different typeHash). The last case is the important
+tightening: USDC exposes both `transferWithAuthorization` and `permit`
+under one domain, so domain-only binding would let a transfer-scoped key
+sign a `permit(spender, value=max)` and grant an unlimited allowance.
+Type binding closes that. To support both EIP-3009 and Permit2 (or both
+transfer and permit), create separate sub-keys with different scopes.
 
 **Security property:** the key can only produce signatures valid under a
-specific EIP-712 domain. It cannot sign arbitrary messages, raw hashes,
-or typed data for a different contract. The `from` field in EIP-3009 is
-implicitly the key's own address — the token contract verifies
-`ecrecover(sig) == from`.
+specific EIP-712 domain **and a specific primary type**. It cannot sign
+arbitrary messages, raw hashes, typed data for a different contract, or a
+different typed-data method on the same contract. The `from` field in
+EIP-3009 is implicitly the key's own address — the token contract
+verifies `ecrecover(sig) == from`. The key does **not** constrain the
+message field values (recipient, amount); that is enforced one layer up
+(delegation-token holder policy and/or the smart wallet in scheme `0x01`).
 
 **Verified in WAIaaS POC:** The full EIP-3009 flow works end-to-end —
 Google OAuth → Signet Robust ECDSA keygen → EIP-712 typed data signing →
@@ -397,6 +411,8 @@ Tested against Nansen's x402 API ($0.01/query, USDC on Base mainnet).
 
 - **Scope enforcement is distributed** — every signing participant independently verifies the scope against the payload. No single node can bypass it.
 - **No raw hash signing for scoped keys** — the hash is always computed by the node from the structured payload. A malicious caller cannot submit an arbitrary hash.
+- **Method binding (EIP-712)** — a `0x03` scope pins the primary type via its EIP-712 typeHash, not just the domain. A key authorized for one typed-data method (e.g. `TransferWithAuthorization`) cannot sign a different method on the same contract (e.g. `permit`). Scope binds *what kind* of message, not just *which contract*.
+- **Checked fields are signed fields (EIP-712)** — `chainId` and `verifyingContract` must be declared in the `EIP712Domain` type, guaranteeing the values the scope checks are the values committed to in the signed domain separator. No payload can pass the scope check while signing a separator that omits them.
 - **Delegation tokens are self-validating** — any node can verify the FROST signature without external calls.
 - **Revocation is deletion** — no separate revocation registry to manage. Delete the key, the token is dead.
 - **Backwards compatible** — unscoped keys work exactly as before. Scope is opt-in at keygen time.

@@ -33,7 +33,7 @@ func RunCorrectness(ctx context.Context, clients []*Client, newKeyID func() stri
 	const testChainID = uint64(1)
 	testContract := common.HexToAddress("0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48") // USDC mainnet
 	testTo := common.HexToAddress("0x1111111111111111111111111111111111111111")
-	testScopeHex := BuildEIP712Scope(testChainID, testContract)
+	testScopeHex := BuildEIP712Scope(testChainID, testContract, transferTypeHash())
 
 	tests := []correctnessTest{
 		{
@@ -672,7 +672,7 @@ func BuildKeyPoolWithCurve(ctx context.Context, ring *ClientRing, n int, newKeyI
 // BuildScopedKeyPool pre-generates n EIP-712 scoped ECDSA keys.
 func BuildScopedKeyPool(ctx context.Context, ring *ClientRing, n int, newKeyID func() string) (*KeyPool, error) {
 	pool := &KeyPool{}
-	scopeHex := BuildEIP712Scope(scopedTestChainID, scopedTestContract)
+	scopeHex := BuildEIP712Scope(scopedTestChainID, scopedTestContract, transferTypeHash())
 	fmt.Printf("  building scoped key pool (%d keys, %d nodes)...", n, ring.Len())
 	for i := 0; i < n; i++ {
 		c := ring.Next()

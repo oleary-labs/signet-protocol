@@ -288,12 +288,12 @@ The function assumes the issuer starts with `https://` and does ad-hoc string sp
 
 ### M6. EIP-712 Scope: `HexToAddress` Silently Returns Zero
 
-**File**: `node/scope.go:112`
-**Status**: ⚠️ Open — not yet addressed
+**File**: `node/scope.go` (`verifyEIP712Scope`)
+**Status**: ✅ Resolved (`main`)
 
-`common.HexToAddress(typedData.Domain.VerifyingContract)` silently returns the zero address on invalid input. If the scope also encodes a zero address, a malformed payload could pass verification.
+`common.HexToAddress(typedData.Domain.VerifyingContract)` silently returns the zero address on invalid input. If the scope also encoded a zero address, a malformed payload could pass verification.
 
-**Recommendation**: Validate that `VerifyingContract` is a valid hex address before converting, or reject zero addresses in scopes.
+**Resolution**: `verifyEIP712Scope` now rejects an empty `verifyingContract` and rejects the zero address after conversion (so malformed/empty input can no longer fail open). This landed alongside a broader scope-tightening: `0x03` scopes now also bind the EIP-712 **primary type** via `keccak256(encodeType(primaryType))` (scope grew 29→61 bytes), and require `chainId`/`verifyingContract` to be declared in the `EIP712Domain` type (closing a checked-vs-signed mismatch). A new `ValidateScope` is run at keygen so malformed scopes fail fast. Covered by `TestScopeRejectsZeroContract`, `TestScopeRejectsDifferentTypeSameDomain`, `TestScopeRejectsUndeclaredDomainFields`, `TestBuildEIP712ScopeRejectsBadTypeHash` in `node/scope_test.go`. **Note:** this is a breaking scope-format change — SDK/clients must build the 61-byte typed scope (see `docs/DESIGN-SCOPED-SUBKEYS.md`).
 
 ---
 

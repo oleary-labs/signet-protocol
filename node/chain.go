@@ -6,6 +6,7 @@ import (
 	"math/big"
 	"reflect"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/ethereum/go-ethereum"
@@ -31,16 +32,30 @@ const (
 		{"name":"threshold","type":"function","inputs":[],"outputs":[{"name":"","type":"uint256"}],"stateMutability":"view"},
 		{"name":"getIssuers","type":"function","inputs":[],"outputs":[{"name":"","type":"tuple[]","components":[{"name":"issuer","type":"string"},{"name":"clientIds","type":"string[]"}]}],"stateMutability":"view"},
 		{"name":"getAuthKeys","type":"function","inputs":[],"outputs":[{"name":"","type":"bytes[]"}],"stateMutability":"view"},
+		{"name":"getAuthResolver","type":"function","inputs":[],"outputs":[{"name":"","type":"tuple","components":[{"name":"chainId","type":"uint64"},{"name":"resolver","type":"address"},{"name":"requireCanonicalSubject","type":"bool"}]}],"stateMutability":"view"},
 		{"name":"NodeJoined","type":"event","inputs":[{"name":"node","type":"address","indexed":true}],"anonymous":false},
 		{"name":"NodeRemoved","type":"event","inputs":[{"name":"node","type":"address","indexed":true}],"anonymous":false},
 		{"name":"IssuerAdded","type":"event","inputs":[{"name":"h","type":"bytes32","indexed":true},{"name":"issuer","type":"string","indexed":false},{"name":"clientIds","type":"string[]","indexed":false}],"anonymous":false},
 		{"name":"IssuerRemoved","type":"event","inputs":[{"name":"h","type":"bytes32","indexed":true},{"name":"issuer","type":"string","indexed":false}],"anonymous":false},
 		{"name":"AuthKeyAdded","type":"event","inputs":[{"name":"keyHash","type":"bytes32","indexed":true},{"name":"pubkey","type":"bytes","indexed":false}],"anonymous":false},
 		{"name":"AuthKeyRemoved","type":"event","inputs":[{"name":"keyHash","type":"bytes32","indexed":true},{"name":"pubkey","type":"bytes","indexed":false}],"anonymous":false},
+		{"name":"AuthResolverSet","type":"event","inputs":[{"name":"chainId","type":"uint64","indexed":false},{"name":"resolver","type":"address","indexed":true},{"name":"requireCanonicalSubject","type":"bool","indexed":false}],"anonymous":false},
 		{"name":"ReshareRequested","type":"event","inputs":[{"name":"requestedBy","type":"address","indexed":true}],"anonymous":false}
 	]`
 
+	// resolverABIJSON is the ISignetAuthResolver interface the node calls to
+	// authorize + resolve a SIWE-recovered address (the on-chain auth lane).
+	resolverABIJSON = `[
+		{"name":"resolve","type":"function","inputs":[{"name":"account","type":"address"}],"outputs":[{"name":"ok","type":"bool"},{"name":"subject","type":"bytes32"}],"stateMutability":"view"},
+		{"name":"typeAndVersion","type":"function","inputs":[],"outputs":[{"name":"","type":"string"}],"stateMutability":"pure"}
+	]`
+
 	defaultPollInterval = 12 * time.Second
+
+	// maxResolverLag bounds how stale a client-pinned block may be for the
+	// resolver read (R-3): head - maxResolverLag <= blockNum <= head. It is also
+	// the worst-case revocation latency at the auth instant (R-5).
+	maxResolverLag uint64 = 30
 )
 
 // ChainClient watches the factory and group contracts for membership changes
@@ -51,12 +66,21 @@ type ChainClient struct {
 	myAddr       common.Address
 	factABI      abi.ABI
 	grpABI       abi.ABI
+	resolverABI  abi.ABI
 	log          *zap.Logger
 	n            *Node
 	pollInterval time.Duration
 
 	lastBlock uint64
 	stopCh    chan struct{}
+
+	// Cross-chain RPC reach for on-chain auth resolvers. The home chain (the
+	// one `eth` points at) is registered under homeChainID; other chains are
+	// dialed lazily from chainRPCs and cached in resolverClients.
+	homeChainID     uint64
+	chainRPCs       map[uint64]string
+	clientsMu       sync.Mutex
+	resolverClients map[uint64]*ethclient.Client
 }
 
 // newChainClient dials the Ethereum RPC and initialises the chain client.
@@ -76,6 +100,24 @@ func newChainClient(cfg *Config, h *network.Host, n *Node, log *zap.Logger) (*Ch
 		eth.Close()
 		return nil, fmt.Errorf("parse group ABI: %w", err)
 	}
+	resolverABI, err := abi.JSON(strings.NewReader(resolverABIJSON))
+	if err != nil {
+		eth.Close()
+		return nil, fmt.Errorf("parse resolver ABI: %w", err)
+	}
+
+	// Detect the home chain's id so resolver reads targeting it reuse `eth`
+	// rather than re-dialing. Best-effort: on failure the home chain simply is
+	// not pre-registered and a same-chain resolver would require an explicit
+	// chain_rpcs entry.
+	var homeChainID uint64
+	chainIDCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	if id, err := eth.ChainID(chainIDCtx); err != nil {
+		log.Warn("chain: detect home chain id", zap.Error(err))
+	} else {
+		homeChainID = id.Uint64()
+	}
+	cancel()
 
 	pub := h.LibP2PHost().Peerstore().PubKey(h.PeerID())
 	addr, err := network.EthereumAddress(pub)
@@ -89,17 +131,55 @@ func newChainClient(cfg *Config, h *network.Host, n *Node, log *zap.Logger) (*Ch
 		poll = time.Duration(cfg.ChainPollSecs) * time.Second
 	}
 
+	chainRPCs := make(map[uint64]string, len(cfg.ChainRPCs))
+	for id, url := range cfg.ChainRPCs {
+		chainRPCs[id] = url
+	}
+
+	resolverClients := make(map[uint64]*ethclient.Client)
+	if homeChainID != 0 {
+		resolverClients[homeChainID] = eth
+	}
+
 	return &ChainClient{
-		eth:          eth,
-		factory:      common.HexToAddress(cfg.FactoryAddress),
-		myAddr:       common.Address(addr),
-		factABI:      factABI,
-		grpABI:       grpABI,
-		log:          log,
-		n:            n,
-		pollInterval: poll,
-		stopCh:       make(chan struct{}),
+		eth:             eth,
+		factory:         common.HexToAddress(cfg.FactoryAddress),
+		myAddr:          common.Address(addr),
+		factABI:         factABI,
+		grpABI:          grpABI,
+		resolverABI:     resolverABI,
+		log:             log,
+		n:               n,
+		pollInterval:    poll,
+		stopCh:          make(chan struct{}),
+		homeChainID:     homeChainID,
+		chainRPCs:       chainRPCs,
+		resolverClients: resolverClients,
 	}, nil
+}
+
+// clientForChain returns an ethclient for the given chainId, lazily dialing and
+// caching it from chain_rpcs config. The home chain (and any chain dialed
+// earlier) is served from the cache. Returns an error if the chain is not
+// configured, so a resolver read fails closed rather than reading the wrong
+// chain.
+func (c *ChainClient) clientForChain(chainID uint64) (*ethclient.Client, error) {
+	c.clientsMu.Lock()
+	defer c.clientsMu.Unlock()
+
+	if cl, ok := c.resolverClients[chainID]; ok {
+		return cl, nil
+	}
+	url, ok := c.chainRPCs[chainID]
+	if !ok || url == "" {
+		return nil, fmt.Errorf("no RPC configured for chain %d", chainID)
+	}
+	cl, err := ethclient.Dial(url)
+	if err != nil {
+		return nil, fmt.Errorf("dial chain %d rpc: %w", chainID, err)
+	}
+	c.resolverClients[chainID] = cl
+	return cl, nil
 }
 
 // loadGroups queries the factory for all groups this node is active in and
@@ -191,6 +271,15 @@ func (c *ChainClient) buildGroupInfo(ctx context.Context, grpAddr common.Address
 		c.n.auth.SetAuthKeys(hexGrp, rawAuthKeys)
 	}
 
+	// Load the on-chain auth resolver binding (the auth lane). getAuthResolver
+	// is new; older group deployments revert/return-empty, so treat failure as
+	// "no resolver" rather than failing group load.
+	if cfg, err := c.callGetAuthResolver(ctx, grpAddr); err != nil {
+		c.log.Debug("chain: getAuthResolver", zap.String("group", grpAddr.Hex()), zap.Error(err))
+	} else {
+		c.n.auth.SetAuthResolver(strings.ToLower(grpAddr.Hex()), cfg)
+	}
+
 	return &GroupInfo{
 		Threshold: int(thresh.Int64()),
 		Members:   ids,
@@ -218,9 +307,20 @@ func (c *ChainClient) start() {
 	go c.watchLoop()
 }
 
-// close stops the polling loop and releases the eth client.
+// close stops the polling loop and releases all eth clients (home + any
+// lazily-dialed resolver chains).
 func (c *ChainClient) close() {
 	close(c.stopCh)
+	c.clientsMu.Lock()
+	for id, cl := range c.resolverClients {
+		// The home client is the same handle as c.eth; close it once below.
+		if id == c.homeChainID {
+			continue
+		}
+		cl.Close()
+	}
+	c.resolverClients = nil
+	c.clientsMu.Unlock()
 	c.eth.Close()
 }
 
@@ -336,13 +436,14 @@ func (c *ChainClient) pollGroupEvents(ctx context.Context, grpAddr common.Addres
 	issuerRemovedID := c.grpABI.Events["IssuerRemoved"].ID
 	authKeyAddedID := c.grpABI.Events["AuthKeyAdded"].ID
 	authKeyRemovedID := c.grpABI.Events["AuthKeyRemoved"].ID
+	authResolverSetID := c.grpABI.Events["AuthResolverSet"].ID
 	reshareRequestedID := c.grpABI.Events["ReshareRequested"].ID
 
 	query := ethereum.FilterQuery{
 		FromBlock: new(big.Int).SetUint64(from),
 		ToBlock:   new(big.Int).SetUint64(to),
 		Addresses: []common.Address{grpAddr},
-		Topics:    [][]common.Hash{{joinedID, removedID, issuerAddedID, issuerRemovedID, authKeyAddedID, authKeyRemovedID, reshareRequestedID}},
+		Topics:    [][]common.Hash{{joinedID, removedID, issuerAddedID, issuerRemovedID, authKeyAddedID, authKeyRemovedID, authResolverSetID, reshareRequestedID}},
 	}
 	logs, err := c.eth.FilterLogs(ctx, query)
 	if err != nil {
@@ -483,6 +584,21 @@ func (c *ChainClient) pollGroupEvents(ctx context.Context, grpAddr common.Addres
 			h := [32]byte(lg.Topics[1])
 			c.n.auth.RemoveAuthKey(hexGrp, h)
 			c.log.Info("chain: auth key removed", zap.String("group", hexGrp))
+
+		case authResolverSetID:
+			// The binding changed (timelocked executeAuthResolver fired). Re-read
+			// the getter for the authoritative value rather than decoding the
+			// event, mirroring how the binding is loaded at startup.
+			if cfg, err := c.callGetAuthResolver(ctx, grpAddr); err != nil {
+				c.log.Warn("chain: getAuthResolver on AuthResolverSet",
+					zap.String("group", hexGrp), zap.Error(err))
+			} else {
+				c.n.auth.SetAuthResolver(hexGrp, cfg)
+				c.log.Info("chain: auth resolver set",
+					zap.String("group", hexGrp),
+					zap.String("resolver", cfg.Resolver.Hex()),
+					zap.Uint64("chainId", cfg.ChainID))
+			}
 
 		case reshareRequestedID:
 			// Manual reshare request from the group manager.
@@ -653,6 +769,125 @@ func (c *ChainClient) callThreshold(ctx context.Context, grpAddr common.Address)
 		return nil, err
 	}
 	return results[0].(*big.Int), nil
+}
+
+// callGetAuthResolver reads the group's on-chain auth resolver binding. A single
+// tuple output → go-ethereum decodes via reflect, so fields are read by name.
+func (c *ChainClient) callGetAuthResolver(ctx context.Context, grpAddr common.Address) (ResolverConfig, error) {
+	data, err := c.grpABI.Pack("getAuthResolver")
+	if err != nil {
+		return ResolverConfig{}, err
+	}
+	result, err := c.eth.CallContract(ctx, ethereum.CallMsg{To: &grpAddr, Data: data}, nil)
+	if err != nil {
+		return ResolverConfig{}, err
+	}
+	results, err := c.grpABI.Unpack("getAuthResolver", result)
+	if err != nil {
+		return ResolverConfig{}, err
+	}
+	if len(results) == 0 {
+		return ResolverConfig{}, fmt.Errorf("empty getAuthResolver result")
+	}
+	v := reflect.ValueOf(results[0])
+	if v.Kind() != reflect.Struct {
+		return ResolverConfig{}, fmt.Errorf("unexpected type %T for getAuthResolver result", results[0])
+	}
+	resolver, ok := v.FieldByName("Resolver").Interface().(common.Address)
+	if !ok {
+		return ResolverConfig{}, fmt.Errorf("unexpected resolver field type")
+	}
+	return ResolverConfig{
+		ChainID:                 v.FieldByName("ChainId").Uint(),
+		Resolver:                resolver,
+		RequireCanonicalSubject: v.FieldByName("RequireCanonicalSubject").Bool(),
+	}, nil
+}
+
+// callResolve performs the pinned-block resolver read (§10 R-2/R-3). It dials
+// the resolver's chain, verifies the client-pinned block is fresh and its hash
+// canonical in this node's own view, then eth_calls resolve(account) at exactly
+// that block with from = 0x0 — so every honest node reads identical state and
+// a resolver branching on msg.sender cannot split the vote. Fails closed on any
+// freshness/hash mismatch.
+func (c *ChainClient) callResolve(
+	ctx context.Context,
+	chainID uint64,
+	resolver, account common.Address,
+	blockNum uint64,
+	blockHash common.Hash,
+) (bool, [32]byte, error) {
+	var zero [32]byte
+	cl, err := c.clientForChain(chainID)
+	if err != nil {
+		return false, zero, err
+	}
+
+	head, err := cl.BlockNumber(ctx)
+	if err != nil {
+		return false, zero, fmt.Errorf("chain %d head: %w", chainID, err)
+	}
+	if blockNum > head {
+		return false, zero, fmt.Errorf("pinned block %d ahead of head %d", blockNum, head)
+	}
+	if head-blockNum > maxResolverLag {
+		return false, zero, fmt.Errorf("pinned block %d too stale (head %d, max lag %d)", blockNum, head, maxResolverLag)
+	}
+
+	header, err := cl.HeaderByNumber(ctx, new(big.Int).SetUint64(blockNum))
+	if err != nil {
+		return false, zero, fmt.Errorf("header %d on chain %d: %w", blockNum, chainID, err)
+	}
+	if header.Hash() != blockHash {
+		return false, zero, fmt.Errorf("pinned block hash mismatch at %d: have %s, want %s",
+			blockNum, header.Hash().Hex(), blockHash.Hex())
+	}
+
+	data, err := c.resolverABI.Pack("resolve", account)
+	if err != nil {
+		return false, zero, err
+	}
+	out, err := cl.CallContract(ctx, ethereum.CallMsg{To: &resolver, Data: data}, new(big.Int).SetUint64(blockNum))
+	if err != nil {
+		return false, zero, fmt.Errorf("resolve eth_call: %w", err)
+	}
+	results, err := c.resolverABI.Unpack("resolve", out)
+	if err != nil {
+		return false, zero, err
+	}
+	if len(results) != 2 {
+		return false, zero, fmt.Errorf("unexpected resolve result arity %d", len(results))
+	}
+	ok, _ := results[0].(bool)
+	subject, _ := results[1].([32]byte)
+	return ok, subject, nil
+}
+
+// callResolverTypeAndVersion reads the resolver's typeAndVersion() so the node
+// can refuse unknown versions (R-2). typeAndVersion is pure, so the read is not
+// block-pinned.
+func (c *ChainClient) callResolverTypeAndVersion(ctx context.Context, chainID uint64, resolver common.Address) (string, error) {
+	cl, err := c.clientForChain(chainID)
+	if err != nil {
+		return "", err
+	}
+	data, err := c.resolverABI.Pack("typeAndVersion")
+	if err != nil {
+		return "", err
+	}
+	out, err := cl.CallContract(ctx, ethereum.CallMsg{To: &resolver, Data: data}, nil)
+	if err != nil {
+		return "", fmt.Errorf("typeAndVersion eth_call: %w", err)
+	}
+	results, err := c.resolverABI.Unpack("typeAndVersion", out)
+	if err != nil {
+		return "", err
+	}
+	if len(results) == 0 {
+		return "", fmt.Errorf("empty typeAndVersion result")
+	}
+	s, _ := results[0].(string)
+	return s, nil
 }
 
 // --- Slice helpers ---

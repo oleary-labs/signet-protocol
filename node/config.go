@@ -18,6 +18,20 @@ type Config struct {
 	FactoryAddress string   `yaml:"factory_address"`
 	KMSSocket      string   `yaml:"kms_socket"`      // Unix socket path to external KMS; empty = in-process tss
 	ChainPollSecs  int      `yaml:"chain_poll_secs"` // chain event poll interval in seconds; 0 = default (12)
+
+	// ChainRPCs maps a chainId to an RPC URL for chains OTHER than the home
+	// chain (the one EthRPC points at). Used by the on-chain auth resolver: a
+	// group's resolver may live on a different chain, and a node serving such a
+	// group must have trusted RPC reach to that chain. The home chain is
+	// registered automatically from EthRPC (its chainId is detected at dial
+	// time), so it need not appear here.
+	ChainRPCs map[uint64]string `yaml:"chain_rpcs"`
+
+	// SIWEDomain is the expected ERC-4361 `domain` field for onchain_resolver
+	// auth. It MUST be set for that scheme to be usable: pinning the domain is
+	// what stops a SIWE signature minted for another site from opening a Signet
+	// session (R-4). If empty, the onchain_resolver scheme is rejected.
+	SIWEDomain string `yaml:"siwe_domain"`
 }
 
 // LoadConfig reads a YAML config file and applies defaults for missing fields.

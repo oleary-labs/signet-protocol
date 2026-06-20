@@ -15,6 +15,8 @@ require (
 	github.com/libp2p/go-libp2p-kad-dht v0.37.1
 	github.com/multiformats/go-multiaddr v0.16.1
 	github.com/oleary-labs/signet-circuits/packages/go v0.3.0
+	github.com/relvacode/iso8601 v1.1.1-0.20210511065120-b30b151cc433
+	github.com/spruceid/siwe-go v0.2.1
 	github.com/stretchr/testify v1.11.1
 	go.etcd.io/bbolt v1.4.3
 	go.uber.org/zap v1.27.1
@@ -41,6 +43,7 @@ require (
 	github.com/crate-crypto/go-eth-kzg v1.4.0 // indirect
 	github.com/davecgh/go-spew v1.1.2-0.20180830191138-d8f796af33cc // indirect
 	github.com/davidlazar/go-crypto v0.0.0-20200604182044-b73af7476f6c // indirect
+	github.com/dchest/uniuri v1.2.0 // indirect
 	github.com/deckarep/golang-set/v2 v2.6.0 // indirect
 	github.com/dunglas/httpsfv v1.1.0 // indirect
 	github.com/ethereum/c-kzg-4844/v2 v2.1.6 // indirect

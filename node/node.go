@@ -444,13 +444,21 @@ func randomNonce() (string, error) {
 	return hex.EncodeToString(b), nil
 }
 
-// stripKeyNamespace removes the internal "oauth:" or "authkey:" prefix from a
-// resolved key_id, returning the logical key_id that clients sign over.
+// stripKeyNamespace removes the internal "oauth:", "authkey:", or
+// "resolver:<addr>:" prefix from a resolved key_id, returning the logical
+// key_id that clients sign over.
 func stripKeyNamespace(keyID string) string {
 	if after, ok := strings.CutPrefix(keyID, "oauth:"); ok {
 		return after
 	}
 	if after, ok := strings.CutPrefix(keyID, "authkey:"); ok {
+		return after
+	}
+	if after, ok := strings.CutPrefix(keyID, "resolver:"); ok {
+		// after == "<resolverAddr>:<subject>[:<suffix>]"; drop the resolver addr.
+		if _, rest, found := strings.Cut(after, ":"); found {
+			return rest
+		}
 		return after
 	}
 	return keyID

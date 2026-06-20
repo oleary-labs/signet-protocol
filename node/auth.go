@@ -540,6 +540,16 @@ type AuthProof struct {
 
 	// Delegation token (delegation path only).
 	DelegationToken string `cbor:"17,keyasint,omitempty"`
+
+	// On-chain auth resolver path. Participants re-run SIWE recovery AND the
+	// resolver eth_call at the SAME pinned block from these fields, so every
+	// honest node reads identical state and derives the subject independently
+	// (the initiator's claim is never trusted). The resolver address + chainId
+	// come from group config, not the proof (§3).
+	SiweMessage   string `cbor:"18,keyasint,omitempty"`
+	SiweSignature string `cbor:"19,keyasint,omitempty"`
+	BlockNumber   uint64 `cbor:"20,keyasint,omitempty"`
+	BlockHash     []byte `cbor:"21,keyasint,omitempty"` // 32-byte canonical block hash
 }
 
 // SessionAuth is a lightweight credential carried in keygen/sign/delegate

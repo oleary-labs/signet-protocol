@@ -41,6 +41,13 @@ type SessionInfo struct {
 	// key ID. Sign requests auto-resolve to this key without needing
 	// key_suffix. Empty for non-delegation sessions.
 	DelegatedKeyID string
+
+	// On-chain auth resolver sessions: Subject is the resolved canonical
+	// principal (hex), ResolverAddr is the resolver contract address (lowercase
+	// hex). Together they namespace keys as resolver:<ResolverAddr>:<Subject>.
+	// Both empty for non-resolver sessions.
+	Subject      string
+	ResolverAddr string
 }
 
 // SessionStore is a thread-safe in-memory cache mapping compressed session

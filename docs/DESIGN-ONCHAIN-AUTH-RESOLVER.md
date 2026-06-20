@@ -98,9 +98,12 @@ is group config. Otherwise a malicious initiator points the check at a resolver
 it controls. (Same principle as the H1 fix: the verification target is config,
 not caller-supplied.)
 
-Governance follows the existing issuer model (`onlyManager`, immediate). If
-auth-provider changes warrant a delay, reuse the node-removal `removalDelay`
-pattern — a decision, not a requirement.
+Governance follows the existing issuer model (`onlyManager`), but with a
+**mandatory timelock** on `setAuthResolver` (reuse the node-removal
+`removalDelay` pattern). The resolver's blast radius is strictly larger than an
+issuer's — it authorizes addresses unilaterally, whereas a rogue issuer still
+needs the external IdP to actually sign a token — so the delay is a requirement,
+not a decision. See §10 R-1.
 
 ---
 
@@ -113,7 +116,9 @@ New `/v1/auth` branch, `scheme: "onchain_resolver"`:
   "scheme": "onchain_resolver",
   "siwe_message": "<ERC-4361 message text>",   // binds session_pub, nonce, domain, expiry
   "siwe_signature": "0x...",
-  "session_pub": "02..."
+  "session_pub": "02...",
+  "block_number": 12345678,                    // client-pinned recent block for the resolver read (§10 R-3)
+  "block_hash": "0x..."                        // canonical hash at that height — reorg-safe pin
 }
 ```
 
@@ -125,7 +130,11 @@ Each node, independently:
    *(Node-side, scheme-independent.)*
 2. Load `(chainId, resolver)` from the group contract (cached/polled like
    issuers and membership).
-3. `eth_call resolver.resolve(recoveredAddr)` on `chainId` → `(ok, subject)`.
+3. Validate the client-pinned block: `block_hash` is canonical at `block_number`
+   in this node's own view, and `head - maxLag ≤ block_number ≤ head`. Fail
+   closed (abstain) if not — the client retries against a fresher block. Then
+   `eth_call resolver.resolve(recoveredAddr)` **at that block, with
+   `from = 0x0`**, on `chainId` → `(ok, subject)`. (§10 R-2, R-3.)
 4. If `!ok` → reject. Else create a session keyed by `session_pub`, namespace
    `resolver:<subject>` (see §5 for `subject == 0`).
 
@@ -155,7 +164,9 @@ slowly; this matches how membership/issuers are already polled).
 - **Versioning.** Nodes check `typeAndVersion()` and refuse unknown versions.
 - **Determinism.** `resolve` must be a pure function of chain state at a block
   (non-reverting view, no oracles with per-call randomness), so independent
-  nodes agree.
+  nodes agree. The node enforces its half too: all nodes read at the same
+  client-pinned block and with `from = 0x0` (§10 R-2, R-3), and the accepted
+  `typeAndVersion()` set is group config, never per-node.
 
 ---
 
@@ -251,12 +262,20 @@ resolver at it. The node code is identical across all adapters.
 2. **Subject collision across adapters.** If a group ever swaps adapters, do
    subjects remain stable / namespaced per-resolver? Likely namespace as
    `resolver:<resolverAddr>:<subject>` to avoid cross-provider collision.
+   **Resolved (§10 R-1):** adopt that namespacing — it also closes the
+   resolver-swap hijack, at the cost of treating resolver upgrades as key
+   migrations.
 3. **Block-lag tolerance window.** Concrete value / policy for cross-node
-   agreement on the resolver read.
+   agreement on the resolver read. **Resolved (§10 R-3):** client-pinned
+   `(block_number, block_hash)` plus a `head - maxLag` freshness window;
+   `maxLag` remains the one value to set.
 4. **Delay on resolver changes.** Immediate (`onlyManager`) like issuers, or
    delayed like node removal? Higher-stakes than an issuer swap, arguably.
+   **Resolved (§10 R-1):** delayed — the timelock is mandatory.
 5. **Caching.** Per-node cache TTL for `resolve` results vs. revocation
    latency (a revoked credential should stop opening sessions promptly).
+   **Reframed (§10 R-5):** the load-bearing quantity is the revocation SLA
+   (= session TTL); caching is just an optimization bounded under it.
 6. **Capability advertisement (§6).** Where do nodes declare supported
    networks — an on-chain field in the factory node registry, or off-chain node
    info/gossip? And does group membership *enforce* `resolver-chains ⊆
@@ -266,7 +285,128 @@ resolver at it. The node code is identical across all adapters.
 
 ---
 
-## 10. Sources
+## 10. Pressure-test findings & hardening requirements
+
+A design pressure-test surfaced six issues, all in the trust/determinism
+boundary rather than the architecture. Each is stated here as a **requirement**
+on the implementation. Where one resolves an open question in §9, the resolution
+is noted there too. The first three (R-1, R-2/R-3, R-5) are on the critical path
+and should be settled before coding; R-4 and R-6 are hardening that can be
+specified alongside.
+
+### R-1 — Resolver swap is a privilege-escalation vector
+
+A resolver gates *who is whom*. Namespacing sessions by `subject` alone lets a
+compromised or malicious manager swap in a resolver that returns
+`subject = victim's id` for an attacker-controlled address, hijacking the
+victim's key namespace. This is the **C4 pattern** (a later grant overriding an
+identity an earlier grant established). But namespacing per-resolver-address
+orphans keys on every *legitimate* upgrade. You cannot have both.
+
+**Requirements:**
+- Namespace sessions/keys as `resolver:<resolverAddr>:<subject>` (adopts Q2).
+  Cross-resolver hijack becomes impossible; the cost is that a resolver upgrade
+  is a **key migration**, not a transparent swap.
+- `setAuthResolver` MUST be timelocked (reuse node-removal `removalDelay`) — no
+  longer optional (supersedes Q4). The resolver's blast radius exceeds an
+  issuer's: it authorizes addresses unilaterally, whereas a rogue issuer still
+  needs the external IdP to sign.
+- Migration mechanics (keep old resolver readable for existing keys vs. an
+  explicit re-bind) remain open — but the *namespacing decision* is closed.
+
+### R-2 — Node-side determinism: pin the call, not just the adapter
+
+§5 puts determinism on the adapter, but three non-determinism sources are the
+node's to close:
+- **Pin `from = 0x0` on the `eth_call`.** Stops a resolver that branches on
+  `msg.sender`/`tx.origin` (even accidentally) from returning per-node answers.
+- **Pin the read block** — see R-3.
+- **The accepted `typeAndVersion()` set is group config or a protocol constant,
+  never per-node.** Otherwise nodes upgraded at different times disagree on
+  acceptance → split brain.
+
+### R-3 — Client-committed block pin for the resolver read
+
+The mechanism for R-2's block pin; it also bounds R-5 and R-6. The request
+commits to a specific block and every node reads `resolve()` at exactly that
+block, so all honest nodes read identical state.
+
+- Request carries `(block_number, block_hash)` (see §4); nodes `eth_call` at
+  that block.
+- **Reorg safety via hash, not number.** Each node verifies `block_hash` is the
+  canonical hash at `block_number` in its own view. A node that doesn't see that
+  hash (lagging sync or reorg) **fails closed and abstains**; the client retries
+  with a fresher block. Committing to the number alone would let a reorg
+  silently change the read.
+- **Freshness window bounds client choice.** The node requires
+  `head - maxLag ≤ block_number ≤ head` against *its own* head. The client
+  cannot replay an old block where a since-revoked credential was still valid;
+  worst-case staleness is `maxLag`, which is precisely the revocation latency
+  at the auth instant (ties R-5). Resolves Q3.
+- **Not a §3 violation.** The trust target (resolver addr + chain) still comes
+  from group config; the block is only a freshness/consistency parameter, and
+  each node independently bounds it to its own head — a malicious initiator can
+  at most choose a block within the honest window.
+- **Cost:** the client now needs read access to the target chain to obtain a
+  recent `(number, hash)`. Reasonable — the client already drives a
+  chain-specific auth — but it extends §6's RPC-reach observation to the client
+  side. Nodes still need their own RPC (they validate the hash and do the read);
+  block-pinning adds determinism, it does not remove node RPC.
+- For chains exposing a `finalized` tag, a node MAY additionally require
+  `block_number ≤ finalized` to sidestep reorgs entirely, trading latency for
+  safety. Per-group policy (folds into Q7).
+
+### R-4 — SIWE replay hardening: the `session_pub` binding is the whole boundary
+
+SIWE signatures are produced all over the web; the *only* thing stopping a sig
+minted for another dApp (same address) from opening a Signet session is the
+message committing to `session_pub`. §4 hand-waves it, so harden it:
+
+- **`session_pub` MUST be carried in a fixed-form ERC-4361 `Resources` URI**,
+  e.g. `signet://session/<session_pub_hex>` — not parsed from the free-text
+  statement (brittle + an injection surface). Reject messages without exactly
+  this resource.
+- **`domain` MUST equal a node/group-expected value.** "Verify domain" against
+  nothing is vacuous.
+- **Pin the SIWE `Chain ID` field** and define which chain it is — recommend it
+  equal the resolver `chainId` (three chains are in play: group home, resolver,
+  SIWE). The message SHOULD also commit the R-3 `(block_number, block_hash)` so
+  a malicious initiator can't swap the read block (optional given R-3's per-node
+  window, but cheap).
+- **Bound session TTL by the SIWE `expirationTime`**, mirroring the JWT path
+  binding a session to `exp`.
+
+### R-5 — Authorization binds at session creation: name the revocation SLA
+
+The resolver gates *auth*, not each *sign* — a credential revoked on-chain keeps
+signing until the session expires. Q5 frames this as cache TTL; it is really the
+revocation SLA.
+
+- State it plainly: **revocation latency = session TTL** (re-checking per sign
+  reintroduces the `eth_call` on the hot path — rejected). With R-3 it also
+  equals `maxLag` at the auth instant.
+- Make session TTL a group knob, bounded against the strictest adapter's
+  revocation expectation (a CCID revocation should land faster than a 24h JWT).
+- Same family as C4 (delegation outliving key-disable). Standing principle worth
+  adopting protocol-wide: *every revocable authorization must name where it
+  re-checks.*
+
+### R-6 — DoS / billing amplification on `/v1/auth` (depends on M2)
+
+Each request fans out to an `eth_call` — possibly cross-chain, possibly against
+a **metered** RPC — on every node. SIWE recovery is cheap, so one keypair can
+mint unlimited valid requests with fresh nonces, each forcing foreign-chain RPC
+spend ×N.
+
+- Verify SIWE fully **before** the resolver read (§4 already orders this) —
+  necessary, not sufficient.
+- **Rate-limit before the `eth_call`, keyed on recovered address and/or
+  `session_pub`.** This makes the open **M2** a *prerequisite* for any group
+  enabling this scheme, not a nice-to-have.
+- Optionally cache `resolve()` per `(resolverAddr, account, block-window)` to
+  collapse retries (bounded by R-5's TTL).
+
+## 11. Sources
 
 - CCID demo / ACE call shapes — `signet-product/chainlink/demo-login-with-ccid.md`
 - Group auth config precedent — `contracts/contracts/SignetGroup.sol`

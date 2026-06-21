@@ -159,7 +159,7 @@ testnet/
   ansible/
     inventory.yml                 # node hosts, IPs, connection vars
     provision-single-region.yml   # launch EC2 in us-east-1 (multi-AZ)
-    provision.yml                 # launch EC2 across 5 regions (alternative)
+    provision-gcp.yml             # launch a single node on GCP
     deploy.yml                    # upload binaries + config, start services
     manage.yml                    # stop/start/restart/status/logs/clean
     teardown.yml                  # terminate EC2 instances

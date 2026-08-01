@@ -284,6 +284,10 @@ bootstrap_peers:
 node_type: public
 eth_rpc: ${RPC}
 factory_address: ${FACTORY}
+# Local anvil costs nothing per request, so poll fast to keep membership and
+# reshare events snappy during development. The 60s default is tuned for
+# metered public RPC providers.
+chain_poll_secs: 2
 EOF
 
     if $USE_KMS; then

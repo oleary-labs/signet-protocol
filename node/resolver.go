@@ -53,8 +53,9 @@ func (n *Node) validateResolverProof(ctx context.Context, groupID string, proof 
 	}
 
 	// Refuse unknown resolver versions (R-2). typeAndVersion is pure, so it is
-	// not block-pinned.
-	tv, err := n.chain.callResolverTypeAndVersion(ctx, cfg.ChainID, cfg.Resolver)
+	// not block-pinned — and is memoised per chain+address rather than re-read
+	// on every auth.
+	tv, err := n.chain.resolverTypeAndVersion(ctx, cfg.ChainID, cfg.Resolver)
 	if err != nil {
 		return nil, fmt.Errorf("resolver typeAndVersion: %w", err)
 	}

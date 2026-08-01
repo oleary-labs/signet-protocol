@@ -17,7 +17,7 @@ type Config struct {
 	EthRPC         string   `yaml:"eth_rpc"`
 	FactoryAddress string   `yaml:"factory_address"`
 	KMSSocket      string   `yaml:"kms_socket"`      // Unix socket path to external KMS; empty = in-process tss
-	ChainPollSecs  int      `yaml:"chain_poll_secs"` // chain event poll interval in seconds; 0 = default (12)
+	ChainPollSecs  int      `yaml:"chain_poll_secs"` // chain event poll interval in seconds; 0 = default (60)
 
 	// ChainRPCs maps a chainId to an RPC URL for chains OTHER than the home
 	// chain (the one EthRPC points at). Used by the on-chain auth resolver: a

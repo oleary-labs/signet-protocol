@@ -12,6 +12,7 @@ import (
 	"github.com/ethereum/go-ethereum"
 	"github.com/ethereum/go-ethereum/accounts/abi"
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/ethclient"
 	"go.uber.org/zap"
 
@@ -50,7 +51,31 @@ const (
 		{"name":"typeAndVersion","type":"function","inputs":[],"outputs":[{"name":"","type":"string"}],"stateMutability":"pure"}
 	]`
 
-	defaultPollInterval = 12 * time.Second
+	// defaultPollInterval is the chain event poll cadence. Every tick costs one
+	// eth_blockNumber plus (at most) one eth_getLogs regardless of group count,
+	// so this is the dominant standing RPC cost of an otherwise idle node.
+	// The events polled for here — membership, issuer, auth-key and resolver
+	// changes — are all human-initiated and rare, so a minute of detection
+	// latency is not meaningful; 12s was ~5x the cost for no practical gain.
+	// Override with chain_poll_secs where faster reaction matters.
+	defaultPollInterval = 60 * time.Second
+
+	// maxPollRange caps the block span of a single eth_getLogs. Without it, a
+	// node that has been offline (or whose RPC has been failing) asks for an
+	// unbounded range, which providers reject outright — and since lastBlock
+	// only advances on success, that oversized query is then retried every tick
+	// forever, burning quota while never making progress. Catch-up instead
+	// walks forward one capped chunk at a time.
+	maxPollRange uint64 = 5000
+
+	// maxCatchupChunks bounds the chunks walked in a single poll so catch-up
+	// cannot monopolise the tick.
+	maxCatchupChunks = 20
+
+	// headCacheTTL is how long a chain's head block number is reused across
+	// resolver reads. Bursts of auth requests otherwise each pay their own
+	// eth_blockNumber for a value that changes only once per block.
+	headCacheTTL = 4 * time.Second
 
 	// maxResolverLag bounds how stale a client-pinned block may be for the
 	// resolver read (R-3): head - maxResolverLag <= blockNum <= head. It is also
@@ -74,6 +99,28 @@ type ChainClient struct {
 	lastBlock uint64
 	stopCh    chan struct{}
 
+	// watchedTopics is the union of every factory and group event topic0 the
+	// node reacts to, precomputed so a poll can fetch all of them for all
+	// contracts in one eth_getLogs instead of one call per contract.
+	watchedTopics []common.Hash
+
+	// pubkeyCache memoises factory getNodePubkey reads. A node's registered
+	// pubkey is immutable for the lifetime of its address, so this is a
+	// permanent cache, not a TTL one.
+	pubkeyMu    sync.Mutex
+	pubkeyCache map[common.Address][]byte
+
+	// tvCache memoises resolver typeAndVersion() reads, keyed by chain+address.
+	// typeAndVersion is `pure`, so the answer cannot change for a given
+	// deployed contract; without this every auth paid an eth_call for a
+	// constant.
+	tvMu    sync.Mutex
+	tvCache map[string]string
+
+	// headCache holds a recent head block number per chain, see headCacheTTL.
+	headMu    sync.Mutex
+	headCache map[uint64]headEntry
+
 	// Cross-chain RPC reach for on-chain auth resolvers. The home chain (the
 	// one `eth` points at) is registered under homeChainID; other chains are
 	// dialed lazily from chainRPCs and cached in resolverClients.
@@ -81,6 +128,11 @@ type ChainClient struct {
 	chainRPCs       map[uint64]string
 	clientsMu       sync.Mutex
 	resolverClients map[uint64]*ethclient.Client
+}
+
+type headEntry struct {
+	num uint64
+	at  time.Time
 }
 
 // newChainClient dials the Ethereum RPC and initialises the chain client.
@@ -155,7 +207,30 @@ func newChainClient(cfg *Config, h *network.Host, n *Node, log *zap.Logger) (*Ch
 		homeChainID:     homeChainID,
 		chainRPCs:       chainRPCs,
 		resolverClients: resolverClients,
+		watchedTopics:   watchedTopics(factABI, grpABI),
+		pubkeyCache:     make(map[common.Address][]byte),
+		tvCache:         make(map[string]string),
+		headCache:       make(map[uint64]headEntry),
 	}, nil
+}
+
+// watchedTopics returns every event topic0 the poll loop dispatches on, across
+// both the factory and group ABIs. Fetching the union in one query lets a poll
+// cover the factory and every group with a single eth_getLogs; logs are then
+// routed by their emitting address.
+func watchedTopics(factABI, grpABI abi.ABI) []common.Hash {
+	factEvents := []string{"NodeActivatedInGroup", "NodeDeactivatedInGroup"}
+	grpEvents := []string{"NodeJoined", "NodeRemoved", "IssuerAdded", "IssuerRemoved",
+		"AuthKeyAdded", "AuthKeyRemoved", "AuthResolverSet", "ReshareRequested"}
+
+	out := make([]common.Hash, 0, len(factEvents)+len(grpEvents))
+	for _, name := range factEvents {
+		out = append(out, factABI.Events[name].ID)
+	}
+	for _, name := range grpEvents {
+		out = append(out, grpABI.Events[name].ID)
+	}
+	return out
 }
 
 // clientForChain returns an ethclient for the given chainId, lazily dialing and
@@ -288,7 +363,7 @@ func (c *ChainClient) buildGroupInfo(ctx context.Context, grpAddr common.Address
 
 // resolvePartyID fetches the node's pubkey from the factory and derives its tss.PartyID.
 func (c *ChainClient) resolvePartyID(ctx context.Context, nodeAddr common.Address) (tss.PartyID, error) {
-	pubkey, err := c.callGetNodePubkey(ctx, nodeAddr)
+	pubkey, err := c.nodePubkey(ctx, nodeAddr)
 	if err != nil {
 		return "", fmt.Errorf("getNodePubkey %s: %w", nodeAddr.Hex(), err)
 	}
@@ -346,55 +421,124 @@ func (c *ChainClient) poll(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("block number: %w", err)
 	}
+	c.storeHead(c.homeChainID, current)
 	if current <= c.lastBlock {
 		return nil
 	}
-	from := c.lastBlock + 1
-	to := current
 
-	if err := c.pollFactoryEvents(ctx, from, to); err != nil {
-		c.log.Warn("chain: factory events", zap.Error(err))
+	// Walk forward in capped chunks so a large backlog cannot produce a query
+	// the provider refuses (and would then retry unchanged every tick). In
+	// steady state this loop runs exactly once.
+	for chunk := 0; chunk < maxCatchupChunks && c.lastBlock < current; chunk++ {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		from := c.lastBlock + 1
+		to := current
+		if to-from+1 > maxPollRange {
+			to = from + maxPollRange - 1
+		}
+		if err := c.pollRange(ctx, from, to); err != nil {
+			return err
+		}
+		c.lastBlock = to
 	}
+	if c.lastBlock < current {
+		c.log.Info("chain: catch-up still behind head",
+			zap.Uint64("at", c.lastBlock), zap.Uint64("head", current))
+	}
+	return nil
+}
 
+// pollRange fetches every watched factory and group event in [from,to] with a
+// single eth_getLogs and dispatches the results by emitting contract. Querying
+// per-contract instead costs one eth_getLogs per group per tick, which is the
+// single largest driver of RPC spend on an idle node.
+func (c *ChainClient) pollRange(ctx context.Context, from, to uint64) error {
 	c.n.groupsMu.RLock()
-	groupAddrs := make([]common.Address, 0, len(c.n.groups))
+	known := make(map[common.Address]struct{}, len(c.n.groups))
 	for hexAddr := range c.n.groups {
-		groupAddrs = append(groupAddrs, common.HexToAddress(hexAddr))
+		known[common.HexToAddress(hexAddr)] = struct{}{}
 	}
 	c.n.groupsMu.RUnlock()
 
-	for _, grpAddr := range groupAddrs {
-		if err := c.pollGroupEvents(ctx, grpAddr, from, to); err != nil {
+	addrs := make([]common.Address, 0, len(known)+1)
+	addrs = append(addrs, c.factory)
+	for addr := range known {
+		addrs = append(addrs, addr)
+	}
+
+	logs, err := c.eth.FilterLogs(ctx, ethereum.FilterQuery{
+		FromBlock: new(big.Int).SetUint64(from),
+		ToBlock:   new(big.Int).SetUint64(to),
+		Addresses: addrs,
+		Topics:    [][]common.Hash{c.watchedTopics},
+	})
+	if err != nil {
+		return fmt.Errorf("filter logs [%d,%d]: %w", from, to, err)
+	}
+
+	// Route by emitting address. The factory and group ABIs share no event
+	// signatures, so the address alone disambiguates.
+	var factoryLogs []types.Log
+	byGroup := make(map[common.Address][]types.Log)
+	for _, lg := range logs {
+		if lg.Address == c.factory {
+			factoryLogs = append(factoryLogs, lg)
+			continue
+		}
+		byGroup[lg.Address] = append(byGroup[lg.Address], lg)
+	}
+
+	// Factory events first: an activation here may add a group whose own events
+	// in this same range still need scanning.
+	c.handleFactoryLogs(ctx, factoryLogs)
+
+	for grpAddr, lgs := range byGroup {
+		if err := c.handleGroupLogs(ctx, grpAddr, lgs); err != nil {
 			c.log.Warn("chain: group events",
 				zap.String("group", grpAddr.Hex()), zap.Error(err))
 		}
 	}
 
-	c.lastBlock = to
+	// Any group activated during this range was not in the batched query's
+	// address list, so scan it individually to preserve prior behaviour. This
+	// is rare (group activation only), so the extra call does not affect
+	// steady-state cost.
+	c.n.groupsMu.RLock()
+	fresh := make([]common.Address, 0)
+	for hexAddr := range c.n.groups {
+		addr := common.HexToAddress(hexAddr)
+		if _, seen := known[addr]; !seen {
+			fresh = append(fresh, addr)
+		}
+	}
+	c.n.groupsMu.RUnlock()
+
+	for _, grpAddr := range fresh {
+		if err := c.pollGroupEvents(ctx, grpAddr, from, to); err != nil {
+			c.log.Warn("chain: newly activated group events",
+				zap.String("group", grpAddr.Hex()), zap.Error(err))
+		}
+	}
 	return nil
 }
 
-func (c *ChainClient) pollFactoryEvents(ctx context.Context, from, to uint64) error {
+// handleFactoryLogs applies factory membership events addressed to this node.
+// The batched query cannot filter on the indexed node topic (it is shared with
+// group events that index a different address there), so the match on myAddr
+// happens here instead of server-side.
+func (c *ChainClient) handleFactoryLogs(ctx context.Context, logs []types.Log) {
 	activatedID := c.factABI.Events["NodeActivatedInGroup"].ID
 	deactivatedID := c.factABI.Events["NodeDeactivatedInGroup"].ID
-
-	query := ethereum.FilterQuery{
-		FromBlock: new(big.Int).SetUint64(from),
-		ToBlock:   new(big.Int).SetUint64(to),
-		Addresses: []common.Address{c.factory},
-		Topics: [][]common.Hash{
-			{activatedID, deactivatedID},
-			{common.BytesToHash(c.myAddr.Bytes())},
-		},
-	}
-	logs, err := c.eth.FilterLogs(ctx, query)
-	if err != nil {
-		return fmt.Errorf("filter factory logs: %w", err)
-	}
+	meTopic := common.BytesToHash(c.myAddr.Bytes())
 
 	for _, lg := range logs {
 		if len(lg.Topics) < 3 {
 			continue
+		}
+		if lg.Topics[1] != meTopic {
+			continue // another node's membership change
 		}
 		grpAddr := common.BytesToAddress(lg.Topics[2].Bytes())
 		switch lg.Topics[0] {
@@ -426,10 +570,25 @@ func (c *ChainClient) pollFactoryEvents(ctx context.Context, from, to uint64) er
 			c.log.Info("chain: left group", zap.String("group", grpAddr.Hex()))
 		}
 	}
-	return nil
 }
 
+// pollGroupEvents fetches and applies one group's events over a block range.
+// The steady-state path batches all groups into pollRange's single query; this
+// remains for groups that appear mid-range and so missed that query.
 func (c *ChainClient) pollGroupEvents(ctx context.Context, grpAddr common.Address, from, to uint64) error {
+	logs, err := c.eth.FilterLogs(ctx, ethereum.FilterQuery{
+		FromBlock: new(big.Int).SetUint64(from),
+		ToBlock:   new(big.Int).SetUint64(to),
+		Addresses: []common.Address{grpAddr},
+		Topics:    [][]common.Hash{c.watchedTopics},
+	})
+	if err != nil {
+		return fmt.Errorf("filter group logs: %w", err)
+	}
+	return c.handleGroupLogs(ctx, grpAddr, logs)
+}
+
+func (c *ChainClient) handleGroupLogs(ctx context.Context, grpAddr common.Address, logs []types.Log) error {
 	joinedID := c.grpABI.Events["NodeJoined"].ID
 	removedID := c.grpABI.Events["NodeRemoved"].ID
 	issuerAddedID := c.grpABI.Events["IssuerAdded"].ID
@@ -438,17 +597,6 @@ func (c *ChainClient) pollGroupEvents(ctx context.Context, grpAddr common.Addres
 	authKeyRemovedID := c.grpABI.Events["AuthKeyRemoved"].ID
 	authResolverSetID := c.grpABI.Events["AuthResolverSet"].ID
 	reshareRequestedID := c.grpABI.Events["ReshareRequested"].ID
-
-	query := ethereum.FilterQuery{
-		FromBlock: new(big.Int).SetUint64(from),
-		ToBlock:   new(big.Int).SetUint64(to),
-		Addresses: []common.Address{grpAddr},
-		Topics:    [][]common.Hash{{joinedID, removedID, issuerAddedID, issuerRemovedID, authKeyAddedID, authKeyRemovedID, authResolverSetID, reshareRequestedID}},
-	}
-	logs, err := c.eth.FilterLogs(ctx, query)
-	if err != nil {
-		return fmt.Errorf("filter group logs: %w", err)
-	}
 
 	hexGrp := strings.ToLower(grpAddr.Hex())
 
@@ -638,6 +786,89 @@ func (c *ChainClient) pollGroupEvents(ctx context.Context, grpAddr common.Addres
 	return nil
 }
 
+// --- Caches ---
+
+// nodePubkey returns a registered node's pubkey, memoising the factory read.
+// A node's pubkey is fixed at registration, so a hit never goes stale; only
+// successful reads are cached.
+func (c *ChainClient) nodePubkey(ctx context.Context, nodeAddr common.Address) ([]byte, error) {
+	c.pubkeyMu.Lock()
+	if pk, ok := c.pubkeyCache[nodeAddr]; ok {
+		c.pubkeyMu.Unlock()
+		return pk, nil
+	}
+	c.pubkeyMu.Unlock()
+
+	pk, err := c.callGetNodePubkey(ctx, nodeAddr)
+	if err != nil {
+		return nil, err
+	}
+	if len(pk) > 0 {
+		c.pubkeyMu.Lock()
+		c.pubkeyCache[nodeAddr] = pk
+		c.pubkeyMu.Unlock()
+	}
+	return pk, nil
+}
+
+// headBlock returns the head block number for a chain, reusing a recent read
+// for headCacheTTL. Callers needing certainty that a specific block is not
+// ahead of head should use freshHeadBlock on a negative result.
+func (c *ChainClient) headBlock(ctx context.Context, chainID uint64, cl *ethclient.Client) (uint64, error) {
+	c.headMu.Lock()
+	e, ok := c.headCache[chainID]
+	c.headMu.Unlock()
+	if ok && time.Since(e.at) < headCacheTTL {
+		return e.num, nil
+	}
+	return c.freshHeadBlock(ctx, chainID, cl)
+}
+
+func (c *ChainClient) freshHeadBlock(ctx context.Context, chainID uint64, cl *ethclient.Client) (uint64, error) {
+	head, err := cl.BlockNumber(ctx)
+	if err != nil {
+		return 0, err
+	}
+	c.storeHead(chainID, head)
+	return head, nil
+}
+
+func (c *ChainClient) storeHead(chainID, head uint64) {
+	if chainID == 0 {
+		return
+	}
+	c.headMu.Lock()
+	// Never move a cached head backwards: a lagging RPC replica would otherwise
+	// make an already-accepted pinned block look "ahead of head".
+	if e, ok := c.headCache[chainID]; !ok || head >= e.num {
+		c.headCache[chainID] = headEntry{num: head, at: time.Now()}
+	}
+	c.headMu.Unlock()
+}
+
+// resolverTypeAndVersion returns a resolver's typeAndVersion(), memoised per
+// chain+address. The function is `pure` and the contract at an address is
+// immutable, so this is cached permanently rather than on a TTL.
+func (c *ChainClient) resolverTypeAndVersion(ctx context.Context, chainID uint64, resolver common.Address) (string, error) {
+	key := fmt.Sprintf("%d:%s", chainID, strings.ToLower(resolver.Hex()))
+
+	c.tvMu.Lock()
+	if tv, ok := c.tvCache[key]; ok {
+		c.tvMu.Unlock()
+		return tv, nil
+	}
+	c.tvMu.Unlock()
+
+	tv, err := c.callResolverTypeAndVersion(ctx, chainID, resolver)
+	if err != nil {
+		return "", err
+	}
+	c.tvMu.Lock()
+	c.tvCache[key] = tv
+	c.tvMu.Unlock()
+	return tv, nil
+}
+
 // --- ABI call helpers ---
 
 func (c *ChainClient) callGetNodeGroups(ctx context.Context, node common.Address) ([]common.Address, error) {
@@ -823,12 +1054,20 @@ func (c *ChainClient) callResolve(
 		return false, zero, err
 	}
 
-	head, err := cl.BlockNumber(ctx)
+	head, err := c.headBlock(ctx, chainID, cl)
 	if err != nil {
 		return false, zero, fmt.Errorf("chain %d head: %w", chainID, err)
 	}
 	if blockNum > head {
-		return false, zero, fmt.Errorf("pinned block %d ahead of head %d", blockNum, head)
+		// A cached head may simply predate the client's pinned block. Confirm
+		// against a fresh read before rejecting, so the cache can only cost an
+		// extra call, never a false denial.
+		if head, err = c.freshHeadBlock(ctx, chainID, cl); err != nil {
+			return false, zero, fmt.Errorf("chain %d head: %w", chainID, err)
+		}
+		if blockNum > head {
+			return false, zero, fmt.Errorf("pinned block %d ahead of head %d", blockNum, head)
+		}
 	}
 	if head-blockNum > maxResolverLag {
 		return false, zero, fmt.Errorf("pinned block %d too stale (head %d, max lag %d)", blockNum, head, maxResolverLag)

@@ -165,13 +165,24 @@ When finishing a task, always provide a brief summary of:
 - `VKPath` — path to circuit verification key (bb format, required for production ZK auth)
 
 ### HTTP API
-- `GET /v1/health`, `GET /v1/info`, `GET /v1/keys[?group_id=0x...]`
-- `POST /v1/auth` — register session key (auth key certificate or ZK proof + claims)
+Routes are registered in `node/node.go` with method-qualified patterns.
+
+- `GET /v1/health`, `GET /v1/info` — unauthenticated
+- `POST /v1/auth` — register session key (auth key certificate, ZK proof + claims, or SIWE/onchain_resolver)
 - `POST /v1/keygen` — distributed key generation
 - `POST /v1/sign` — threshold signing
+- `POST /v1/delegate` — issue a delegation token
+- `POST /v1/keys/disable`, `/v1/keys/enable`, `/v1/keys/delete` — key lifecycle
+- `POST /admin/keys` — list key shard metadata. Group-scoped, requires an
+  `AdminAuth` ECDSA signature from a group-trusted authorization key. There is
+  no unauthenticated `GET /v1/keys`.
+- `POST /admin/reshare`, `/admin/reshare/status`
+- `GET /debug/stats` — peer/conn/memory stats, unauthenticated
 
 ### Chain Client (`node/chain.go`)
-- Polls factory events (`NodeActivatedInGroup/Deactivated`) and group events every 2s
+- Polls factory + group events on one batched `eth_getLogs` per tick (all
+  contracts in a single query, routed by emitting address). Default interval
+  60s, overridable via `chain_poll_secs`; devnet uses 2s.
 - Loads group membership + issuers from chain at startup
 - `reflect.ValueOf(results[0]).FieldByName("Issuer")` pattern for go-ethereum tuple[] unpacking
 

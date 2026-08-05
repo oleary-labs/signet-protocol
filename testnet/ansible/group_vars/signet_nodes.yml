@@ -14,3 +14,20 @@ kms_data_dir: /opt/signet/kms-data
 
 # Barretenberg version — read from signet-circuits/toolchain.json at deploy time.
 # See roles/bb/tasks/main.yml for how this is resolved.
+
+# Chain event poll interval. Every tick costs one eth_blockNumber plus one
+# eth_getLogs regardless of group count, so this is the standing RPC spend of an
+# idle node. The events polled for are all operator-initiated and rare.
+chain_poll_secs: 60
+
+# --- On-chain auth resolver (onchain_resolver scheme) ---
+#
+# Both are unset by default, which leaves the scheme disabled. The node rejects
+# onchain_resolver outright when siwe_domain is empty, so enabling the scheme
+# means setting this to the exact ERC-4361 domain clients sign against.
+#
+# siwe_domain: "testnet.signet.example"
+#
+# Only needed if a group's resolver lives on a chain other than eth_rpc's.
+# chain_rpcs:
+#   8453: "https://base-mainnet.example/v2/KEY"

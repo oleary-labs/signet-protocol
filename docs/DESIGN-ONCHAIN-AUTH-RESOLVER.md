@@ -1,9 +1,24 @@
 # On-Chain Auth Resolver (SIWE → on-chain identity)
 
-**Status:** Design. Generalizes the CCID login path
+**Status:** Implemented (core), on branch `feat/onchain-auth-resolver`.
+Generalizes the CCID login path
 ([`signet-product/chainlink/demo-login-with-ccid.md`](../../signet-product/chainlink/demo-login-with-ccid.md))
 into a provider-agnostic auth scheme. ACE/CCID becomes the first *adapter*,
 not a special case.
+
+**Implementation status (vs. §10):**
+- Built: `ISignetAuthResolver` + timelocked `SignetGroup` binding (R-1
+  namespacing + mandatory timelock); cross-chain pinned-block resolver read with
+  `from=0x0` + block-hash/freshness checks (R-2/R-3); SIWE verification with
+  domain/chainId/session_pub/expiry bindings (R-4); `resolver:<addr>:<subject>`
+  session namespacing with independent per-participant re-verification;
+  protocol-constant resolver version accept-list (R-2). Concrete provider
+  adapters (ACE/CCID, allowlist) live in a separate repo (license); this repo
+  ships the interface + a mock.
+- Deferred: rate limiting on `/v1/auth` (R-6, tracked under audit M2 — a
+  prerequisite for production use; a TODO marks the call site); resolver-upgrade
+  key migration mechanics (R-1 leaves keys created under an old resolver
+  addressable only under that resolver's namespace).
 
 ---
 

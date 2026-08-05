@@ -131,6 +131,12 @@ func (n *Node) handleAuth(w http.ResponseWriter, r *http.Request) {
 
 		// Delegation token (JWT signed by parent key)
 		DelegationToken string `json:"delegation_token,omitempty"`
+
+		// On-chain auth resolver (SIWE) fields.
+		SiweMessage   string `json:"siwe_message,omitempty"`
+		SiweSignature string `json:"siwe_signature,omitempty"`
+		BlockNumber   uint64 `json:"block_number,omitempty"`
+		BlockHash     string `json:"block_hash,omitempty"` // hex, 32 bytes (canonical pin)
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		n.httpError(w, http.StatusBadRequest, "decode body: "+err.Error())
@@ -297,6 +303,74 @@ func (n *Node) handleAuth(w http.ResponseWriter, r *http.Request) {
 			"key_id":     claims.Sub,
 			"parent_key": claims.Kid,
 			"expires_at": claims.Exp,
+		})
+		return
+	}
+
+	// On-chain auth resolver (SIWE) path.
+	//
+	// TODO(R-6/M2): this branch triggers an eth_call (possibly cross-chain,
+	// possibly metered) per request on an unauthenticated endpoint. SIWE is
+	// verified before the resolver read, but rate limiting keyed on the
+	// recovered address / session_pub is still needed and is tracked under
+	// audit M2 — a prerequisite for enabling this scheme in production.
+	if req.SiweMessage != "" {
+		blockHashBytes, err := hex.DecodeString(strings.TrimPrefix(req.BlockHash, "0x"))
+		if err != nil || len(blockHashBytes) != 32 {
+			n.httpError(w, http.StatusBadRequest, "block_hash must be 32 hex-encoded bytes")
+			return
+		}
+
+		ap := &AuthProof{
+			SessionPub:    sessionPubBytes,
+			SiweMessage:   req.SiweMessage,
+			SiweSignature: req.SiweSignature,
+			BlockNumber:   req.BlockNumber,
+			BlockHash:     blockHashBytes,
+		}
+
+		verdict, err := n.validateResolverProof(r.Context(), req.GroupID, ap)
+		if err != nil {
+			n.httpError(w, http.StatusUnauthorized, "resolver auth failed: "+err.Error())
+			return
+		}
+		ap.Exp = uint64(verdict.Expiry.Unix())
+
+		pubHex := sessionPubToHex(sessionPubBytes)
+		n.sessions.Put(pubHex, &SessionInfo{
+			Exp:          verdict.Expiry,
+			Subject:      verdict.Subject,
+			ResolverAddr: verdict.ResolverAddr,
+		})
+		n.log.Info("auth: session registered (onchain resolver)",
+			zap.String("group_id", req.GroupID),
+			zap.String("resolver", verdict.ResolverAddr),
+			zap.String("subject", verdict.Subject),
+			zap.String("session_pub", pubHex))
+
+		// Forward to participants so each re-runs SIWE recovery + the resolver
+		// read at the same pinned block and establishes the session itself.
+		n.groupsMu.RLock()
+		grpRes, grpResOk := n.groups[req.GroupID]
+		n.groupsMu.RUnlock()
+		if grpResOk {
+			members := tss.NewPartyIDSlice(grpRes.Members)
+			go func() {
+				if err := n.broadcastCoord(n.ctx, members, coordMsg{
+					Type:    msgAuth,
+					GroupID: req.GroupID,
+					Auth:    ap,
+				}); err != nil {
+					n.log.Warn("auth: failed to forward resolver session to participants", zap.Error(err))
+				}
+			}()
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{
+			"status":     "ok",
+			"identity":   verdict.Subject,
+			"expires_at": verdict.Expiry.Unix(),
 		})
 		return
 	}
@@ -1092,12 +1166,18 @@ func (n *Node) validateSessionRequest(
 
 	// Derive the logical key_id (what the client signs over).
 	var logicalKeyID string
-	if info.Identity != "" {
+	switch {
+	case info.ResolverAddr != "":
+		logicalKeyID = info.Subject
+		if keySuffix != "" {
+			logicalKeyID = info.Subject + ":" + keySuffix
+		}
+	case info.Identity != "":
 		logicalKeyID = info.Identity
 		if keySuffix != "" {
 			logicalKeyID = info.Identity + ":" + keySuffix
 		}
-	} else {
+	default:
 		logicalKeyID = info.Iss + ":" + info.Sub
 		if keySuffix != "" {
 			logicalKeyID = info.Iss + ":" + info.Sub + ":" + keySuffix
@@ -1120,11 +1200,16 @@ func (n *Node) validateSessionRequest(
 	}
 
 	// Add namespace prefix after signature verification. The prefix is internal
-	// — clients never see it — and prevents cross-path key_id collisions.
+	// — clients never see it — and prevents cross-path key_id collisions. For
+	// resolver sessions the prefix includes the resolver address, which closes
+	// the resolver-swap hijack (§10 R-1).
 	var resolvedKeyID string
-	if info.Identity != "" {
+	switch {
+	case info.ResolverAddr != "":
+		resolvedKeyID = resolverKeyPrefix(info.ResolverAddr, logicalKeyID)
+	case info.Identity != "":
 		resolvedKeyID = "authkey:" + logicalKeyID
-	} else {
+	default:
 		resolvedKeyID = "oauth:" + logicalKeyID
 	}
 

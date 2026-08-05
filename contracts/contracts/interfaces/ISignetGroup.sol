@@ -26,6 +26,23 @@ interface ISignetGroup {
         string[] clientIds;
     }
 
+    /// @notice On-chain auth resolver binding (the auth lane — "who may open a
+    ///         session"). chainId may differ from the group's home chain.
+    ///         resolver == address(0) means no resolver is configured.
+    struct AuthResolver {
+        uint64  chainId;                 // chain the resolver lives on
+        address resolver;                // ISignetAuthResolver implementation
+        bool    requireCanonicalSubject; // reject resolve() results with subject == 0
+    }
+
+    /// @notice A queued (timelocked) change to the auth resolver binding.
+    ///         executeAfter == 0 is the sentinel for "no pending change".
+    struct PendingResolver {
+        uint256      executeAfter;
+        AuthResolver next;
+        address      initiator;
+    }
+
     // -------------------------------------------------------------------------
     // Events — node membership
     // -------------------------------------------------------------------------
@@ -51,6 +68,14 @@ interface ISignetGroup {
 
     event AuthKeyAdded   (bytes32 indexed keyHash, bytes pubkey);
     event AuthKeyRemoved (bytes32 indexed keyHash, bytes pubkey);
+
+    // -------------------------------------------------------------------------
+    // Events — on-chain auth resolver (timelocked)
+    // -------------------------------------------------------------------------
+
+    event AuthResolverQueued    (uint64 chainId, address indexed resolver, bool requireCanonicalSubject, uint256 executeAfter);
+    event AuthResolverCancelled (address indexed initiator);
+    event AuthResolverSet       (uint64 chainId, address indexed resolver, bool requireCanonicalSubject);
 
     // -------------------------------------------------------------------------
     // Events — reshare
@@ -124,6 +149,24 @@ interface ISignetGroup {
     function removeAuthKey(bytes32 keyHash) external;
 
     // -------------------------------------------------------------------------
+    // On-chain auth resolver management (manager-only, timelocked)
+    // -------------------------------------------------------------------------
+
+    /// @notice Queue a change to the group's auth resolver binding. The change
+    ///         takes effect only after `removalDelay` elapses and someone calls
+    ///         `executeAuthResolver`. The timelock is mandatory: a resolver can
+    ///         authorize addresses unilaterally, so its blast radius exceeds an
+    ///         issuer's. Pass resolver == address(0) to queue clearing it.
+    function queueAuthResolver(uint64 chainId, address resolver, bool requireCanonicalSubject) external;
+
+    /// @notice Cancel a queued auth-resolver change (only the original initiator).
+    function cancelAuthResolver() external;
+
+    /// @notice Apply a queued auth-resolver change after its delay has elapsed
+    ///         (permissionless, mirroring executeRemoval).
+    function executeAuthResolver() external;
+
+    // -------------------------------------------------------------------------
     // Reshare (manager-only)
     // -------------------------------------------------------------------------
 
@@ -171,4 +214,16 @@ interface ISignetGroup {
 
     /// @notice True when the given key hash corresponds to a trusted authorization key.
     function isAuthKeyTrusted(bytes32 keyHash) external view returns (bool);
+
+    // -------------------------------------------------------------------------
+    // Views — on-chain auth resolver
+    // -------------------------------------------------------------------------
+
+    /// @notice Returns the active auth resolver binding (resolver == address(0)
+    ///         when none is configured).
+    function getAuthResolver() external view returns (AuthResolver memory);
+
+    /// @notice Returns the currently queued auth-resolver change (executeAfter
+    ///         == 0 when none is pending).
+    function getPendingAuthResolver() external view returns (PendingResolver memory);
 }

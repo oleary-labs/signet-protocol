@@ -206,8 +206,26 @@ func (n *Node) handleCoordStream(s libp2pnet.Stream) {
 
 		var keyPrefix string
 		var sessionExp time.Time
+		// Resolver session fields, populated only on the resolver path.
+		var resolverSubject, resolverAddr string
 
-		if msg.Auth.DelegationToken != "" {
+		if msg.Auth.SiweMessage != "" {
+			// On-chain resolver path: independently re-run SIWE recovery + the
+			// resolver read at the pinned block. The initiator's claim is never
+			// trusted (same rule as scope verification).
+			verdict, err := n.validateResolverProof(n.ctx, msg.GroupID, msg.Auth)
+			if err != nil {
+				n.log.Warn("coord: resolver auth invalid",
+					zap.String("group_id", msg.GroupID),
+					zap.Error(err))
+				s.Write([]byte{coordNACK})
+				return
+			}
+			resolverSubject = verdict.Subject
+			resolverAddr = verdict.ResolverAddr
+			keyPrefix = resolverKeyPrefix(verdict.ResolverAddr, verdict.Subject)
+			sessionExp = verdict.Expiry
+		} else if msg.Auth.DelegationToken != "" {
 			// Delegation token path: verify the token independently.
 			claims, err := n.VerifyDelegationToken(msg.GroupID, msg.Auth.DelegationToken)
 			if err != nil {
@@ -248,6 +266,8 @@ func (n *Node) handleCoordStream(s libp2pnet.Stream) {
 			AuthKeyPub:    msg.Auth.AuthKeyPub,
 			CertSignature: msg.Auth.CertSignature,
 			Identity:      msg.Auth.Identity,
+			Subject:       resolverSubject,
+			ResolverAddr:  resolverAddr,
 		}
 		// For delegation token sessions, lock to the delegated sub-key.
 		if msg.Auth.DelegationToken != "" {
@@ -294,9 +314,12 @@ func (n *Node) handleCoordStream(s libp2pnet.Stream) {
 
 		// Build identity prefix from cached session.
 		var keyPrefix string
-		if cached.Identity != "" {
+		switch {
+		case cached.ResolverAddr != "":
+			keyPrefix = resolverKeyPrefix(cached.ResolverAddr, cached.Subject)
+		case cached.Identity != "":
 			keyPrefix = "authkey:" + cached.Identity
-		} else {
+		default:
 			keyPrefix = "oauth:" + cached.Iss + ":" + cached.Sub
 		}
 

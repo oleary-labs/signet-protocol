@@ -48,10 +48,22 @@ contract SignetGroup is Initializable, ISignetGroup {
     mapping(bytes32 => uint256) internal _authKeyHashIndex;  // 1-based
 
     // -------------------------------------------------------------------------
-    // Upgrade-safe storage gap
+    // State — on-chain auth resolver (timelocked)
     // -------------------------------------------------------------------------
 
-    uint256[50] private __gap;
+    AuthResolver    internal _authResolver;   // 1 slot (uint64+address+bool pack)
+    PendingResolver internal _pendingResolver; // 3 slots (nested struct breaks slot)
+
+    // -------------------------------------------------------------------------
+    // Upgrade-safe storage gap
+    // -------------------------------------------------------------------------
+    //
+    // Reduced from [50] to [46] when the auth-resolver storage above (4 slots:
+    // _authResolver = 1, _pendingResolver = 3) was appended. New storage must be
+    // added ABOVE this gap and the gap shrunk by the same number of slots so the
+    // total layout footprint stays constant across beacon upgrades.
+
+    uint256[46] private __gap;
 
     // -------------------------------------------------------------------------
     // Modifiers
@@ -270,6 +282,62 @@ contract SignetGroup is Initializable, ISignetGroup {
     }
 
     // -------------------------------------------------------------------------
+    // On-chain auth resolver management (manager-only, timelocked)
+    // -------------------------------------------------------------------------
+
+    /// @inheritdoc ISignetGroup
+    function queueAuthResolver(
+        uint64 chainId,
+        address resolver,
+        bool requireCanonicalSubject
+    ) external onlyManager {
+        require(_pendingResolver.executeAfter == 0, "resolver change already queued");
+        // A non-zero resolver must declare which chain it lives on; a zero
+        // resolver (clearing the binding) must not carry stray config.
+        if (resolver == address(0)) {
+            require(chainId == 0 && !requireCanonicalSubject, "clear must be zeroed");
+        } else {
+            require(chainId != 0, "chainId required");
+        }
+
+        uint256 executeAfter = block.timestamp + removalDelay;
+        _pendingResolver = PendingResolver({
+            executeAfter: executeAfter,
+            next: AuthResolver({
+                chainId: chainId,
+                resolver: resolver,
+                requireCanonicalSubject: requireCanonicalSubject
+            }),
+            initiator: msg.sender
+        });
+        emit AuthResolverQueued(chainId, resolver, requireCanonicalSubject, executeAfter);
+    }
+
+    /// @inheritdoc ISignetGroup
+    function cancelAuthResolver() external {
+        PendingResolver memory pending = _pendingResolver;
+        require(pending.executeAfter != 0, "no queued resolver change");
+        require(msg.sender == pending.initiator, "not initiator");
+        delete _pendingResolver;
+        emit AuthResolverCancelled(msg.sender);
+    }
+
+    /// @inheritdoc ISignetGroup
+    function executeAuthResolver() external {
+        PendingResolver memory pending = _pendingResolver;
+        require(pending.executeAfter != 0, "no queued resolver change");
+        require(block.timestamp >= pending.executeAfter, "delay not elapsed");
+
+        _authResolver = pending.next;
+        delete _pendingResolver;
+        emit AuthResolverSet(
+            pending.next.chainId,
+            pending.next.resolver,
+            pending.next.requireCanonicalSubject
+        );
+    }
+
+    // -------------------------------------------------------------------------
     // Reshare
     // -------------------------------------------------------------------------
 
@@ -368,6 +436,20 @@ contract SignetGroup is Initializable, ISignetGroup {
     /// @inheritdoc ISignetGroup
     function isAuthKeyTrusted(bytes32 keyHash) external view returns (bool) {
         return _authKeyHashIndex[keyHash] != 0;
+    }
+
+    // -------------------------------------------------------------------------
+    // Views — on-chain auth resolver
+    // -------------------------------------------------------------------------
+
+    /// @inheritdoc ISignetGroup
+    function getAuthResolver() external view returns (AuthResolver memory) {
+        return _authResolver;
+    }
+
+    /// @inheritdoc ISignetGroup
+    function getPendingAuthResolver() external view returns (PendingResolver memory) {
+        return _pendingResolver;
     }
 
     // -------------------------------------------------------------------------

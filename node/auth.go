@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/bytemare/frost"
+	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/lestrrat-go/jwx/v2/jwa"
 	"github.com/lestrrat-go/jwx/v2/jwk"
@@ -111,9 +112,18 @@ type GroupAuth struct {
 	mu        sync.RWMutex
 	groups    map[string][]IssuerInfo // groupID hex → trusted issuers
 	authKeys  map[string][][]byte    // groupID hex → trusted auth keys (34-byte: scheme prefix + compressed pubkey)
+	resolvers map[string]ResolverConfig // groupID hex → on-chain auth resolver binding
 	cache     *jwk.Cache
 	circuitVK []byte // verification key for the jwt_auth circuit (bb format)
 	log       *zap.Logger
+}
+
+// ResolverConfig is the in-memory copy of a group's on-chain auth resolver
+// binding (the auth lane). A zero Resolver address means no resolver is set.
+type ResolverConfig struct {
+	ChainID                 uint64
+	Resolver                common.Address
+	RequireCanonicalSubject bool
 }
 
 func newGroupAuth(ctx context.Context, circuitVK []byte, log *zap.Logger) *GroupAuth {
@@ -121,6 +131,7 @@ func newGroupAuth(ctx context.Context, circuitVK []byte, log *zap.Logger) *Group
 	return &GroupAuth{
 		groups:    make(map[string][]IssuerInfo),
 		authKeys:  make(map[string][][]byte),
+		resolvers: make(map[string]ResolverConfig),
 		cache:     cache,
 		circuitVK: circuitVK,
 		log:       log,
@@ -183,11 +194,43 @@ func (g *GroupAuth) HasAuthKeys(groupID string) bool {
 }
 
 // HasAuthPolicy returns true when the group has any auth policy configured
-// (OAuth issuers or authorization keys).
+// (OAuth issuers, authorization keys, or an on-chain auth resolver).
 func (g *GroupAuth) HasAuthPolicy(groupID string) bool {
 	g.mu.RLock()
 	defer g.mu.RUnlock()
-	return len(g.groups[groupID]) > 0 || len(g.authKeys[groupID]) > 0
+	return len(g.groups[groupID]) > 0 ||
+		len(g.authKeys[groupID]) > 0 ||
+		g.resolvers[groupID].Resolver != (common.Address{})
+}
+
+// SetAuthResolver records (or, when cfg.Resolver is the zero address, clears)
+// the on-chain auth resolver binding for a group.
+func (g *GroupAuth) SetAuthResolver(groupID string, cfg ResolverConfig) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if cfg.Resolver == (common.Address{}) {
+		delete(g.resolvers, groupID)
+		return
+	}
+	g.resolvers[groupID] = cfg
+}
+
+// GetAuthResolver returns the group's auth resolver binding. ok is false when no
+// resolver is configured.
+func (g *GroupAuth) GetAuthResolver(groupID string) (ResolverConfig, bool) {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	cfg, ok := g.resolvers[groupID]
+	if !ok || cfg.Resolver == (common.Address{}) {
+		return ResolverConfig{}, false
+	}
+	return cfg, true
+}
+
+// HasAuthResolver returns true when the group has an on-chain auth resolver set.
+func (g *GroupAuth) HasAuthResolver(groupID string) bool {
+	_, ok := g.GetAuthResolver(groupID)
+	return ok
 }
 
 // SetAuthKeys replaces the full authorization key list for a group.
@@ -497,6 +540,16 @@ type AuthProof struct {
 
 	// Delegation token (delegation path only).
 	DelegationToken string `cbor:"17,keyasint,omitempty"`
+
+	// On-chain auth resolver path. Participants re-run SIWE recovery AND the
+	// resolver eth_call at the SAME pinned block from these fields, so every
+	// honest node reads identical state and derives the subject independently
+	// (the initiator's claim is never trusted). The resolver address + chainId
+	// come from group config, not the proof (§3).
+	SiweMessage   string `cbor:"18,keyasint,omitempty"`
+	SiweSignature string `cbor:"19,keyasint,omitempty"`
+	BlockNumber   uint64 `cbor:"20,keyasint,omitempty"`
+	BlockHash     []byte `cbor:"21,keyasint,omitempty"` // 32-byte canonical block hash
 }
 
 // SessionAuth is a lightweight credential carried in keygen/sign/delegate

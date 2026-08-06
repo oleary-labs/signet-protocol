@@ -1,6 +1,38 @@
 ---
 # roles/kms-tss/tasks/main.yml — Deploy kms-tss alongside signetd.
 
+# --- Retire kms-frost (renamed to kms-tss in f30e43f, 2026-05-04) ---
+#
+# The rename shipped a new unit but never retired the old one. Both stayed
+# enabled, so at every boot they raced for the same sled database and the same
+# socket path. On 2026-07-28 kms-frost won that race on all four testnet nodes
+# and the cluster was silently down for 8 days: kms-tss crash-looped ~200k
+# times unable to take the lock, while signetd's Requires= dragged it through a
+# restart every ~4s (~19 eth_calls each, which dominated the RPC bill).
+#
+# Removed rather than merely disabled: kms-frost predates the testnet-1
+# curve-prefixed storage format, so it cannot correctly read the current
+# database and is not a viable rollback. Leaving a stale unit and binary on
+# disk only invites the same race back.
+
+- name: Stop and disable legacy kms-frost service
+  become: true
+  systemd:
+    name: kms-frost
+    state: stopped
+    enabled: false
+  failed_when: false
+
+- name: Remove legacy kms-frost unit and binary
+  become: true
+  file:
+    path: "{{ item }}"
+    state: absent
+  loop:
+    - /etc/systemd/system/kms-frost.service
+    - /usr/local/bin/kms-frost
+  notify: reload systemd
+
 - name: Create KMS data directory
   become: true
   file:

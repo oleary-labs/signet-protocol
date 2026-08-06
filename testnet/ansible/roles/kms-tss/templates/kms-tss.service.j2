@@ -6,7 +6,11 @@ Before=signetd.service
 Type=simple
 User={{ signetd_user }}
 Group={{ signetd_user }}
-ExecStartPre=/bin/rm -f {{ kms_socket }}
+# No ExecStartPre=rm -f on the socket. Unlinking the path unconditionally, from
+# outside the process, destroys a *live* instance's socket whenever a second one
+# starts — turning a benign lock conflict into a total outage (see the kms-frost
+# race in roles/kms-tss/tasks/main.yml). kms-tss clears a genuinely stale socket
+# itself, but only after taking the sled lock, which proves no peer is serving.
 ExecStart={{ kms_bin }} {{ kms_socket }} {{ kms_data_dir }}
 Restart=on-failure
 RestartSec=3

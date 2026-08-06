@@ -87,12 +87,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let socket_path = PathBuf::from(socket_path);
 
-    // Remove stale socket file if it exists.
-    if socket_path.exists() {
-        std::fs::remove_file(&socket_path)?;
-    }
-
-    // Open key storage, optionally with at-rest encryption.
+    // Open key storage FIRST. The sled lock is what makes "only one KMS per
+    // data dir" true, so it must be acquired before this process touches any
+    // shared resource. Unlinking the socket first — as this did previously —
+    // means a second instance destroys the live instance's socket path and
+    // only then discovers it cannot have the database: the loser of the race
+    // takes the winner down with it, leaving a KMS that holds the data but has
+    // no name any client can reach.
     let storage = if let Ok(hex_key) = std::env::var("SIGNET_KMS_KEY") {
         let kek = parse_hex_key(&hex_key)?;
         let custody = Arc::new(LocalKeyCustody::new(kek));
@@ -103,6 +104,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         info!("at-rest encryption disabled (set SIGNET_KMS_KEY to enable)");
         Arc::new(Storage::new(data_dir).map_err(|e| format!("open storage: {e}"))?)
     };
+
+    // Only now, holding the storage lock, clear a socket left behind by an
+    // unclean shutdown. Reaching this point proves no other instance is live.
+    if socket_path.exists() {
+        std::fs::remove_file(&socket_path)?;
+    }
 
     let uds = tokio::net::UnixListener::bind(&socket_path)?;
     let uds_stream = tokio_stream::wrappers::UnixListenerStream::new(uds);

@@ -3,10 +3,13 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"sync/atomic"
 	"time"
 )
@@ -16,6 +19,12 @@ type Client struct {
 	node    Node
 	groupID string
 	http    *http.Client
+
+	// auth is nil for groups with no auth policy. When set, every keygen and
+	// sign request carries session-auth fields and the caller's key name is
+	// sent as key_suffix — under auth the node derives key_id from the session
+	// identity, so a client cannot choose it freely.
+	auth *AuthSession
 }
 
 // NewClient creates a client targeting the given node and group.
@@ -25,6 +34,82 @@ func NewClient(node Node, groupID string, timeout time.Duration) *Client {
 		groupID: groupID,
 		http:    &http.Client{Timeout: timeout},
 	}
+}
+
+// WithAuth attaches an authenticated session. Call Authenticate before use.
+func (c *Client) WithAuth(s *AuthSession) *Client {
+	c.auth = s
+	return c
+}
+
+// Authenticate registers the session key with this node via POST /v1/auth.
+//
+// One call is sufficient for the whole group: handleAuth broadcasts a msgAuth
+// coord message and every participant independently re-verifies the proof and
+// caches the session. The harness calls it on each node anyway, as a barrier —
+// that broadcast is asynchronous and /v1/auth returns without waiting for it,
+// so a request racing ahead of propagation would measure session propagation
+// rather than signing.
+func (c *Client) Authenticate(ctx context.Context) error {
+	if c.auth == nil {
+		return nil
+	}
+	body, _ := json.Marshal(map[string]any{
+		"group_id":    c.auth.GroupID,
+		"session_pub": c.auth.SessionPub,
+		"certificate": c.auth.cert,
+	})
+	var resp struct {
+		Status   string `json:"status"`
+		Identity string `json:"identity"`
+	}
+	if err := c.post(ctx, "/v1/auth", body, &resp); err != nil {
+		return fmt.Errorf("authenticate against %s: %w", c.node.Name, err)
+	}
+	return nil
+}
+
+// decorate merges session-auth fields into a request body. keyName is the
+// caller's logical key label; under auth it travels as key_suffix and the
+// signature commits to "<identity>:<keyName>". messageHash is the raw 32-byte
+// hash for sign requests, nil for keygen.
+//
+// Without auth the body is returned unchanged, so unauthenticated groups keep
+// working exactly as before.
+func (c *Client) decorate(body map[string]any, keyName string, messageHash []byte) (map[string]any, error) {
+	if c.auth == nil {
+		body["key_id"] = keyName
+		return body, nil
+	}
+
+	keyName = c.auth.NormalizeSuffix(keyName)
+
+	nonce, err := newNonce()
+	if err != nil {
+		return nil, err
+	}
+	ts := uint64(time.Now().Unix())
+	sig, err := c.auth.SignRequest(keyName, nonce, ts, messageHash)
+	if err != nil {
+		return nil, err
+	}
+
+	body["key_suffix"] = keyName
+	body["session_pub"] = c.auth.SessionPub
+	body["request_sig"] = sig
+	body["nonce"] = nonce
+	body["timestamp"] = ts
+	return body, nil
+}
+
+// decodeHash parses a 0x-optional hex hash into raw bytes for the canonical
+// request hash. Sign requests must commit to the same bytes the node sees.
+func decodeHash(hexStr string) ([]byte, error) {
+	b, err := hex.DecodeString(strings.TrimPrefix(hexStr, "0x"))
+	if err != nil {
+		return nil, fmt.Errorf("decode message hash: %w", err)
+	}
+	return b, nil
 }
 
 // KeygenResponse is the JSON response from POST /v1/keygen.
@@ -49,10 +134,11 @@ type SignResponse struct {
 
 // Keygen calls POST /v1/keygen and returns the response.
 func (c *Client) Keygen(ctx context.Context, keyID string) (*KeygenResponse, error) {
-	body, _ := json.Marshal(map[string]string{
-		"group_id": c.groupID,
-		"key_id":   keyID,
-	})
+	fields, err := c.decorate(map[string]any{"group_id": c.groupID}, keyID, nil)
+	if err != nil {
+		return nil, err
+	}
+	body, _ := json.Marshal(fields)
 	var resp KeygenResponse
 	if err := c.post(ctx, "/v1/keygen", body, &resp); err != nil {
 		return nil, err
@@ -62,11 +148,14 @@ func (c *Client) Keygen(ctx context.Context, keyID string) (*KeygenResponse, err
 
 // KeygenWithCurve calls POST /v1/keygen with an explicit curve.
 func (c *Client) KeygenWithCurve(ctx context.Context, keyID, curve string) (*KeygenResponse, error) {
-	body, _ := json.Marshal(map[string]string{
+	fields, err := c.decorate(map[string]any{
 		"group_id": c.groupID,
-		"key_id":   keyID,
 		"curve":    curve,
-	})
+	}, keyID, nil)
+	if err != nil {
+		return nil, err
+	}
+	body, _ := json.Marshal(fields)
 	var resp KeygenResponse
 	if err := c.post(ctx, "/v1/keygen", body, &resp); err != nil {
 		return nil, err
@@ -76,14 +165,43 @@ func (c *Client) KeygenWithCurve(ctx context.Context, keyID, curve string) (*Key
 
 // KeygenScoped calls POST /v1/keygen with a scope (hex-encoded).
 func (c *Client) KeygenScoped(ctx context.Context, keyID, curve, scopeHex string) (*KeygenResponse, error) {
-	body, _ := json.Marshal(map[string]string{
+	// A scoped key's suffix is derived from the scope by the node, which
+	// substitutes it before verifying auth — so the caller's key name is not
+	// what the signature must commit to.
+	if c.auth != nil {
+		derived, err := ScopeDerivedSuffix(scopeHex)
+		if err != nil {
+			return nil, err
+		}
+		keyID = derived
+	}
+	fields, err := c.decorate(map[string]any{
 		"group_id": c.groupID,
-		"key_id":   keyID,
 		"curve":    curve,
 		"scope":    scopeHex,
-	})
+	}, keyID, nil)
+	if err != nil {
+		return nil, err
+	}
+	body, _ := json.Marshal(fields)
 	var resp KeygenResponse
 	if err := c.post(ctx, "/v1/keygen", body, &resp); err != nil {
+		// A scoped key is identified by its scope — the node derives the
+		// suffix from it, so "same scope = same key". Under auth every caller
+		// with this identity therefore lands on one key per scope, and a
+		// repeat keygen is the idempotent success case rather than a
+		// collision. (Unscoped keygen keeps returning the 409 as an error,
+		// where a duplicate key_id really is a conflict.)
+		var he *HTTPError
+		if c.auth != nil && errors.As(err, &he) && he.Code == http.StatusConflict {
+			if jsonErr := json.Unmarshal([]byte(he.Body), &resp); jsonErr != nil {
+				return nil, err
+			}
+			// The conflict body omits scope; it is known to match, since the
+			// suffix that collided was derived from this very scope.
+			resp.Scope = scopeHex
+			return &resp, nil
+		}
 		return nil, err
 	}
 	return &resp, nil
@@ -91,11 +209,18 @@ func (c *Client) KeygenScoped(ctx context.Context, keyID, curve, scopeHex string
 
 // Sign calls POST /v1/sign and returns the response.
 func (c *Client) Sign(ctx context.Context, keyID, messageHashHex string) (*SignResponse, error) {
-	body, _ := json.Marshal(map[string]string{
+	msgHash, err := decodeHash(messageHashHex)
+	if err != nil {
+		return nil, err
+	}
+	fields, err := c.decorate(map[string]any{
 		"group_id":     c.groupID,
-		"key_id":       keyID,
 		"message_hash": messageHashHex,
-	})
+	}, keyID, msgHash)
+	if err != nil {
+		return nil, err
+	}
+	body, _ := json.Marshal(fields)
 	var resp SignResponse
 	if err := c.post(ctx, "/v1/sign", body, &resp); err != nil {
 		return nil, err
@@ -105,12 +230,19 @@ func (c *Client) Sign(ctx context.Context, keyID, messageHashHex string) (*SignR
 
 // SignWithCurve calls POST /v1/sign with an explicit curve.
 func (c *Client) SignWithCurve(ctx context.Context, keyID, messageHashHex, curve string) (*SignResponse, error) {
-	body, _ := json.Marshal(map[string]string{
+	msgHash, err := decodeHash(messageHashHex)
+	if err != nil {
+		return nil, err
+	}
+	fields, err := c.decorate(map[string]any{
 		"group_id":     c.groupID,
-		"key_id":       keyID,
 		"message_hash": messageHashHex,
 		"curve":        curve,
-	})
+	}, keyID, msgHash)
+	if err != nil {
+		return nil, err
+	}
+	body, _ := json.Marshal(fields)
 	var resp SignResponse
 	if err := c.post(ctx, "/v1/sign", body, &resp); err != nil {
 		return nil, err
@@ -125,13 +257,36 @@ type SignPayload struct {
 }
 
 // SignScoped calls POST /v1/sign with a structured payload (for scoped keys).
+//
+// Under auth the request signature commits to the payload hash the client
+// computes locally — for scheme=eip712 that is hashTypedData of the typed
+// data. Every node recomputes it from the forwarded payload before accepting
+// the session signature, so the payload cannot be swapped in transit or by the
+// initiating node.
 func (c *Client) SignScoped(ctx context.Context, keyID, curve string, payload *SignPayload) (*SignResponse, error) {
-	body, _ := json.Marshal(map[string]interface{}{
+	var payloadHash []byte
+	if c.auth != nil {
+		switch payload.Scheme {
+		case "eip712":
+			h, err := ComputeEIP712Hash(payload.TypedData)
+			if err != nil {
+				return nil, fmt.Errorf("compute eip712 payload hash: %w", err)
+			}
+			payloadHash = h
+		default:
+			return nil, fmt.Errorf("scoped signing under auth: unsupported payload scheme %q", payload.Scheme)
+		}
+	}
+
+	fields, err := c.decorate(map[string]any{
 		"group_id": c.groupID,
-		"key_id":   keyID,
 		"curve":    curve,
 		"payload":  payload,
-	})
+	}, keyID, payloadHash)
+	if err != nil {
+		return nil, err
+	}
+	body, _ := json.Marshal(fields)
 	var resp SignResponse
 	if err := c.post(ctx, "/v1/sign", body, &resp); err != nil {
 		return nil, err

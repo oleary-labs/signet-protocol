@@ -47,6 +47,8 @@ settings.local.json
 
 # Build output
 /build/
+/harness
+/signetd
 
 # Test data
 /data/

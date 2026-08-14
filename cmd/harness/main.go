@@ -26,6 +26,7 @@ func run() error {
 		outFile   = flag.String("out", "", "path to write JSON lines output (optional)")
 		timeout   = flag.Duration("timeout", 30*time.Second, "per-request timeout")
 		stopAfter = flag.Bool("stop-after", false, "stop testnet nodes via ansible after run completes")
+		authTTL   = flag.Duration("auth-ttl", time.Hour, "session lifetime for HARNESS_AUTH_KEY auth")
 	)
 
 	// Subcommand flags — parsed after the subcommand name.
@@ -86,6 +87,26 @@ func run() error {
 		clients[i] = NewClient(n, env.GroupAddress, *timeout)
 	}
 
+	// Attach session auth when an authorization key is configured. Groups with
+	// any auth policy (issuers, auth keys, or a resolver) reject unauthenticated
+	// keygen/sign with 401, so this is required for anything but a bare group.
+	if authKey := os.Getenv("HARNESS_AUTH_KEY"); authKey != "" {
+		identity := os.Getenv("HARNESS_AUTH_IDENTITY")
+		if identity == "" {
+			identity = "harness"
+		}
+		session, err := NewAuthSession(authKey, identity, env.GroupAddress, *authTTL)
+		if err != nil {
+			return fmt.Errorf("build auth session: %w", err)
+		}
+		for _, c := range clients {
+			c.WithAuth(session)
+		}
+		fmt.Printf("auth: identity %q, session %s…, expires %s\n",
+			identity, session.SessionPub[:16],
+			time.Unix(int64(session.Expiry), 0).Format(time.RFC3339))
+	}
+
 	// Check all nodes are healthy.
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
@@ -95,6 +116,21 @@ func run() error {
 		if err := c.Health(ctx); err != nil {
 			return fmt.Errorf("node %s unhealthy: %w", c.node.Name, err)
 		}
+	}
+
+	// Register the session. A single call would suffice — /v1/auth broadcasts a
+	// msgAuth coord message and every participant re-verifies and caches the
+	// session — but that broadcast is asynchronous, and scenarios round-robin
+	// the initiator. Calling every node is a cheap barrier that keeps a
+	// propagation race out of the measurements.
+	if clients[0].auth != nil {
+		fmt.Print("registering session on all nodes... ")
+		for _, c := range clients {
+			if err := c.Authenticate(ctx); err != nil {
+				return err
+			}
+		}
+		fmt.Println("ok")
 	}
 	fmt.Println("ok")
 

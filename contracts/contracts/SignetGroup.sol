@@ -506,6 +506,14 @@ contract SignetGroup is Initializable, ISignetGroup {
         OAuthIssuer storage stored = _issuers[h];
         stored.issuer = issuer;
         for (uint256 i = 0; i < clientIds.length; i++) {
+            // An empty client id is never satisfiable and is not a way to say
+            // "no restriction" — nodes gate the allowlist on clientIds.length,
+            // so [""] enables the allowlist with a single entry no token can
+            // ever match, rejecting every client from an otherwise trusted
+            // issuer. Registering [""] instead of [] is what silently broke
+            // OAuth auth on testnet group 0xa5B9…8429. Pass an empty array to
+            // mean "any client from this issuer".
+            require(bytes(clientIds[i]).length > 0, "empty client id");
             stored.clientIds.push(clientIds[i]);
         }
         emit IssuerAdded(h, issuer, clientIds);

@@ -658,6 +658,53 @@ contract SignetGroupIssuerTest is PubkeyHelpersGroup {
     }
 
     // -------------------------------------------------------------------------
+    // Empty client id guard
+    // -------------------------------------------------------------------------
+
+    /// [""] is not "no restriction": nodes gate the allowlist on
+    /// clientIds.length, so a single empty entry enables the allowlist with a
+    /// value no token can match and locks out every client of a trusted issuer.
+    /// An empty array is the way to express "any client".
+    function testAddIssuerRejectsEmptyClientId() public {
+        ISignetGroup g = _makeGroup();
+
+        string[] memory cids = new string[](1);
+        cids[0] = "";
+
+        vm.prank(manager);
+        vm.expectRevert("empty client id");
+        g.addIssuer(ISS1, cids);
+    }
+
+    /// The guard must also catch an empty entry mixed in with valid ones.
+    function testAddIssuerRejectsEmptyClientIdAmongValid() public {
+        ISignetGroup g = _makeGroup();
+
+        string[] memory cids = new string[](2);
+        cids[0] = CLIENT_A;
+        cids[1] = "";
+
+        vm.prank(manager);
+        vm.expectRevert("empty client id");
+        g.addIssuer(ISS1, cids);
+    }
+
+    /// An empty array remains valid — that is the supported way to say
+    /// "trust any client from this issuer".
+    function testAddIssuerAllowsEmptyClientIdList() public {
+        ISignetGroup g = _makeGroup();
+
+        string[] memory cids = new string[](0);
+
+        vm.prank(manager);
+        g.addIssuer(ISS1, cids);
+
+        ISignetGroup.OAuthIssuer[] memory issuers = g.getIssuers();
+        assertEq(issuers.length, 1);
+        assertEq(issuers[0].clientIds.length, 0);
+    }
+
+    // -------------------------------------------------------------------------
     // Duplicate add guard
     // -------------------------------------------------------------------------
 

@@ -1,12 +1,20 @@
 # signet
 
-<!-- TODO: Update references to circuits/jwt_auth/ and vk_path — circuit source has moved to the signet-circuits repo. VK is now embedded at build time. -->
+Threshold signing governed by on-chain policy — trusted issuers, signing scopes, and committee changes — enforced independently by every node, with no node ever holding a whole key.
 
-Research implementation of a threshold signing network using FROST (RFC 9591) on secp256k1.
+Three signing schemes share one DKG, storage, and coordination stack, selected per request with a `curve` parameter:
 
-Nodes hold persistent secp256k1 identities, connect over a libp2p mesh, and expose an HTTP API for distributed key generation and threshold signing. Signatures are produced in Ethereum-compatible format (65-byte R+S+V).
+| Scheme | Curve | Typical use |
+|--------|-------|-------------|
+| FROST Schnorr (RFC 9591) | secp256k1 | On-chain Schnorr verification, general signing |
+| FROST Schnorr | Ed25519 | Solana |
+| Threshold ECDSA (DJNPO20) | secp256k1 | EVM `ecrecover`, EIP-712, EIP-3009 |
 
-Group membership and trust configuration are managed on-chain via `SignetFactory` and `SignetGroup` smart contracts. An optional ZK-based authentication layer lets clients prove OAuth identity without forwarding JWTs to the network.
+See [`docs/CURVES.md`](docs/CURVES.md) for the canonical curve strings and per-scheme response shapes.
+
+Nodes hold persistent secp256k1 identities, connect over a libp2p mesh, and expose an HTTP API for distributed key generation and threshold signing. Response signature format depends on the scheme — Ethereum-compatible 65-byte R+S+V for secp256k1 schemes, raw 64-byte signatures for Ed25519.
+
+Group membership and trust configuration are managed on-chain via `SignetFactory` and `SignetGroup` smart contracts. Clients authenticate by one of four routes: an auth-key certificate, a ZK proof of OAuth identity (the JWT never reaches the network), a delegation token, or SIWE against an on-chain identity resolver.
 
 A client sends a single request to **any one node** in the group. That node coordinates the session with the other participants automatically.
 
@@ -29,26 +37,30 @@ A client sends a single request to **any one node** in the group. That node coor
 ## Repository layout
 
 ```
-cmd/signetd/       — node binary
-cmd/devnet-init/   — key-init helper used by devnet scripts
-cmd/harness/       — multi-node test harness (correctness + performance)
-cmd/zkbench/       — ZK proof benchmark tool
-node/              — HTTP API, coordinator, chain client, auth
-tss/               — FROST adapter (keygen/sign round runner, Go fallback path)
-kms-tss/         — Rust KMS: ZF FROST keygen/signing over gRPC (production default)
-kms/               — gRPC client and generated protobuf (Go side)
-network/           — libp2p host + session network
-contracts/         — Solidity (Foundry): SignetFactory, SignetGroup
-circuits/jwt_auth/ — Noir ZK circuit: JWT → session key binding
-devnet/            — local devnet scripts (Anvil + 3 nodes + KMS instances)
-docs/              — design and security documents
+cmd/signetd/        — node binary
+cmd/devnet-init/    — key-init helper used by devnet scripts
+cmd/harness/        — multi-node test harness (correctness + performance)
+cmd/testvector/     — test vector generator
+cmd/verify-ed25519/ — standalone Ed25519 signature verifier
+node/               — HTTP API, coordinator, chain client, auth
+tss/                — FROST adapter (keygen/sign round runner, Go fallback path)
+kms-tss/            — Rust KMS: FROST + threshold ECDSA over gRPC (production default)
+kms/                — gRPC client and generated protobuf (Go side)
+proto/              — keymanager.proto (Go ↔ KMS interface)
+network/            — libp2p host + session network
+contracts/          — Solidity (Foundry): SignetFactory, SignetGroup
+devnet/             — local devnet scripts (Anvil + 3 nodes + KMS instances)
+testnet/            — Ansible deploy tooling for the Sepolia testnet
+docs/               — design and security documents
 ```
+
+The Noir ZK circuit lives in the separate [`signet-circuits`](https://github.com/oleary-labs/signet-circuits) repo and is consumed here as a Go module; its verification key is embedded at build time.
 
 ---
 
 ## Build
 
-**Requirements:** Go 1.22+, Rust toolchain (for KMS)
+**Requirements:** Go 1.26+, Rust toolchain (for KMS)
 
 ```bash
 git clone https://github.com/oleary-labs/signet-protocol
@@ -70,12 +82,14 @@ To run without the Rust KMS (in-process Go FROST, for development), pass `--no-k
 cd contracts && forge build
 ```
 
-**ZK circuit** (requires [nargo](https://noir-lang.org) + [bb](https://github.com/AztecProtocol/aztec-packages)):
+**ZK circuit** — no local build step. The circuit lives in the [`signet-circuits`](https://github.com/oleary-labs/signet-circuits) repo and its verification key is embedded via the Go module, so `go build` is sufficient. To bump it:
 
 ```bash
-cd circuits/jwt_auth
-nargo compile --force
+go get github.com/oleary-labs/signet-circuits/packages/go@vX.Y.Z
+go mod tidy
 ```
+
+Verifying proofs at runtime still needs the `bb` binary on `PATH` or at `~/.bb/bb`, pinned to the version in the circuits repo's `toolchain.json`.
 
 ---
 
@@ -94,13 +108,17 @@ node_type:        public                       # "public" or "permissioned"
 # Blockchain integration (required to resolve group membership)
 eth_rpc:          ""                           # e.g. http://localhost:8545
 factory_address:  ""                           # SignetFactory contract address (0x...)
+chain_poll_secs:  60                           # chain event poll interval; 0 = default (60)
 
-# KMS (Rust FROST process)
+# KMS (Rust multi-scheme process)
 kms_socket:       ""                           # Unix socket path to kms-tss; empty = in-process Go FROST
 
-# Auth options
-vk_path:          ""                           # path to circuit verification key (required for ZK auth)
+# On-chain auth resolver (SIWE). Both unset = scheme disabled.
+siwe_domain:      ""                           # ERC-4361 domain; REQUIRED, else the scheme is rejected
+chain_rpcs:       {}                           # chainId → RPC URL, for resolvers off the home chain
 ```
+
+The circuit verification key is embedded at build time — there is no `vk_path` setting.
 
 Pass a custom config file with `-config`:
 
@@ -208,23 +226,34 @@ Returns this node's identity.
 }
 ```
 
-### `GET /v1/keys`
+### `POST /admin/keys`
 
-Lists all key shards held by this node.
+Lists key shard metadata for one group. Group-scoped and authenticated — it requires an `AdminAuth` ECDSA signature from an authorization key trusted by that group. There is no unauthenticated `GET /v1/keys`.
 
+```json
+{
+  "group_id":     "0xGroupAddr",
+  "auth_key_pub": "02...",
+  "signature":    "hex64",
+  "nonce":        "hex",
+  "timestamp":    1709900000
+}
 ```
-GET /v1/keys                       — all groups
-GET /v1/keys?group_id=0xGroupAddr  — one group
-```
+
+- `auth_key_pub` — 34-byte scheme-prefixed key (hex)
+- `signature` — over `SHA256(group_id : nonce : timestamp_8bytes_BE)`; 64 bytes ECDSA or 65 bytes Schnorr
 
 ```json
 [
   {
     "group_id":         "0x...",
     "key_id":           "k1",
+    "curve":            "frost_secp256k1",
+    "public_key":       "0x03abcd...",
     "ethereum_address": "0xabc123...",
-    "threshold":        1,
-    "parties":          ["16Uiu2HAm...", "16Uiu2HAm...", "16Uiu2HAm..."]
+    "threshold":        2,
+    "parties":          ["16Uiu2HAm...", "16Uiu2HAm...", "16Uiu2HAm..."],
+    "status":           "enabled"
   }
 ]
 ```
@@ -269,7 +298,22 @@ Registers an ephemeral session key bound to a verified identity. Required before
 
 - `proof` — Barretenberg ZK proof (hex) generated by the client
 - `jwks_modulus` — RSA-2048 public key modulus used to verify the proof (hex)
-- The node verifies the proof via `bb verify` against the circuit VK at `vk_path`
+- The node verifies the proof via `bb verify` against the circuit VK embedded at build time, and checks the modulus against its cached OIDC JWKS
+
+**SIWE / on-chain resolver** — requires `siwe_domain` to be configured, and a resolver bound on the group contract:
+
+```json
+{
+  "group_id":       "0x...",
+  "session_pub":    "02abc...",
+  "siwe_message":   "example.com wants you to sign in...",
+  "siwe_signature": "hex65",
+  "block_number":   12345678,
+  "block_hash":     "0x..."
+}
+```
+
+The node recovers the address from the SIWE signature, then reads the group's resolver at the client-pinned block with `from = 0x0`, so every node reads identical state. See [`docs/DESIGN-ONCHAIN-AUTH-RESOLVER.md`](docs/DESIGN-ONCHAIN-AUTH-RESOLVER.md).
 
 Response:
 
@@ -363,7 +407,20 @@ Response:
 }
 ```
 
-The signature is 65 bytes in Ethereum format (R ++ S ++ V).
+The response field depends on the scheme:
+
+| Curve | Field | Format |
+|-------|-------|--------|
+| `frost_secp256k1` | `ethereum_signature` | 65 bytes, R.x ++ z ++ v |
+| `ecdsa_secp256k1` | `ecdsa_signature` | 65 bytes, r ++ s ++ v — verifies under `ecrecover` |
+| `frost_ed25519` | `signature` | 64 bytes, standard Ed25519 |
+
+### Other endpoints
+
+- `POST /v1/delegate` — issue a delegation token scoped to a sub-key
+- `POST /v1/keys/disable`, `/v1/keys/enable`, `/v1/keys/delete` — key lifecycle
+- `POST /admin/reshare`, `POST /admin/reshare/status` — reshare control
+- `GET /debug/stats` — peer, connection, and memory stats (unauthenticated)
 
 ---
 
@@ -386,9 +443,11 @@ For scoped (payload-based) signing, `message_hash` in the canonical request hash
 
 ### ZK auth (production)
 
-The Noir circuit at `circuits/jwt_auth/` proves that a valid JWT signed by a trusted RSA key commits to a given session public key, without revealing the JWT to the network. The `bb verify` binary must be on `PATH` or at `~/.bb/bb`, and `vk_path` must point to the compiled circuit verification key.
+The Noir circuit — now in the [`signet-circuits`](https://github.com/oleary-labs/signet-circuits) repo — proves that a valid JWT signed by a trusted RSA key commits to a given session public key, without revealing the JWT to the network. Its verification key is embedded at build time, so there is nothing to configure; the `bb verify` binary must be on `PATH` or at `~/.bb/bb`.
 
-See [docs/DESIGN-ZK-AUTH.md](docs/DESIGN-ZK-AUTH.md) and [docs/SECURITY-ANALYSIS.md](docs/SECURITY-ANALYSIS.md) for the full design and threat model.
+Where a group has OAuth issuers registered with a non-empty client ID allowlist, the token's `azp` (falling back to `aud`) must appear in that list. An empty array means "any client from this issuer" — an array containing an empty string does **not**, and will reject every client.
+
+See [docs/DESIGN-ZK-AUTH.md](docs/DESIGN-ZK-AUTH.md) for the full design, and [docs/SECURITY-AUDIT-KIMI-20260613.md](docs/SECURITY-AUDIT-KIMI-20260613.md) plus [docs/AUDIT-SCOPE.md](docs/AUDIT-SCOPE.md) for the threat model and audit scope.
 
 ---
 
@@ -454,11 +513,11 @@ go test -v -timeout 3m ./...
 # Solidity contracts (requires Foundry)
 cd contracts && forge test
 
-# ZK circuit (requires nargo + bb)
-cd circuits/jwt_auth && nargo compile --force && nargo execute bench_witness
-bb prove -b target/jwt_auth.json -w target/bench_witness.gz -o target/proof --write_vk
-bb verify -k target/proof/vk -p target/proof/proof -i target/proof/public_inputs
+# Rust KMS
+cd kms-tss && cargo test
 ```
+
+ZK circuit tests live in the [`signet-circuits`](https://github.com/oleary-labs/signet-circuits) repo, which pins its own `nargo` + `bb` toolchain. This repo only consumes the compiled verification key.
 
 ---
 
@@ -472,7 +531,9 @@ Because this key is the node's on-chain identity, it can be encrypted at rest. S
 
 ### Group membership
 
-Group membership is not passed in API requests. At startup, the chain client calls `getNodeGroups(myAddr)` on the factory to discover which groups this node belongs to, then loads membership and threshold from each group contract. It polls every two seconds for `NodeActivatedInGroup`, `NodeDeactivatedInGroup`, and issuer events to stay in sync with chain state.
+Group membership is not passed in API requests. At startup, the chain client calls `getNodeGroups(myAddr)` on the factory to discover which groups this node belongs to, then loads membership and threshold from each group contract.
+
+It then stays in sync by polling for membership, issuer, auth-key, and resolver events. Each tick issues a single `eth_getLogs` covering the factory and every group at once, routing results by emitting address, so RPC cost is flat in group count rather than linear. The default interval is 60s (`chain_poll_secs`); devnet uses 2s since a local Anvil is free.
 
 ### Session coordination
 
@@ -488,17 +549,23 @@ All protocol messages travel over direct libp2p streams using a session-scoped p
 
 ### Cryptography
 
-FROST (RFC 9591) on secp256k1, implemented via ZcashFoundation/frost (Rust). The production path runs FROST keygen and signing in a dedicated Rust KMS process (`kms-tss`) connected to the Go node over a gRPC Unix domain socket. A Go fallback path (`--no-kms`) using `bytemare/frost` is retained for development.
+Three schemes over one gRPC interface, implemented in Rust via `frost-core`, `frost-ed25519`, `frost-secp256k1`, and `k256`:
+
+- **FROST Schnorr / secp256k1** (RFC 9591) — two-round signing
+- **FROST Schnorr / Ed25519** (RFC 9591)
+- **Threshold ECDSA / secp256k1** (DJNPO20) — 4-round robust protocol (3 presign + 1 sign), requires N ≥ 2t+1, produces `ecrecover`-compatible signatures
+
+The production path runs keygen and signing in a dedicated Rust KMS process (`kms-tss`) connected to the Go node over a gRPC Unix domain socket. A Go fallback path (`--no-kms`) using `bytemare/frost` is retained for development; it supports FROST secp256k1 only.
 
 See [docs/KMS-INTEGRATION.md](docs/KMS-INTEGRATION.md) for the KMS architecture, bug fixes, and performance comparison.
 
 ### Key storage
 
-**With KMS (default):** Key material (FROST `KeyPackage`, `PublicKeyPackage`) is persisted in sled on the KMS side, never transmitted to the Go node. The node only sees public keys.
+**With KMS (default):** Key material is persisted in sled on the KMS side, never transmitted to the Go node — the node only sees public keys. Sled keys are curve-prefixed (`0x01` secp256k1, `0x02` ed25519, `0x03` ecdsa_secp256k1), so the same `key_id` under different curves is a different key. Values can be encrypted at rest by setting `SIGNET_KMS_KEY`; note there is no migration path from a plaintext store, so enabling it on existing data requires a wipe.
 
 **Without KMS (`--no-kms`):** Key shards are persisted in a bbolt database (`data_dir/keyshards.db`) in nested buckets: `keyshards → <groupID> → <keyID> → JSON`.
 
 ### Smart contracts
 
 - `SignetFactory` — UUPS upgradeable factory. Registers nodes, deploys `SignetGroup` beacon proxies, maintains a reverse mapping of node → groups.
-- `SignetGroup` — Per-group state: active member set, threshold, OAuth issuer registry with time-delayed add/remove. Notifies the factory on member activation/deactivation.
+- `SignetGroup` — Per-group state: active member set, threshold, OAuth issuer registry, authorization-key registry, and a timelocked on-chain auth resolver binding. Notifies the factory on member activation/deactivation.

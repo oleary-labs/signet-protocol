@@ -302,10 +302,13 @@ type KeyStatusResponse struct {
 
 // DisableKey calls POST /v1/keys/disable.
 func (c *Client) DisableKey(ctx context.Context, keyID string) (*KeyStatusResponse, error) {
-	body, _ := json.Marshal(map[string]string{
-		"group_id": c.groupID,
-		"key_id":   keyID,
-	})
+	// Key-lifecycle operations are session-authenticated too: coord.go lists
+	// msgSetKeyStatus and msgDeleteKey alongside keygen/sign in requiresUserAuth.
+	fields, err := c.decorate(map[string]any{"group_id": c.groupID}, keyID, nil)
+	if err != nil {
+		return nil, err
+	}
+	body, _ := json.Marshal(fields)
 	var resp KeyStatusResponse
 	if err := c.post(ctx, "/v1/keys/disable", body, &resp); err != nil {
 		return nil, err
@@ -315,10 +318,13 @@ func (c *Client) DisableKey(ctx context.Context, keyID string) (*KeyStatusRespon
 
 // EnableKey calls POST /v1/keys/enable.
 func (c *Client) EnableKey(ctx context.Context, keyID string) (*KeyStatusResponse, error) {
-	body, _ := json.Marshal(map[string]string{
-		"group_id": c.groupID,
-		"key_id":   keyID,
-	})
+	// Key-lifecycle operations are session-authenticated too: coord.go lists
+	// msgSetKeyStatus and msgDeleteKey alongside keygen/sign in requiresUserAuth.
+	fields, err := c.decorate(map[string]any{"group_id": c.groupID}, keyID, nil)
+	if err != nil {
+		return nil, err
+	}
+	body, _ := json.Marshal(fields)
 	var resp KeyStatusResponse
 	if err := c.post(ctx, "/v1/keys/enable", body, &resp); err != nil {
 		return nil, err
@@ -328,10 +334,13 @@ func (c *Client) EnableKey(ctx context.Context, keyID string) (*KeyStatusRespons
 
 // DeleteKey calls POST /v1/keys/delete.
 func (c *Client) DeleteKey(ctx context.Context, keyID string) (*KeyStatusResponse, error) {
-	body, _ := json.Marshal(map[string]string{
-		"group_id": c.groupID,
-		"key_id":   keyID,
-	})
+	// Key-lifecycle operations are session-authenticated too: coord.go lists
+	// msgSetKeyStatus and msgDeleteKey alongside keygen/sign in requiresUserAuth.
+	fields, err := c.decorate(map[string]any{"group_id": c.groupID}, keyID, nil)
+	if err != nil {
+		return nil, err
+	}
+	body, _ := json.Marshal(fields)
 	var resp KeyStatusResponse
 	if err := c.post(ctx, "/v1/keys/delete", body, &resp); err != nil {
 		return nil, err
@@ -351,9 +360,14 @@ type AdminKeyEntry struct {
 
 // ListKeys calls POST /admin/keys and returns all keys for the group.
 func (c *Client) ListKeys(ctx context.Context) ([]AdminKeyEntry, error) {
-	body, _ := json.Marshal(map[string]string{
-		"group_id": c.groupID,
-	})
+	fields := map[string]any{"group_id": c.groupID}
+	if c.auth != nil {
+		var err error
+		if fields, err = c.auth.AdminAuthFields(); err != nil {
+			return nil, err
+		}
+	}
+	body, _ := json.Marshal(fields)
 	var resp []AdminKeyEntry
 	if err := c.post(ctx, "/admin/keys", body, &resp); err != nil {
 		return nil, err

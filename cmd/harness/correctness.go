@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/hex"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -393,13 +394,13 @@ func RunCorrectness(ctx context.Context, clients []*Client, newKeyID func() stri
 			"22-scoped-rejects-wrong-chain",
 			func(ctx context.Context) error {
 				kid := newKeyID()
-				_, err := c0.KeygenScoped(ctx, kid, "ecdsa_secp256k1", testScopeHex)
+				kg, err := c0.KeygenScoped(ctx, kid, "ecdsa_secp256k1", testScopeHex)
 				if err != nil {
 					return fmt.Errorf("scoped keygen: %w", err)
 				}
 				// Wrong chainId (42 instead of 1).
 				wrongData := BuildTestTypedData(42, testContract, testTo, "1000000")
-				_, err = c0.SignScoped(ctx, kid, "ecdsa_secp256k1", &SignPayload{
+				_, err = c0.SignScoped(ctx, kg.KeyID, "ecdsa_secp256k1", &SignPayload{
 					Scheme:    "eip712",
 					TypedData: wrongData,
 				})
@@ -416,13 +417,13 @@ func RunCorrectness(ctx context.Context, clients []*Client, newKeyID func() stri
 			"23-scoped-rejects-wrong-contract",
 			func(ctx context.Context) error {
 				kid := newKeyID()
-				_, err := c0.KeygenScoped(ctx, kid, "ecdsa_secp256k1", testScopeHex)
+				kg, err := c0.KeygenScoped(ctx, kid, "ecdsa_secp256k1", testScopeHex)
 				if err != nil {
 					return fmt.Errorf("scoped keygen: %w", err)
 				}
 				wrongContract := common.HexToAddress("0xdead000000000000000000000000000000000000")
 				wrongData := BuildTestTypedData(testChainID, wrongContract, testTo, "1000000")
-				_, err = c0.SignScoped(ctx, kid, "ecdsa_secp256k1", &SignPayload{
+				_, err = c0.SignScoped(ctx, kg.KeyID, "ecdsa_secp256k1", &SignPayload{
 					Scheme:    "eip712",
 					TypedData: wrongData,
 				})
@@ -568,7 +569,8 @@ func RunCorrectness(ctx context.Context, clients []*Client, newKeyID func() stri
 			"35-status-in-key-listing",
 			func(ctx context.Context) error {
 				kid := newKeyID()
-				if _, err := c0.Keygen(ctx, kid); err != nil {
+				kg, err := c0.Keygen(ctx, kid)
+				if err != nil {
 					return fmt.Errorf("keygen: %w", err)
 				}
 				if _, err := c0.DisableKey(ctx, kid); err != nil {
@@ -578,15 +580,19 @@ func RunCorrectness(ctx context.Context, clients []*Client, newKeyID func() stri
 				if err != nil {
 					return fmt.Errorf("list keys: %w", err)
 				}
+				// /v1/keygen strips the internal namespace prefix from key_id
+				// but /admin/keys does not, so the same key reads as
+				// "harness:k1" from one and "authkey:harness:k1" from the
+				// other. Match on the suffix to tolerate both forms.
 				for _, k := range keys {
-					if k.KeyID == kid {
+					if k.KeyID == kg.KeyID || strings.HasSuffix(k.KeyID, ":"+kg.KeyID) {
 						if k.Status != "disabled" {
 							return fmt.Errorf("expected status=disabled in listing, got %q", k.Status)
 						}
 						return nil
 					}
 				}
-				return fmt.Errorf("key %s not found in listing", kid)
+				return fmt.Errorf("key %s not found in listing", kg.KeyID)
 			},
 		},
 	}

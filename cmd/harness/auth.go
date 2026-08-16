@@ -41,7 +41,47 @@ type AuthSession struct {
 	SessionPub string // lowercase hex, 33-byte compressed, no 0x prefix
 	Expiry     uint64
 
+	// authKey is retained beyond certificate issuance because /admin/*
+	// endpoints use a different scheme: the authorization key signs those
+	// directly, rather than delegating to the session key.
+	authKey    *ecdsa.PrivateKey
+	authKeyPub string
+
 	cert *AuthCertificate
+}
+
+// AdminAuthFields builds the payload for admin endpoints. Unlike session auth,
+// the authorization key signs SHA256(group_id ":" nonce ":" timestamp_8bytes_BE)
+// itself — there is no session indirection.
+func (s *AuthSession) AdminAuthFields() (map[string]any, error) {
+	nonce, err := newNonce()
+	if err != nil {
+		return nil, err
+	}
+	ts := uint64(time.Now().Unix())
+
+	h := sha256.New()
+	h.Write([]byte(s.GroupID))
+	h.Write([]byte(":"))
+	h.Write([]byte(nonce))
+	h.Write([]byte(":"))
+	var tsb [8]byte
+	binary.BigEndian.PutUint64(tsb[:], ts)
+	h.Write(tsb[:])
+	var hash [32]byte
+	copy(hash[:], h.Sum(nil))
+
+	sig, err := crypto.Sign(hash[:], s.authKey)
+	if err != nil {
+		return nil, fmt.Errorf("sign admin request: %w", err)
+	}
+	return map[string]any{
+		"group_id":     s.GroupID,
+		"auth_key_pub": s.authKeyPub,
+		"signature":    hex.EncodeToString(sig[:64]),
+		"nonce":        nonce,
+		"timestamp":    ts,
+	}, nil
 }
 
 // NewAuthSession generates an ephemeral session keypair and signs an auth-key
@@ -81,6 +121,8 @@ func NewAuthSession(authKeyHex, identity, groupID string, ttl time.Duration) (*A
 		sessionKey: sessionKey,
 		SessionPub: sessionPub,
 		Expiry:     expiry,
+		authKey:    authKey,
+		authKeyPub: hex.EncodeToString(authKeyPub),
 		cert: &AuthCertificate{
 			Identity:   identity,
 			GroupID:    groupID,

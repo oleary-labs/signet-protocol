@@ -182,13 +182,13 @@ cd testnet/ansible
 # OLL — AWS
 ansible-playbook provision-alpha.yml -e ssh_cidr=<your-ip>/32
 
+# OLL — Vultr
+export VULTR_API_KEY=...
+ansible-playbook provision-vultr.yml -e ssh_cidr=<your-ip>/32
+
 # SFLuv — GCP
 ansible-playbook provision-gcp-alpha.yml \
   -e gcp_project=<project-id> -e ssh_cidr=<your-ip>/32
-
-# SFLuv — Vultr
-export VULTR_API_KEY=...
-ansible-playbook provision-vultr.yml -e ssh_cidr=<your-ip>/32
 ```
 
 `provision-gcp.yml` (singular) is the old single-node playbook for an external
@@ -246,15 +246,30 @@ challenge on port 80, which requires the name to already resolve to the node.
 
 ## Phase 3 — Contracts
 
+Every chain-touching phase requires both `ETH_RPC_URL` and `CHAIN_ID`, and
+refuses to act if the RPC reports a different chain than `CHAIN_ID` claims.
+
+That guard is not only about wasted gas. Scoped keys bind a chainId at keygen
+time (the `0x03` EIP-712 scope), so a key created against the wrong chain is
+silently mis-scoped and fails much later, when a signature is rejected or a
+transfer reverts. It also means each operator confirms the chain independently
+before registering, rather than assuming its RPC and the deployer's agree.
+
+`SEPOLIA_RPC_URL` still works as a deprecated alias, with a notice.
+
 **3a. Deployer only:**
 
 ```bash
-export SEPOLIA_RPC_URL=https://...
+export ETH_RPC_URL=https://...
+export CHAIN_ID=11155111          # Sepolia; 1 = mainnet
 export DEPLOYER_PK=0x...          # fresh key — the old one is compromised
 testnet/scripts/alpha-contracts.sh deploy-factory
 ```
 
-Share the printed `FACTORY_ADDRESS`. Note that whoever holds `DEPLOYER_PK` owns
+On mainnet (`CHAIN_ID=1`) each phase additionally prompts for confirmation
+before spending; set `MAINNET_CONFIRMED=yes` to skip that in automation.
+
+Share the printed `CHAIN_ID` and `FACTORY_ADDRESS`. Note that whoever holds `DEPLOYER_PK` owns
 the factory and the `UpgradeableBeacon`, and can upgrade the `SignetGroup`
 implementation under every group. That is a standing power, not a one-time one.
 
@@ -268,7 +283,7 @@ testnet/scripts/alpha-contracts.sh fund
 **3c. Each operator registers its own nodes:**
 
 ```bash
-export SEPOLIA_RPC_URL=... FACTORY_ADDRESS=0x...
+export ETH_RPC_URL=... CHAIN_ID=11155111 FACTORY_ADDRESS=0x...
 ALPHA_ORG=sfluv testnet/scripts/alpha-contracts.sh register
 ```
 
@@ -310,7 +325,7 @@ GOOS=linux GOARCH=amd64 xcaddy build \
   --with github.com/mholt/caddy-ratelimit --output build/caddy-linux-amd64
 
 cd testnet/ansible
-FACTORY_ADDRESS=0x... SEPOLIA_RPC_URL=... \
+FACTORY_ADDRESS=0x... ETH_RPC_URL=... \
 ansible-playbook -i inventory-alpha.yml deploy.yml \
   --limit org_sfluv --ask-vault-pass
 ```
@@ -367,9 +382,9 @@ rate_limit_exempt_cidrs:
 
 ```bash
 # Over TLS, by name.
-for h in sfluv1.nodes.sfluv.org sfluv2.nodes.sfluv.org \
-         sfluv3.nodes.sfluv.org sfluv4.nodes.sfluv.org \
-         oll1.nodes.olearylabs.com oll2.nodes.olearylabs.com; do
+for h in oll1.nodes.olearylabs.com oll2.nodes.olearylabs.com \
+         oll3.nodes.olearylabs.com oll4.nodes.olearylabs.com \
+         sfluv1.nodes.sfluv.org sfluv2.nodes.sfluv.org; do
   printf "%-32s " "$h"; curl -s --max-time 5 "https://$h/v1/health"; echo
 done
 ```
@@ -425,7 +440,7 @@ Worth testing explicitly, since it is newly real: stop one node and confirm
 signing continues.
 
 ```bash
-ansible-playbook -i inventory-alpha.yml manage.yml -e action=stop --limit sfluv4
+ansible-playbook -i inventory-alpha.yml manage.yml -e action=stop --limit oll4
 ./build/harness -env testnet/.env-alpha correctness
 ```
 

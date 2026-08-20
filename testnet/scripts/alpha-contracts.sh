@@ -23,18 +23,17 @@
 # Only `register` touches private key material, and it only ever reads the
 # running operator's own testnet/data/nodes-<org>.json.
 #
+# Every chain-touching phase requires ETH_RPC_URL and CHAIN_ID, and refuses to
+# act if the RPC reports a different chain than CHAIN_ID claims. Mainnet
+# additionally prompts unless MAINNET_CONFIRMED=yes.
+#
 # Usage:
-#   SEPOLIA_RPC_URL=https://... DEPLOYER_PK=0x... \
-#     testnet/scripts/alpha-contracts.sh deploy-factory
+#   export ETH_RPC_URL=https://...  CHAIN_ID=11155111   # Sepolia
 #
-#   SEPOLIA_RPC_URL=... DEPLOYER_PK=... FACTORY_ADDRESS=0x... \
-#     testnet/scripts/alpha-contracts.sh fund
-#
-#   SEPOLIA_RPC_URL=... FACTORY_ADDRESS=0x... ALPHA_ORG=sfluv \
-#     testnet/scripts/alpha-contracts.sh register
-#
-#   SEPOLIA_RPC_URL=... DEPLOYER_PK=... FACTORY_ADDRESS=0x... \
-#     testnet/scripts/alpha-contracts.sh create-group 3
+#   DEPLOYER_PK=0x... testnet/scripts/alpha-contracts.sh deploy-factory
+#   DEPLOYER_PK=0x... FACTORY_ADDRESS=0x... testnet/scripts/alpha-contracts.sh fund
+#   FACTORY_ADDRESS=0x... ALPHA_ORG=sfluv testnet/scripts/alpha-contracts.sh register
+#   DEPLOYER_PK=0x... FACTORY_ADDRESS=0x... testnet/scripts/alpha-contracts.sh create-group 3
 #
 # `fund`, `create-group` and `write-env` read every testnet/data/manifest-*.json
 # present, so collect the other operators' manifests first.
@@ -53,9 +52,68 @@ info() { echo "==> $*"; }
 command -v jq   >/dev/null 2>&1 || die "'jq' not found"
 command -v cast >/dev/null 2>&1 || die "'cast' not found — install Foundry"
 
+# The chain is a value, not a variable name. SEPOLIA_RPC_URL baked the network
+# into the interface, so a mainnet deploy would have been performed by pointing
+# a variable called SEPOLIA at mainnet — misleading to read and impossible to
+# validate. ETH_RPC_URL is the name now; the old one still works so a
+# stand-up already in progress does not break.
 need_rpc() {
-    [[ -n "${SEPOLIA_RPC_URL:-}" ]] || die "SEPOLIA_RPC_URL not set"
-    RPC="$SEPOLIA_RPC_URL"
+    RPC="${ETH_RPC_URL:-}"
+    if [[ -z "$RPC" && -n "${SEPOLIA_RPC_URL:-}" ]]; then
+        RPC="$SEPOLIA_RPC_URL"
+        echo "NOTE: SEPOLIA_RPC_URL is deprecated; use ETH_RPC_URL." >&2
+    fi
+    [[ -n "$RPC" ]] || die "ETH_RPC_URL not set"
+}
+
+chain_name() {
+    case "$1" in
+        1)        echo "Ethereum MAINNET" ;;
+        11155111) echo "Sepolia" ;;
+        17000)    echo "Holesky" ;;
+        560048)   echo "Hoodi" ;;
+        8453)     echo "Base" ;;
+        84532)    echo "Base Sepolia" ;;
+        31337)    echo "local (anvil/hardhat)" ;;
+        *)        echo "chain $1" ;;
+    esac
+}
+
+# need_chain refuses to act until the operator's stated CHAIN_ID matches what
+# the RPC actually reports.
+#
+# This matters beyond "wrong network, wasted gas". Scoped keys bind a chainId
+# at keygen time (the 0x03 EIP-712 scope), so a key created against the wrong
+# chain is silently mis-scoped and only fails much later, when a signature is
+# rejected or a transfer reverts. Catching it here is the difference between an
+# error message and a debugging session.
+#
+# It also means every operator independently confirms the chain before
+# registering, rather than trusting that the deployer's RPC and theirs agree.
+need_chain() {
+    need_rpc
+    [[ -n "${CHAIN_ID:-}" ]] || die "CHAIN_ID not set (11155111 = Sepolia, 1 = mainnet)"
+
+    local actual
+    actual=$(cast chain-id --rpc-url "$RPC" 2>/dev/null) \
+        || die "could not read the chain id from the RPC — is ETH_RPC_URL reachable?"
+
+    if [[ "$actual" != "$CHAIN_ID" ]]; then
+        die "chain mismatch — refusing to continue.
+     you asked for : $CHAIN_ID ($(chain_name "$CHAIN_ID"))
+     the RPC is    : $actual ($(chain_name "$actual"))
+     Either the RPC URL or CHAIN_ID is wrong. Fix whichever one you did not
+     intend before any on-chain state is created."
+    fi
+
+    info "Chain: $(chain_name "$actual") ($actual)"
+
+    # Mainnet spends real money and creates permanent state. Make it deliberate.
+    if [[ "$actual" == "1" && "${MAINNET_CONFIRMED:-}" != "yes" ]]; then
+        echo
+        read -r -p "This is Ethereum MAINNET. Type 'mainnet' to proceed: " reply
+        [[ "$reply" == "mainnet" ]] || die "aborted (set MAINNET_CONFIRMED=yes to skip this prompt in automation)"
+    fi
 }
 need_deployer() {
     [[ -n "${DEPLOYER_PK:-}" ]] || die "DEPLOYER_PK not set"
@@ -86,7 +144,7 @@ all_nodes() {
 
 # --------------------------------------------------------------------------
 cmd_deploy_factory() {
-    need_rpc; need_deployer
+    need_chain; need_deployer
     local deployer
     deployer=$(cast wallet address "$DEPLOYER_PK")
     info "Deployer: $deployer"
@@ -108,18 +166,20 @@ Factory:   $factory
 Beacon:    $beacon
 GroupImpl: $impl
 
-Share FACTORY_ADDRESS with the other operators — they need it to register.
+Share these with the other operators — they need both to register, and the
+chain id is what stops them registering against the wrong network.
 
+  export CHAIN_ID=$CHAIN_ID
   export FACTORY_ADDRESS=$factory
 EOF
-    printf 'FACTORY_ADDRESS=%s\nGROUP_BEACON=%s\nGROUP_IMPL=%s\n' \
-        "$factory" "$beacon" "$impl" > "$DATA/factory.env"
+    printf 'CHAIN_ID=%s\nFACTORY_ADDRESS=%s\nGROUP_BEACON=%s\nGROUP_IMPL=%s\n' \
+        "$CHAIN_ID" "$factory" "$beacon" "$impl" > "$DATA/factory.env"
     info "Wrote $DATA/factory.env"
 }
 
 # --------------------------------------------------------------------------
 cmd_fund() {
-    need_rpc; need_deployer
+    need_chain; need_deployer
     local amount="${FUND_AMOUNT:-0.02ether}"
     info "Funding every manifest node with $amount (gas for its own registerNode)"
 
@@ -138,7 +198,7 @@ cmd_fund() {
 
 # --------------------------------------------------------------------------
 cmd_register() {
-    need_rpc; need_factory
+    need_chain; need_factory
     local org="${ALPHA_ORG:-}"
     [[ -n "$org" ]] || die "ALPHA_ORG not set — register only handles your own org's nodes"
 
@@ -186,7 +246,7 @@ cmd_register() {
 
 # --------------------------------------------------------------------------
 cmd_create_group() {
-    need_rpc; need_deployer; need_factory
+    need_chain; need_deployer; need_factory
     local threshold="${1:-}"
     [[ -n "$threshold" ]] || die "usage: alpha-contracts.sh create-group <threshold>"
 
@@ -266,6 +326,7 @@ cmd_write_env() {
     local hosts="$TESTNET/.hosts-alpha"
     {
         echo "RPC_URL=${RPC}"
+        echo "CHAIN_ID=${CHAIN_ID:-unknown}"
         echo "FACTORY_ADDRESS=${FACTORY_ADDRESS}"
         echo "GROUP_ADDRESS=${GROUP_ADDRESS:-FILL_ME}"
         echo "USE_KMS=true"

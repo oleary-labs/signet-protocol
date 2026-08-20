@@ -31,9 +31,10 @@
           - eth_rpc is defined and eth_rpc != ''
           - factory_address is defined and factory_address != ''
         fail_msg: >
-          Missing required variables. Ensure inventory.yml has IPs,
-          host_vars have peer_id, and SEPOLIA_RPC_URL + FACTORY_ADDRESS
-          are set in the environment.
+          Missing required variables. Ensure inventory-alpha.yml has IPs,
+          host_vars have peer_id, and ETH_RPC_URL + FACTORY_ADDRESS are set
+          in the environment (SEPOLIA_RPC_URL is accepted as a deprecated
+          alias).
 
     - name: Create signet user early (needed for /run/signet ownership)
       user:

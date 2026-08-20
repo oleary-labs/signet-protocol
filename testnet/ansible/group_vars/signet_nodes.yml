@@ -83,6 +83,19 @@ rate_limit_exempt_cidrs: []
 # Secrets dir, kept separate from signetd_config_dir so its 0750 root:signet
 # perms do not fight the 0755 signet:signet the config dir wants.
 signet_secrets_dir: /etc/signet/secrets
+
+# --- Chain connection ---
+#
+# Read from the environment, which is how ALPHA-RUNBOOK.md and deploy.yml's own
+# fail message say to supply them. They were previously defined nowhere in the
+# repo at all — they lived only in the gitignored inventory.yml, so the
+# documented deploy command failed the assert in deploy.yml on a fresh clone.
+#
+# ETH_RPC_URL is the current name; SEPOLIA_RPC_URL is honoured as a deprecated
+# alias so a stand-up already underway keeps working. Override either with
+# -e eth_rpc=... if you prefer not to use the environment.
+eth_rpc: "{{ lookup('env', 'ETH_RPC_URL') or lookup('env', 'SEPOLIA_RPC_URL') }}"
+factory_address: "{{ lookup('env', 'FACTORY_ADDRESS') }}"
 signetd_env_file: "{{ signet_secrets_dir }}/signetd.env"
 
 # KMS configuration

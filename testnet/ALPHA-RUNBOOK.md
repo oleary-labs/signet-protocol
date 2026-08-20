@@ -308,6 +308,20 @@ That last part is informational. It refuses only for things that would not
 work — an unregistered member, or `N < 2T-1` — never for a distribution it
 disapproves of.
 
+**3e. Build the harness env file** (anyone, once the group exists and all the
+`.hosts-alpha` fragments are merged):
+
+```bash
+testnet/scripts/alpha-contracts.sh write-env
+```
+
+Writes `testnet/.env-alpha` from `testnet/data/factory.env` plus every
+`manifest-*.json` — this is the file Phase 6 runs against. It prefers each
+node's TLS hostname and only falls back to `http://<ip>:8080`, which it marks
+`INSECURE` and warns about, because a cleartext endpoint leaks delegation
+tokens. A `FILL_IP` in the output means a manifest arrived without a hostname
+and that node's address is missing from the merged fragments.
+
 ---
 
 ## Phase 4 — Deploy (each operator, own nodes only)
@@ -468,8 +482,8 @@ Each operator tears down its own:
 
 ```bash
 ansible-playbook teardown-alpha.yml                              # OLL, AWS
+ansible-playbook teardown-vultr.yml                              # OLL, Vultr
 ansible-playbook teardown-gcp-alpha.yml -e gcp_project=<id>      # SFLuv, GCP
-ansible-playbook teardown-vultr.yml                              # SFLuv, Vultr
 ```
 
 All three prompt before destroying, because destroying an instance destroys its
@@ -493,6 +507,9 @@ gcloud compute instances list --filter="labels.project=signet-alpha"  # all GCP 
 - **No backup mechanism** (`docs/PRODUCTION-GAPS.md`). Losing more than `N-T`
   nodes is permanent key loss.
 - **No CI.** Nothing verifies a PR server-side; the repo is not `gofmt`-clean.
-- **Rate limiting on `/v1/auth`** before any public exposure (audit M2 / R-6).
+- **Rate limiting is per node, not per group.** Caddy counts per client IP on
+  each machine independently, so a caller spread across six nodes gets six times
+  the quota, and one behind a shared NAT is throttled on behalf of everyone
+  sharing it. Adequate for the alpha; not a substitute for per-identity limits.
 - **Mid-session dropout is not recovered** — see
   `docs/DESIGN-SIGNER-SELECTION.md`.

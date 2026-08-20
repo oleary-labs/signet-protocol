@@ -24,11 +24,8 @@
   vars:
     project_tag: signet-alpha
     nodes:
-      - { name: alpha1, region: us-east-1 }
-      - { name: alpha2, region: us-west-2 }
-      - { name: alpha3, region: eu-west-1 }
-      - { name: alpha4, region: ap-southeast-1 }
-      - { name: alpha5, region: sa-east-1 }
+      - { name: oll1, region: us-west-1 }   # N. California
+      - { name: oll2, region: us-west-2 }   # Oregon
 
   tasks:
     - name: Derive the distinct region list
@@ -91,10 +88,20 @@
       loop_control:
         label: "{{ item }}"
 
-    - name: Remove generated .hosts-alpha
-      file:
-        path: "{{ playbook_dir }}/../.hosts-alpha"
+    # Remove only THIS cloud's lines. .hosts-alpha and .clouds-alpha are shared
+    # fragments covering every node across all three providers, so deleting the
+    # files outright would take the Vultr and GCP entries with them and leave
+    # build-inventory.sh unable to resolve their addresses. Matches how
+    # teardown-vultr.yml and teardown-gcp-alpha.yml prune.
+    - name: Drop the destroyed hosts from the local fragments
+      lineinfile:
+        path: "{{ playbook_dir }}/../{{ item[0] }}"
+        regexp: "^{{ item[1].name }}="
         state: absent
+      loop: "{{ ['.hosts-alpha', '.clouds-alpha'] | product(nodes) | list }}"
+      loop_control:
+        label: "{{ item[0] }}: {{ item[1].name }}"
+      failed_when: false
 
     - name: Done
       debug:

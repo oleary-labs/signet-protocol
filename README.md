@@ -553,7 +553,7 @@ Three schemes over one gRPC interface, implemented in Rust via `frost-core`, `fr
 
 - **FROST Schnorr / secp256k1** (RFC 9591) — two-round signing
 - **FROST Schnorr / Ed25519** (RFC 9591)
-- **Threshold ECDSA / secp256k1** (DJNPO20) — 4-round robust protocol (3 presign + 1 sign), requires N ≥ 2t+1, produces `ecrecover`-compatible signatures
+- **Threshold ECDSA / secp256k1** (DJNPO20) — 4-round robust protocol (3 presign + 1 sign), produces `ecrecover`-compatible signatures. Unlike FROST it is **not** T-of-N: signing a T-of-N key needs **at least `2T-1` signers in the session**, so a 3-of-6 group tolerates one node being down and a 2-of-3 group tolerates none. Below that bound the protocol completes and returns a well-formed signature that does not verify. See [docs/DESIGN-SIGNER-SELECTION.md](docs/DESIGN-SIGNER-SELECTION.md)
 
 The production path runs keygen and signing in a dedicated Rust KMS process (`kms-tss`) connected to the Go node over a gRPC Unix domain socket. A Go fallback path (`--no-kms`) using `bytemare/frost` is retained for development; it supports FROST secp256k1 only.
 

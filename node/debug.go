@@ -13,11 +13,11 @@ import (
 // debugStats is the response from GET /debug/stats.
 type debugStats struct {
 	// Go runtime
-	Goroutines int    `json:"goroutines"`
+	Goroutines int     `json:"goroutines"`
 	HeapMB     float64 `json:"heap_mb"`
 	StackMB    float64 `json:"stack_mb"`
 	SysMB      float64 `json:"sys_mb"`
-	NumGC      uint32 `json:"num_gc"`
+	NumGC      uint32  `json:"num_gc"`
 
 	// Process
 	OpenFDs int    `json:"open_fds"`
@@ -34,6 +34,26 @@ type debugStats struct {
 
 	// Per-peer connection details (optional, only if few peers)
 	Peers []peerInfo `json:"peers,omitempty"`
+
+	// Signing readiness per group: which members the node believes can sign
+	// right now, and how many a signature actually needs. This is what
+	// explains a "insufficient available signers" rejection or an unexpected
+	// choice of signer set.
+	Groups []groupLiveness `json:"groups,omitempty"`
+}
+
+// groupLiveness reports a group's membership health and the per-scheme signer
+// counts derived from its threshold.
+type groupLiveness struct {
+	GroupID   string       `json:"group_id"`
+	Threshold int          `json:"threshold"`
+	Members   int          `json:"members"`
+	Healthy   int          `json:"healthy"`
+	NeedFROST int          `json:"need_frost"`
+	NeedECDSA int          `json:"need_ecdsa"`
+	CanFROST  bool         `json:"can_sign_frost"`
+	CanECDSA  bool         `json:"can_sign_ecdsa"`
+	Peers     []PeerStatus `json:"peers"`
 }
 
 type peerInfo struct {
@@ -87,6 +107,35 @@ func (n *Node) handleDebugStats(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 
+	// Signing readiness per group.
+	var groupStats []groupLiveness
+	if n.liveness != nil {
+		n.groupsMu.RLock()
+		for gid, g := range n.groups {
+			peerStats := n.liveness.Snapshot(g.Members)
+			healthy := 0
+			for _, ps := range peerStats {
+				if ps.Healthy {
+					healthy++
+				}
+			}
+			needFrost := requiredSigners(CurveSecp256k1, g.Threshold)
+			needEcdsa := requiredSigners(CurveEcdsaSecp256k1, g.Threshold)
+			groupStats = append(groupStats, groupLiveness{
+				GroupID:   gid,
+				Threshold: g.Threshold,
+				Members:   len(g.Members),
+				Healthy:   healthy,
+				NeedFROST: needFrost,
+				NeedECDSA: needEcdsa,
+				CanFROST:  healthy >= needFrost,
+				CanECDSA:  healthy >= needEcdsa,
+				Peers:     peerStats,
+			})
+		}
+		n.groupsMu.RUnlock()
+	}
+
 	stats := debugStats{
 		Goroutines: runtime.NumGoroutine(),
 		HeapMB:     float64(m.HeapAlloc) / 1024 / 1024,
@@ -100,10 +149,11 @@ func (n *Node) handleDebugStats(w http.ResponseWriter, r *http.Request) {
 		PeerCount:       len(h.Network().Peers()),
 		ConnectionCount: totalConns,
 		StreamCount:     totalStreams,
-		InboundStreams:   inStreams,
-		OutboundStreams:  outStreams,
+		InboundStreams:  inStreams,
+		OutboundStreams: outStreams,
 
-		Peers: peers,
+		Peers:  peers,
+		Groups: groupStats,
 	}
 
 	w.Header().Set("Content-Type", "application/json")

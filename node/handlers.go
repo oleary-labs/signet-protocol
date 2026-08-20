@@ -117,14 +117,14 @@ func (n *Node) handleListKeys(w http.ResponseWriter, r *http.Request) {
 func (n *Node) handleAuth(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		GroupID     string `json:"group_id"`
-		Proof       string `json:"proof"`         // ZK proof hex
-		SessionPub  string `json:"session_pub"`   // hex, 33-byte compressed secp256k1
-		Sub         string `json:"sub"`           // JWT subject
-		Iss         string `json:"iss"`           // JWT issuer
-		Exp         uint64 `json:"exp"`           // JWT expiry unix timestamp
-		Aud         string `json:"aud"`           // JWT audience
-		Azp         string `json:"azp"`           // JWT authorized party
-		JWKSModulus string `json:"jwks_modulus"`  // RSA modulus hex
+		Proof       string `json:"proof"`        // ZK proof hex
+		SessionPub  string `json:"session_pub"`  // hex, 33-byte compressed secp256k1
+		Sub         string `json:"sub"`          // JWT subject
+		Iss         string `json:"iss"`          // JWT issuer
+		Exp         uint64 `json:"exp"`          // JWT expiry unix timestamp
+		Aud         string `json:"aud"`          // JWT audience
+		Azp         string `json:"azp"`          // JWT authorized party
+		JWKSModulus string `json:"jwks_modulus"` // RSA modulus hex
 
 		// Authorization key certificate fields
 		Certificate *AuthCertificate `json:"certificate,omitempty"`
@@ -419,11 +419,11 @@ func (n *Node) handleAuth(w http.ResponseWriter, r *http.Request) {
 
 	pubHex := sessionPubToHex(sessionPubBytes)
 	n.sessions.Put(pubHex, &SessionInfo{
-		Sub:         req.Sub, // raw sub from JWT, not the compound iss:sub
-		Iss:         req.Iss,
-		Exp:         time.Unix(int64(req.Exp), 0),
-		Aud:         req.Aud,
-		Azp:         req.Azp,
+		Sub: req.Sub, // raw sub from JWT, not the compound iss:sub
+		Iss: req.Iss,
+		Exp: time.Unix(int64(req.Exp), 0),
+		Aud: req.Aud,
+		Azp: req.Azp,
 	})
 	n.log.Info("auth: session registered (ZK proof)",
 		zap.String("group_id", req.GroupID),
@@ -776,45 +776,9 @@ func (n *Node) handleSign(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	sortedSigners := tss.NewPartyIDSlice(grp.Members)
-	if !sortedSigners.Contains(keyInfo.PartyID) {
+	if !tss.NewPartyIDSlice(grp.Members).Contains(keyInfo.PartyID) {
 		n.httpError(w, http.StatusBadRequest, "this node is not a member of group "+req.GroupID)
 		return
-	}
-
-	nonce, err := randomNonce()
-	if err != nil {
-		n.httpError(w, http.StatusInternalServerError, "generate nonce: "+err.Error())
-		return
-	}
-	sessID := signSessionID(req.GroupID, keyID, nonce)
-
-	n.log.Info("sign starting",
-		zap.String("group_id", req.GroupID),
-		zap.String("key_id", keyID),
-		zap.Int("signers", len(sortedSigners)),
-	)
-
-	sn, err := network.NewSessionNetwork(r.Context(), n.host, sessID, sortedSigners)
-	if err != nil {
-		n.httpError(w, http.StatusInternalServerError, "session network: "+err.Error())
-		return
-	}
-	defer sn.Close()
-
-	// For ECDSA, the initiating node is the coordinator (aggregates
-	// signature shares). Ensure self is first in the signer list so
-	// the KMS assigns coordinator role to this node's party_id.
-	signersForCoord := sortedSigners
-	if signCurve == CurveEcdsaSecp256k1 {
-		self := tss.PartyID(n.host.Self())
-		signersForCoord = make([]tss.PartyID, 0, len(sortedSigners))
-		signersForCoord = append(signersForCoord, self)
-		for _, s := range sortedSigners {
-			if s != self {
-				signersForCoord = append(signersForCoord, s)
-			}
-		}
 	}
 
 	// Serialize payload for coord message (so participants can verify scope).
@@ -828,37 +792,22 @@ func (n *Node) handleSign(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	if err := n.broadcastCoord(r.Context(), sortedSigners, coordMsg{
-		Type:        msgSign,
-		GroupID:     req.GroupID,
-		KeyID:       keyID,
-		SignNonce:   nonce,
-		Signers:     signersForCoord,
-		MessageHash: msgHash,
-		Curve:       string(signCurve),
-		SignPayload: signPayloadBytes,
-		Session:     authProof,
-	}); err != nil {
-		n.httpError(w, http.StatusInternalServerError, "coordinate: "+err.Error())
-		return
-	}
-
-	sig, err := n.km.RunSign(r.Context(), SignParams{
-		Host:        n.host,
-		SN:          sn,
-		SessionID:   sessID,
-		GroupID:     req.GroupID,
-		KeyID:       keyID,
-		Signers:     signersForCoord,
-		MessageHash: msgHash,
-		Curve:       signCurve,
-	})
+	sig, err := n.runThresholdSign(r.Context(), grp, signCurve, req.GroupID, keyID, msgHash,
+		func(nonce string, signersForCoord []tss.PartyID) coordMsg {
+			return coordMsg{
+				Type:        msgSign,
+				GroupID:     req.GroupID,
+				KeyID:       keyID,
+				SignNonce:   nonce,
+				Signers:     signersForCoord,
+				MessageHash: msgHash,
+				Curve:       string(signCurve),
+				SignPayload: signPayloadBytes,
+				Session:     authProof,
+			}
+		})
 	if err != nil {
-		n.log.Error("sign failed",
-			zap.String("group_id", req.GroupID),
-			zap.String("key_id", keyID),
-			zap.Error(err))
-		n.httpError(w, http.StatusInternalServerError, "sign: "+err.Error())
+		n.writeSignError(w, req.GroupID, keyID, err)
 		return
 	}
 

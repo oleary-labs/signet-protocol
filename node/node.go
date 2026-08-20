@@ -61,6 +61,10 @@ type Node struct {
 
 	bootstrapPeers []peer.AddrInfo // parsed bootstrap peer addresses for reconnect
 
+	// liveness tracks which group members are reachable, so signing can use
+	// the minimum viable signer set instead of every member. See liveness.go.
+	liveness *Liveness
+
 	// Reshare state: per-group job tracking, per-key session channels,
 	// coordinator flags. See reshare.go for methods.
 	reshareStore   *ReshareStore
@@ -239,7 +243,9 @@ func New(cfg *Config, log *zap.Logger) (*Node, error) {
 	}
 	n.initReshareState(reshareStore)
 	n.sessions.startCleanupLoop(ctx)
+	n.liveness = newLiveness(n, tss.PartyID(h.Self()), log)
 	go n.reconnectLoop(ctx)
+	go n.liveness.probeLoop(ctx)
 
 	// Wire the chain client when eth_rpc and factory_address are configured.
 	if cfg.EthRPC != "" && cfg.FactoryAddress != "" {

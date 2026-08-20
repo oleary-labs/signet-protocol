@@ -42,6 +42,46 @@
     group: "{{ signetd_user }}"
     mode: "0700"
 
+# --- At-rest encryption KEK ---
+#
+# kms-tss enables encryption purely on the presence of SIGNET_KMS_KEY
+# (src/main.rs:97). There is no migration path between a plaintext and an
+# encrypted sled store, so this must be correct before the first keygen and
+# must never silently flip back.
+
+- name: Assert a KEK is available when at-rest encryption is enabled
+  assert:
+    that:
+      - kms_kek is defined
+      - kms_kek | length == 64
+    fail_msg: >
+      kms_at_rest_encryption is true but {{ inventory_hostname }} has no valid
+      kms_kek (expected 64 hex chars / 32 bytes). Run
+      testnet/scripts/init-alpha.sh to generate per-node KEKs.
+  when: kms_at_rest_encryption | default(false) | bool
+
+- name: Create /etc/signet for the KEK env file
+  become: true
+  file:
+    path: "{{ kms_env_file | dirname }}"
+    state: directory
+    owner: root
+    group: "{{ signetd_user }}"
+    mode: "0750"
+  when: kms_at_rest_encryption | default(false) | bool
+
+- name: Install KEK env file
+  become: true
+  copy:
+    content: "SIGNET_KMS_KEY={{ kms_kek }}\n"
+    dest: "{{ kms_env_file }}"
+    owner: root
+    group: "{{ signetd_user }}"
+    mode: "0640"
+  no_log: true
+  when: kms_at_rest_encryption | default(false) | bool
+  notify: restart kms-tss
+
 - name: Upload kms-tss binary
   become: true
   copy:

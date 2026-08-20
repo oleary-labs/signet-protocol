@@ -43,6 +43,36 @@
   when: local_node_key_path is defined
   notify: restart signetd
 
+# --- node.key passphrase ---
+#
+# network.LoadOrGenerateKey only ENCRYPTS on generation; it decrypts any file
+# carrying the SIGNETK1 magic. So a node whose key was generated with a
+# passphrase cannot start without it, while one generated plaintext ignores it.
+# EnvironmentFile (not Environment=) for the same reason as the KMS KEK: the
+# unit is mode 0644 and rendered by `systemctl show`.
+
+- name: Create /etc/signet for the node-key env file
+  become: true
+  file:
+    path: "{{ signetd_env_file | dirname }}"
+    state: directory
+    owner: root
+    group: "{{ signetd_user }}"
+    mode: "0750"
+  when: node_key_passphrase is defined and node_key_passphrase | length > 0
+
+- name: Install node-key passphrase env file
+  become: true
+  copy:
+    content: "SIGNET_NODE_KEY_PASSPHRASE={{ node_key_passphrase }}\n"
+    dest: "{{ signetd_env_file }}"
+    owner: root
+    group: "{{ signetd_user }}"
+    mode: "0640"
+  no_log: true
+  when: node_key_passphrase is defined and node_key_passphrase | length > 0
+  notify: restart signetd
+
 - name: Write node config
   become: true
   template:

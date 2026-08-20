@@ -1,0 +1,192 @@
+---
+# provision-gcp-alpha.yml — Launch multiple Signet alpha nodes on GCP.
+#
+# provision-gcp.yml provisions exactly ONE node (it was written for a single
+# external operator joining the testnet) and appends to the old inventory.yml.
+# That is left alone; this is the multi-node equivalent for the alpha, matching
+# provision-alpha.yml (AWS) and provision-vultr.yml.
+#
+# GCP has no Bay Area region. us-west1 (Oregon), us-west2 (Los Angeles) and
+# us-west4 (Las Vegas) are the closest; AWS us-west-1 and Vultr sjc are nearer
+# to San Francisco. Spread across zones so a single-zone incident cannot take
+# more than one node.
+#
+# Prerequisites:
+#   - gcloud CLI authenticated:  gcloud auth application-default login
+#   - google.cloud collection:   ansible-galaxy collection install google.cloud
+#   - pip3 install google-auth requests
+#   - An SSH public key at ssh_public_key_path
+#
+# Usage:
+#   ansible-playbook provision-gcp-alpha.yml -e gcp_project=<project-id>
+#   ansible-playbook provision-gcp-alpha.yml -e gcp_project=<id> -e ssh_cidr=203.0.113.7/32
+
+- name: Provision Signet alpha nodes on GCP
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars:
+    gcp_project: ""
+    org: sfluv
+    project_tag: signet-alpha
+    machine_type: e2-medium      # 2 vCPU, 4 GB — comparable to t3.medium
+    disk_size_gb: 20
+    image_family: ubuntu-2404-lts-amd64
+    image_project: ubuntu-os-cloud
+    network: default
+    ssh_user: ubuntu
+    ssh_public_key_path: "~/.ssh/signet-alpha.pub"
+    auth_kind: application
+    ssh_cidr: "0.0.0.0/0"
+
+    # See provision-alpha.yml — 443 + 80 with TLS, 8080 without, never both.
+    use_tls: true
+
+    # ---- Topology: the block to edit ----
+    nodes:
+      - { name: sfluv1, zone: us-west1-a }   # Oregon
+      - { name: sfluv2, zone: us-west2-a }   # Los Angeles
+
+  tasks:
+    - name: Validate gcp_project
+      assert:
+        that: gcp_project != ""
+        fail_msg: "gcp_project is required: -e gcp_project=your-project-id"
+
+    - name: Report plan
+      debug:
+        msg: >-
+          {{ nodes | length }} GCP nodes for org '{{ org }}'
+          ({{ nodes | map(attribute='zone') | join(', ') }}),
+          {{ machine_type }} in project {{ gcp_project }}
+
+    # Separate rules so SSH can be narrowed independently of the protocol
+    # ports, which genuinely must be world-reachable.
+    - name: Ensure firewall rule for libp2p and the HTTP API
+      google.cloud.gcp_compute_firewall:
+        name: signet-alpha-allow-protocol
+        project: "{{ gcp_project }}"
+        auth_kind: "{{ auth_kind }}"
+        network:
+          selfLink: "global/networks/{{ network }}"
+        allowed:
+          - ip_protocol: tcp
+            ports: "{{ ['9000', '443', '80'] if use_tls | bool else ['9000', '8080'] }}"
+        source_ranges: ["0.0.0.0/0"]
+        target_tags: ["signet-alpha"]
+        state: present
+
+    - name: Ensure firewall rule for SSH
+      google.cloud.gcp_compute_firewall:
+        name: signet-alpha-allow-ssh
+        project: "{{ gcp_project }}"
+        auth_kind: "{{ auth_kind }}"
+        network:
+          selfLink: "global/networks/{{ network }}"
+        allowed:
+          - ip_protocol: tcp
+            ports: ["22"]
+        source_ranges: ["{{ ssh_cidr }}"]
+        target_tags: ["signet-alpha"]
+        state: present
+
+    - name: Ensure instances
+      google.cloud.gcp_compute_instance:
+        name: "{{ item.name }}"
+        project: "{{ gcp_project }}"
+        auth_kind: "{{ auth_kind }}"
+        zone: "{{ item.zone }}"
+        machine_type: "{{ machine_type }}"
+        disks:
+          - auto_delete: true
+            boot: true
+            initialize_params:
+              source_image: "projects/{{ image_project }}/global/images/family/{{ image_family }}"
+              disk_size_gb: "{{ disk_size_gb }}"
+              disk_type: pd-balanced
+        network_interfaces:
+          - network:
+              selfLink: "global/networks/{{ network }}"
+            access_configs:
+              - name: External NAT
+                type: ONE_TO_ONE_NAT
+        tags:
+          items: ["signet-alpha"]
+        labels:
+          project: "{{ project_tag }}"
+          org: "{{ org }}"
+          node: "{{ item.name }}"
+        metadata:
+          ssh-keys: "{{ ssh_user }}:{{ lookup('file', ssh_public_key_path) }}"
+        state: present
+      loop: "{{ nodes }}"
+      loop_control:
+        label: "{{ item.name }} ({{ item.zone }})"
+      register: gcp_instances
+
+    - name: Build name → IP map
+      set_fact:
+        instance_ips: >-
+          {{ instance_ips | default({}) | combine({
+               item.item.name: item.networkInterfaces[0].accessConfigs[0].natIP
+             }) }}
+      loop: "{{ gcp_instances.results }}"
+      loop_control:
+        label: "{{ item.item.name }}"
+
+    - name: Fail if any instance has no external address
+      assert:
+        that:
+          - instance_ips[item.name] is defined
+          - instance_ips[item.name] | length > 0
+        fail_msg: "{{ item.name }} came up without an external IP"
+      loop: "{{ nodes }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: Show addresses
+      debug:
+        msg: "{{ item.key }}: {{ item.value }}"
+      loop: "{{ instance_ips | dict2items }}"
+      loop_control:
+        label: "{{ item.key }}"
+
+    - name: Append to .hosts-alpha
+      lineinfile:
+        path: "{{ playbook_dir }}/../.hosts-alpha"
+        regexp: "^{{ item.key }}="
+        line: "{{ item.key }}={{ item.value }}"
+        create: true
+        mode: "0644"
+      loop: "{{ instance_ips | dict2items }}"
+      loop_control:
+        label: "{{ item.key }}"
+
+    - name: Record cloud for each node
+      lineinfile:
+        path: "{{ playbook_dir }}/../.clouds-alpha"
+        regexp: "^{{ item.name }}="
+        line: "{{ item.name }}=gcp"
+        create: true
+        mode: "0644"
+      loop: "{{ nodes }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: Wait for SSH
+      wait_for:
+        host: "{{ item.value }}"
+        port: 22
+        timeout: 300
+        state: started
+      loop: "{{ instance_ips | dict2items }}"
+      loop_control:
+        label: "{{ item.key }}"
+
+    - name: Done
+      debug:
+        msg: >-
+          {{ nodes | length }} GCP instances ready. Wrote ../.hosts-alpha and
+          ../.clouds-alpha. Merge the other clouds' fragments, then run
+          testnet/scripts/build-inventory.sh.

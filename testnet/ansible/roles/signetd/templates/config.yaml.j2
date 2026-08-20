@@ -1,6 +1,6 @@
 data_dir: {{ signetd_data_dir }}
 listen_addr: /ip4/0.0.0.0/tcp/{{ p2p_port }}
-api_addr: :{{ api_port }}
+api_addr: {{ api_bind }}:{{ api_port }}
 announce_addr: /ip4/{{ ansible_host }}/tcp/{{ p2p_port }}
 bootstrap_peers:
 {% for host in groups['signet_nodes'] %}

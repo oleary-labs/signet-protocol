@@ -3,7 +3,13 @@
 #
 # Reads the pinned bb version from signet-circuits/toolchain.json so there is
 # exactly one source of truth. Installed under the ansible_user home, then
-# symlinked to /usr/local/bin/bb so signetd can find it on PATH.
+# COPIED to /usr/local/bin/bb so signetd can find it on PATH. (Copied, not
+# symlinked, despite what this comment used to say — a symlink breaks the CRS
+# cache.)
+#
+# Paths use ansible_env.HOME rather than a literal /home/ubuntu: AWS Ubuntu
+# images log in as `ubuntu`, GCP images derive the account from the SSH key, so
+# a hardcoded home silently breaks every non-AWS node.
 
 - name: Read bb version from signet-circuits toolchain.json
   set_fact:
@@ -16,7 +22,7 @@
       curl -sL https://raw.githubusercontent.com/AztecProtocol/aztec-packages/refs/heads/next/barretenberg/bbup/install | bash
     fi
   args:
-    creates: /home/ubuntu/.bb/bbup
+    creates: "{{ ansible_env.HOME }}/.bb/bbup"
 
 - name: Install bb at pinned version ({{ bb_version }})
   become: false
@@ -24,11 +30,11 @@
     export PATH="$HOME/.bb:${PATH}"
     bbup -v {{ bb_version }}
   environment:
-    PATH: "/home/ubuntu/.bb:{{ ansible_env.PATH }}"
+    PATH: "{{ ansible_env.HOME }}/.bb:{{ ansible_env.PATH }}"
 
 - name: Check bb version
   become: false
-  command: /home/ubuntu/.bb/bb --version
+  command: "{{ ansible_env.HOME }}/.bb/bb --version"
   register: bb_ver
   changed_when: false
 
@@ -38,7 +44,7 @@
 
 - name: Copy bb to /usr/local/bin
   copy:
-    src: /home/ubuntu/.bb/bb
+    src: "{{ ansible_env.HOME }}/.bb/bb"
     dest: /usr/local/bin/bb
     mode: "0755"
     remote_src: true

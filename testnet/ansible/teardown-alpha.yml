@@ -1,0 +1,104 @@
+---
+# teardown-alpha.yml — Terminate the alpha cluster's EC2 instances.
+#
+# Selects on `tag:Project = signet-alpha`, so it cannot touch the
+# `signet-testnet` instances (and teardown.yml cannot touch these).
+#
+# The region list is derived from the same `nodes` block as
+# provision-alpha.yml. Keep them in sync — an instance in a region absent from
+# this list survives the teardown and keeps billing. That is exactly how the
+# us-west-1 orphan referenced in 0ef0c0a outlived its playbook.
+#
+# To sweep every region regardless of what this list says, use
+#   testnet/scripts/audit-instances.sh
+#
+# Usage:
+#   ansible-playbook teardown-alpha.yml
+#   ansible-playbook teardown-alpha.yml -e confirm=yes    # skip the prompt
+
+- name: Terminate Signet alpha EC2 instances
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars:
+    project_tag: signet-alpha
+    nodes:
+      - { name: alpha1, region: us-east-1 }
+      - { name: alpha2, region: us-west-2 }
+      - { name: alpha3, region: eu-west-1 }
+      - { name: alpha4, region: ap-southeast-1 }
+      - { name: alpha5, region: sa-east-1 }
+
+  tasks:
+    - name: Derive the distinct region list
+      set_fact:
+        regions: "{{ nodes | map(attribute='region') | unique | list }}"
+
+    - name: Find instances that would be terminated
+      amazon.aws.ec2_instance_info:
+        region: "{{ item }}"
+        filters:
+          "tag:Project": "{{ project_tag }}"
+          instance-state-name:
+            - running
+            - stopped
+            - pending
+      loop: "{{ regions }}"
+      register: found
+
+    - name: Show what will be terminated
+      debug:
+        msg: >-
+          {{ item.item }}:
+          {{ (item.instances | map(attribute='instance_id') | list) | default([]) | join(', ')
+             if item.instances | length > 0 else 'none' }}
+      loop: "{{ found.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+
+    # Terminating instances destroys key shards. Below threshold that is
+    # permanent key loss, and there is no backup mechanism
+    # (docs/PRODUCTION-GAPS.md). Make the operator say so out loud.
+    - name: Confirm
+      pause:
+        prompt: >-
+          About to TERMINATE
+          {{ found.results | map(attribute='instances') | map('length') | sum }}
+          instances tagged Project={{ project_tag }} across
+          {{ regions | join(', ') }}. This destroys all key shards on them.
+          Type 'yes' to proceed
+      register: confirmation
+      when: confirm | default('') != 'yes'
+
+    - name: Abort unless confirmed
+      fail:
+        msg: "Teardown aborted."
+      when:
+        - confirm | default('') != 'yes'
+        - confirmation.user_input | default('') != 'yes'
+
+    - name: Terminate instances per region
+      amazon.aws.ec2_instance:
+        region: "{{ item }}"
+        state: absent
+        filters:
+          "tag:Project": "{{ project_tag }}"
+          instance-state-name:
+            - running
+            - stopped
+      loop: "{{ regions }}"
+      loop_control:
+        label: "{{ item }}"
+
+    - name: Remove generated .hosts-alpha
+      file:
+        path: "{{ playbook_dir }}/../.hosts-alpha"
+        state: absent
+
+    - name: Done
+      debug:
+        msg: >-
+          Alpha instances terminated. Security groups and key pairs are left in
+          place (harmless, avoids dependency ordering issues). Sepolia contracts
+          persist — they are permanent.

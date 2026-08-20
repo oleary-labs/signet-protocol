@@ -1,0 +1,176 @@
+---
+# roles/caddy/tasks/main.yml — TLS termination in front of signetd.
+#
+# The /v1 API carried session credentials in cleartext before this. The sharpest
+# case is the delegation token: handlers.go binds the session to whatever
+# session_pub the caller supplies, with no proof the caller holds the key the
+# token was issued to. So a token observed in flight can be replayed by anyone
+# with their own session key, giving full use of that sub-key until it is
+# disabled. EIP-712 payloads and the returned signature are exposed too.
+#
+# The inter-node path on :9000 needs nothing — libp2p defaults to TLS 1.3 and
+# Noise with peer-ID authentication (network/host.go passes no Security option,
+# so go-libp2p's DefaultSecurity applies).
+#
+# Certificates are per-operator: each org names its nodes under a domain it
+# controls and issues its own certs. A shared domain would hand one org the
+# ability to issue certificates for every other operator's nodes, which is the
+# same central point the key-material split exists to avoid.
+
+- name: Assert this node has a hostname to certify
+  assert:
+    that:
+      - node_hostname is defined
+      - node_hostname | length > 0
+      - "'.' in node_hostname"
+    fail_msg: >-
+      use_tls is true but {{ inventory_hostname }} has no node_hostname.
+      Re-run init-alpha.sh with ALPHA_DOMAIN set, re-share the manifest, and
+      rebuild the inventory. ACME cannot issue for a bare IP.
+
+- name: Assert an ACME contact address is set
+  assert:
+    that:
+      - tls_email is defined
+      - tls_email | length > 0
+    fail_msg: "tls_email must be set (ACME account contact) — see group_vars/signet_nodes.yml"
+
+- name: Install prerequisites for the Caddy apt repository
+  become: true
+  apt:
+    name:
+      - debian-keyring
+      - debian-archive-keyring
+      - apt-transport-https
+      - curl
+      - gpg
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+
+- name: Add Caddy repository signing key
+  become: true
+  shell: |
+    set -o pipefail
+    curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' \
+      | gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
+  args:
+    executable: /bin/bash
+    creates: /usr/share/keyrings/caddy-stable-archive-keyring.gpg
+
+- name: Add Caddy apt repository
+  become: true
+  copy:
+    content: |
+      deb [signed-by=/usr/share/keyrings/caddy-stable-archive-keyring.gpg] https://dl.cloudsmith.io/public/caddy/stable/deb/debian any-version main
+    dest: /etc/apt/sources.list.d/caddy-stable.list
+    mode: "0644"
+  register: caddy_repo
+
+- name: Install Caddy
+  become: true
+  apt:
+    name: caddy
+    state: present
+    update_cache: "{{ caddy_repo.changed }}"
+
+# --- Rate limiting needs a Caddy built with the plugin ---
+#
+# rate_limit is not in stock Caddy. The apt package above gives us the caddy
+# user, the systemd unit and /etc/caddy; the binary is then replaced with one
+# built by xcaddy:
+#
+#   GOOS=linux GOARCH=amd64 xcaddy build \
+#     --with github.com/mholt/caddy-ratelimit --output build/caddy-linux-amd64
+#
+# Kept as a build artefact alongside signetd and kms-tss rather than compiled
+# on each node, so no Go toolchain is needed on the servers.
+
+- name: Check for the locally built Caddy binary
+  delegate_to: localhost
+  become: false
+  stat:
+    # playbook_dir-anchored rather than the role-relative form used by the
+    # copy below: stat has no role file-search path to resolve against.
+    path: "{{ playbook_dir }}/../../build/caddy-linux-amd64"
+  register: caddy_binary
+  when: use_rate_limit | default(false) | bool
+  run_once: true
+
+- name: Assert the custom binary exists when rate limiting is enabled
+  assert:
+    that: caddy_binary.stat.exists
+    fail_msg: >-
+      use_rate_limit is true but {{ local_caddy_binary_path }} is missing.
+      Stock Caddy does not understand the rate_limit directive and would fail
+      to start. Build it with:
+        GOOS=linux GOARCH=amd64 xcaddy build \
+          --with github.com/mholt/caddy-ratelimit --output build/caddy-linux-amd64
+  when: use_rate_limit | default(false) | bool
+
+- name: Install the plugin-enabled Caddy binary
+  become: true
+  copy:
+    src: "{{ local_caddy_binary_path }}"
+    dest: /usr/bin/caddy
+    owner: root
+    group: root
+    mode: "0755"
+  when: use_rate_limit | default(false) | bool
+  notify: restart caddy
+
+# `caddy validate` does not merely parse — it opens the configured log writer.
+# Without this directory the validate step in the next task fails with
+# "mkdir /var/log/caddy: permission denied" and takes the whole deploy with it.
+# Found by running caddy validate against the rendered template locally.
+- name: Create Caddy log directory
+  become: true
+  file:
+    path: /var/log/caddy
+    state: directory
+    owner: caddy
+    group: caddy
+    mode: "0750"
+
+- name: Write Caddyfile
+  become: true
+  template:
+    src: Caddyfile.j2
+    dest: /etc/caddy/Caddyfile
+    owner: root
+    group: caddy
+    mode: "0640"
+    # Refuse to install a config Caddy cannot parse — a broken Caddyfile takes
+    # the node's entire public API down, and validating costs nothing.
+    validate: "caddy validate --adapter caddyfile --config %s"
+  notify: reload caddy
+
+- name: Enable and start Caddy
+  become: true
+  systemd:
+    name: caddy
+    enabled: true
+    state: started
+    daemon_reload: true
+
+# Certificate issuance is asynchronous — Caddy starts, then talks to ACME. A
+# node that starts but never obtains a certificate is silently unreachable over
+# HTTPS, so confirm rather than assume.
+- name: Wait for Caddy to serve HTTPS
+  become: true
+  uri:
+    url: "https://{{ node_hostname }}/v1/health"
+    method: GET
+    status_code: [200]
+    validate_certs: true
+  register: tls_health
+  retries: 12
+  delay: 10
+  until: tls_health is succeeded
+  when: tls_verify | default(true) | bool
+
+- name: Report
+  debug:
+    msg: >-
+      {{ inventory_hostname }}: HTTPS live on https://{{ node_hostname }}
+      (signetd bound to {{ api_bind }}:{{ api_port }}, not publicly reachable)

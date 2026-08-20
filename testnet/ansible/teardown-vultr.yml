@@ -1,0 +1,99 @@
+---
+# teardown-vultr.yml — Destroy the alpha's Vultr instances.
+#
+# Selects on the `signet-alpha` tag rather than on a hardcoded node list, so an
+# instance created by an earlier edit of provision-vultr.yml and since removed
+# from its `nodes` block is still found. That is the failure mode that left the
+# us-west-1 orphan on AWS (commit 0ef0c0a): the teardown only knew about the
+# nodes the playbook currently declares.
+#
+# Prerequisites:
+#   export VULTR_API_KEY=...
+#
+# Usage:
+#   ansible-playbook teardown-vultr.yml
+#   ansible-playbook teardown-vultr.yml -e confirm=yes    # skip the prompt
+
+- name: Destroy Signet alpha instances on Vultr
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars:
+    project_tag: signet-alpha
+
+  tasks:
+    - name: Assert the API key is present
+      assert:
+        that: lookup('env', 'VULTR_API_KEY') | length > 0
+        fail_msg: "VULTR_API_KEY is not set in the environment"
+
+    - name: List all instances
+      vultr.cloud.instance_info:
+      register: all_instances
+
+    - name: Select instances carrying the project tag
+      set_fact:
+        doomed: >-
+          {{ all_instances.vultr_instance_info
+             | selectattr('tags', 'defined')
+             | selectattr('tags', 'contains', project_tag)
+             | list }}
+
+    - name: Nothing to do
+      meta: end_play
+      when: doomed | length == 0
+
+    - name: Show what will be destroyed
+      debug:
+        msg: >-
+          {{ item.label }} ({{ item.region }}, {{ item.main_ip }},
+          tags={{ item.tags | join(',') }})
+      loop: "{{ doomed }}"
+      loop_control:
+        label: "{{ item.label }}"
+
+    # Destroying an instance destroys its key shard. Below threshold that is
+    # permanent key loss and there is no backup mechanism
+    # (docs/PRODUCTION-GAPS.md), so make the operator say it out loud.
+    - name: Confirm
+      pause:
+        prompt: >-
+          About to DESTROY {{ doomed | length }} Vultr instance(s) tagged
+          '{{ project_tag }}'. This deletes their key shards permanently.
+          Type 'yes' to proceed
+      register: confirmation
+      when: confirm | default('') != 'yes'
+
+    - name: Abort unless confirmed
+      fail:
+        msg: "Teardown aborted."
+      when:
+        - confirm | default('') != 'yes'
+        - confirmation.user_input | default('') != 'yes'
+
+    - name: Destroy instances
+      vultr.cloud.instance:
+        label: "{{ item.label }}"
+        region: "{{ item.region }}"
+        state: absent
+      loop: "{{ doomed }}"
+      loop_control:
+        label: "{{ item.label }}"
+
+    - name: Drop the destroyed hosts from the local fragments
+      lineinfile:
+        path: "{{ playbook_dir }}/../{{ item[0] }}"
+        regexp: "^{{ item[1].label }}="
+        state: absent
+      loop: "{{ ['.hosts-alpha', '.clouds-alpha'] | product(doomed) | list }}"
+      loop_control:
+        label: "{{ item[0] }}: {{ item[1].label }}"
+      failed_when: false
+
+    - name: Done
+      debug:
+        msg: >-
+          {{ doomed | length }} instance(s) destroyed. The firewall group and
+          SSH key are left in place — harmless, and reused by the next
+          provision run.

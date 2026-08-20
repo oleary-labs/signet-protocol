@@ -1,0 +1,142 @@
+{
+	email {{ tls_email }}
+{% if acme_ca is defined and acme_ca %}
+	# Point at the staging endpoint while testing — Let's Encrypt's production
+	# rate limits are per registered domain and easy to exhaust across six
+	# nodes and repeated wipe-and-redeploy cycles.
+	acme_ca {{ acme_ca }}
+{% endif %}
+}
+
+{{ node_hostname }} {
+	encode gzip
+{% if use_rate_limit | default(false) | bool %}
+	# --- Rate limiting (audit M2 / R-6) ---
+	#
+	# Requires a Caddy built with github.com/mholt/caddy-ratelimit; the stock
+	# apt binary does not know this directive and will fail to start. The role
+	# asserts on the custom binary before installing this file.
+	#
+	# Limits are per client IP per window. Zones are ordered by how expensive
+	# the endpoint is to serve, not by how sensitive it is:
+	#
+	#   /v1/auth    — verifies a ZK proof by shelling out to `bb verify`, then
+	#                 broadcasts msgAuth to every group member. By far the most
+	#                 expensive thing an unauthenticated caller can trigger, and
+	#                 a legitimate client authenticates roughly once per JWT
+	#                 lifetime, so it can be tight.
+	#   /v1/keygen  — a full DKG across the committee.
+	#   /v1/sign    — the payment hot path: 4 rounds for ECDSA. Kept generous.
+	#
+	# /v1/health and /v1/info are deliberately unlimited: monitoring polls them,
+	# and they do no work.
+	#
+	# NOTE: the perf harness drives sustained load from ONE source address, so
+	# it will trip these. Put the runner's address in rate_limit_exempt_cidrs
+	# rather than loosening the limits for everyone.
+	rate_limit {
+		zone auth {
+			match {
+				path /v1/auth
+{% if rate_limit_exempt_cidrs | default([]) | length > 0 %}
+				not remote_ip {{ rate_limit_exempt_cidrs | join(' ') }}
+{% endif %}
+			}
+			key {remote_host}
+			events {{ rate_limit_auth_events | default(10) }}
+			window {{ rate_limit_window | default('1m') }}
+		}
+		zone keygen {
+			match {
+				path /v1/keygen
+{% if rate_limit_exempt_cidrs | default([]) | length > 0 %}
+				not remote_ip {{ rate_limit_exempt_cidrs | join(' ') }}
+{% endif %}
+			}
+			key {remote_host}
+			events {{ rate_limit_keygen_events | default(10) }}
+			window {{ rate_limit_window | default('1m') }}
+		}
+		zone sign {
+			match {
+				path /v1/sign
+{% if rate_limit_exempt_cidrs | default([]) | length > 0 %}
+				not remote_ip {{ rate_limit_exempt_cidrs | join(' ') }}
+{% endif %}
+			}
+			key {remote_host}
+			events {{ rate_limit_sign_events | default(120) }}
+			window {{ rate_limit_window | default('1m') }}
+		}
+		zone delegate {
+			match {
+				path /v1/delegate
+{% if rate_limit_exempt_cidrs | default([]) | length > 0 %}
+				not remote_ip {{ rate_limit_exempt_cidrs | join(' ') }}
+{% endif %}
+			}
+			key {remote_host}
+			events {{ rate_limit_delegate_events | default(30) }}
+			window {{ rate_limit_window | default('1m') }}
+		}
+		zone keylifecycle {
+			match {
+				path /v1/keys/*
+{% if rate_limit_exempt_cidrs | default([]) | length > 0 %}
+				not remote_ip {{ rate_limit_exempt_cidrs | join(' ') }}
+{% endif %}
+			}
+			key {remote_host}
+			events {{ rate_limit_keys_events | default(30) }}
+			window {{ rate_limit_window | default('1m') }}
+		}
+		zone admin {
+			match {
+				path /admin/*
+{% if rate_limit_exempt_cidrs | default([]) | length > 0 %}
+				not remote_ip {{ rate_limit_exempt_cidrs | join(' ') }}
+{% endif %}
+			}
+			key {remote_host}
+			events {{ rate_limit_admin_events | default(60) }}
+			window {{ rate_limit_window | default('1m') }}
+		}
+	}
+{% endif %}
+
+	# /debug/stats is unauthenticated and now reports group membership, peer
+	# health and per-peer RTT — a map of the cluster and which nodes are weak.
+	# Signetd has no auth on it, so restrict it here. Set debug_allow_cidrs to
+	# your operator addresses to reach it remotely; otherwise it is loopback
+	# only and you read it over an SSH tunnel.
+	@debug path /debug/*
+	handle @debug {
+		@debug_allowed remote_ip {{ debug_allow_cidrs | default(['127.0.0.1/32']) | join(' ') }}
+		handle @debug_allowed {
+			reverse_proxy {{ api_bind }}:{{ api_port }}
+		}
+		respond 404
+	}
+
+	# Everything else: the /v1 API and the authenticated /admin endpoints.
+	handle {
+		reverse_proxy {{ api_bind }}:{{ api_port }} {
+			# ZK proofs on /v1/auth are large and signing is a multi-round
+			# protocol across regions, so the defaults are too tight.
+			transport http {
+				read_timeout {{ tls_proxy_read_timeout | default('120s') }}
+				write_timeout {{ tls_proxy_write_timeout | default('120s') }}
+			}
+		}
+	}
+
+	log {
+		output file /var/log/caddy/{{ inventory_hostname }}.access.log {
+			roll_size 50MiB
+			roll_keep 5
+		}
+		# Request bodies carry session credentials and EIP-712 payloads; the
+		# default log does not include them, and it must stay that way.
+		format json
+	}
+}

@@ -12,6 +12,12 @@ Type=simple
 User={{ signetd_user }}
 Group={{ signetd_user }}
 Environment=HOME=/opt/signet
+{% if node_key_passphrase is defined and node_key_passphrase | length > 0 %}
+# Passphrase for the encrypted node.key. No leading '-': if this file goes
+# missing the node must fail to start, not fall through to a confusing
+# "decrypt key file" error or, worse, generate a brand-new identity.
+EnvironmentFile={{ signetd_env_file }}
+{% endif %}
 ExecStart={{ signetd_bin }} -config {{ signetd_config_dir }}/config.yaml -log-level {{ log_level }}
 Restart=on-failure
 RestartSec=5

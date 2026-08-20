@@ -1,0 +1,89 @@
+---
+# teardown-gcp-alpha.yml — Destroy the alpha's GCP instances.
+#
+# There was previously no GCP teardown at all: provision-gcp.yml created a node
+# and nothing removed it. The testnet's GCP node (136.119.229.55) therefore had
+# to be deleted by hand, and teardown.yml — which only sweeps us-east-1 EC2 —
+# would never have touched it.
+#
+# Instances are found by zone from the `nodes` block. Unlike the Vultr teardown
+# this cannot sweep by label across all zones, because google.cloud requires a
+# zone per lookup. So verify against the console, or:
+#   gcloud compute instances list --filter="labels.project=signet-alpha"
+#
+# Prerequisites:
+#   gcloud auth application-default login
+#
+# Usage:
+#   ansible-playbook teardown-gcp-alpha.yml -e gcp_project=<project-id>
+#   ansible-playbook teardown-gcp-alpha.yml -e gcp_project=<id> -e confirm=yes
+
+- name: Destroy Signet alpha instances on GCP
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars:
+    gcp_project: ""
+    auth_kind: application
+    # Keep in sync with provision-gcp-alpha.yml.
+    nodes:
+      - { name: sfluv1, zone: us-west1-a }
+      - { name: sfluv2, zone: us-west2-a }
+
+  tasks:
+    - name: Validate gcp_project
+      assert:
+        that: gcp_project != ""
+        fail_msg: "gcp_project is required: -e gcp_project=your-project-id"
+
+    - name: Show what will be destroyed
+      debug:
+        msg: "{{ item.name }} ({{ item.zone }})"
+      loop: "{{ nodes }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: Confirm
+      pause:
+        prompt: >-
+          About to DESTROY {{ nodes | length }} GCP instance(s) in project
+          {{ gcp_project }}. This deletes their key shards permanently.
+          Type 'yes' to proceed
+      register: confirmation
+      when: confirm | default('') != 'yes'
+
+    - name: Abort unless confirmed
+      fail:
+        msg: "Teardown aborted."
+      when:
+        - confirm | default('') != 'yes'
+        - confirmation.user_input | default('') != 'yes'
+
+    - name: Destroy instances
+      google.cloud.gcp_compute_instance:
+        name: "{{ item.name }}"
+        project: "{{ gcp_project }}"
+        auth_kind: "{{ auth_kind }}"
+        zone: "{{ item.zone }}"
+        state: absent
+      loop: "{{ nodes }}"
+      loop_control:
+        label: "{{ item.name }} ({{ item.zone }})"
+
+    - name: Drop the destroyed hosts from the local fragments
+      lineinfile:
+        path: "{{ playbook_dir }}/../{{ item[0] }}"
+        regexp: "^{{ item[1].name }}="
+        state: absent
+      loop: "{{ ['.hosts-alpha', '.clouds-alpha'] | product(nodes) | list }}"
+      loop_control:
+        label: "{{ item[0] }}: {{ item[1].name }}"
+      failed_when: false
+
+    - name: Done
+      debug:
+        msg: >-
+          Instances destroyed. Firewall rules are left in place. Confirm
+          nothing survives in another zone:
+          gcloud compute instances list --filter="labels.project=signet-alpha"

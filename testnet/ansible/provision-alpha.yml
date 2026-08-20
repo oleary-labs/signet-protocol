@@ -1,0 +1,253 @@
+---
+# provision-alpha.yml — Launch the multi-region Signet alpha cluster.
+#
+# Differences from provision-single-region.yml (which stays as-is for the
+# us-east-1 testnet layout):
+#
+#   1. Multi-region. AWS security groups and key pairs are per-region, so both
+#      are ensured in every region rather than once.
+#   2. Tagged `Project: signet-alpha`, NOT `signet-testnet`. teardown.yml
+#      selects on `tag:Project` — sharing a tag would make either teardown
+#      destroy both clusters.
+#   3. AMIs are looked up at run time instead of hardcoded. The dropped
+#      5-region playbook (0ef0c0a) carried a static ami_map that was already
+#      stale; region-pinned AMI ids rot every time Canonical republishes.
+#
+# Prerequisites:
+#   - AWS credentials with EC2 rights in every region in `regions`
+#   - boto3 (`pip3 install boto3`), amazon.aws collection
+#   - An SSH public key at `ssh_public_key_path` to import per region
+#
+# Usage:
+#   ansible-playbook provision-alpha.yml
+#   ansible-playbook provision-alpha.yml -e @alpha-topology.yml   # override nodes
+
+- name: Provision Signet alpha cluster
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars:
+    org: oll
+    project_tag: signet-alpha
+    ssh_key_name: signet-alpha
+    ssh_public_key_path: "~/.ssh/signet-alpha.pub"
+    instance_type: t3.medium
+    volume_size_gb: 20
+    security_group_name: signet-alpha-sg
+
+    # SSH source restriction. The testnet security group allowed 22 from
+    # 0.0.0.0/0; an alpha that will hold real delegation tokens should not.
+    # Override with -e ssh_cidr=X.X.X.X/32 for your operator IP.
+    ssh_cidr: "0.0.0.0/0"
+
+    # With TLS, signetd binds loopback and Caddy fronts it: 443 serves the API,
+    # 80 is needed for the ACME HTTP-01 challenge and the HTTP->HTTPS redirect,
+    # and 8080 must NOT be public or the TLS termination is bypassable.
+    use_tls: true
+
+    # ---- Topology: the one block to edit ----
+    #
+    # O'Leary Labs' share of a 6-node, T=3 group. ECDSA needs 2T-1 = 5 signers,
+    # so one node of the six may be down; the node selects the set at request
+    # time from its liveness view (docs/DESIGN-SIGNER-SELECTION.md).
+    #
+    # Concentrated on the west coast because the users are in SF and ECDSA is a
+    # 4-round protocol: inter-node RTT is paid four times per signature, while
+    # client latency is paid once. us-west-1 is Northern California and the
+    # nearest AWS has; note it is also AWS's most AZ-constrained region, so
+    # confirm capacity before relying on it.
+    nodes:
+      - { name: oll1, region: us-west-1 }   # N. California
+      - { name: oll2, region: us-west-2 }   # Oregon
+
+  tasks:
+    - name: Derive the distinct region list
+      set_fact:
+        regions: "{{ nodes | map(attribute='region') | unique | list }}"
+
+    - name: Report plan
+      debug:
+        msg: >-
+          {{ nodes | length }} nodes across {{ regions | length }} regions
+          ({{ regions | join(', ') }}), {{ instance_type }},
+          tag Project={{ project_tag }}
+
+    - name: Read SSH public key
+      set_fact:
+        ssh_public_key: "{{ lookup('file', ssh_public_key_path) }}"
+
+    # AWS key pairs are regional — the same key must be imported into each.
+    - name: Ensure SSH key pair in each region
+      amazon.aws.ec2_key:
+        name: "{{ ssh_key_name }}"
+        region: "{{ item }}"
+        key_material: "{{ ssh_public_key }}"
+        state: present
+      loop: "{{ regions }}"
+
+    - name: Ensure security group in each region
+      amazon.aws.ec2_security_group:
+        name: "{{ security_group_name }}"
+        description: "Signet alpha - SSH, p2p, API"
+        region: "{{ item }}"
+        rules:
+          - proto: tcp
+            from_port: 22
+            to_port: 22
+            cidr_ip: "{{ ssh_cidr }}"
+            rule_desc: SSH
+          - proto: tcp
+            from_port: 9000
+            to_port: 9000
+            cidr_ip: 0.0.0.0/0
+            rule_desc: "libp2p"
+          - proto: tcp
+            from_port: "{{ 443 if use_tls | bool else 8080 }}"
+            to_port: "{{ 443 if use_tls | bool else 8080 }}"
+            cidr_ip: 0.0.0.0/0
+            rule_desc: "{{ 'HTTPS API (Caddy)' if use_tls | bool else 'HTTP API' }}"
+          - proto: tcp
+            from_port: 80
+            to_port: 80
+            cidr_ip: 0.0.0.0/0
+            rule_desc: "ACME HTTP-01 + redirect"
+        # Rules not listed are revoked, so flipping use_tls off again closes
+        # 443/80 and reopens 8080 rather than leaving both paths open.
+        purge_rules: true
+        state: present
+      loop: "{{ regions }}"
+
+    # Canonical's owner id is 099720109477. Resolving the newest matching AMI
+    # per region avoids the stale-ami_map failure mode.
+    - name: Look up latest Ubuntu 24.04 LTS AMI per region
+      amazon.aws.ec2_ami_info:
+        region: "{{ item }}"
+        owners: "099720109477"
+        filters:
+          name: "ubuntu/images/hvm-ssd-gp3/ubuntu-noble-24.04-amd64-server-*"
+          state: available
+      loop: "{{ regions }}"
+      register: ami_lookup
+
+    - name: Build region → AMI map
+      set_fact:
+        ami_map: >-
+          {{ ami_map | default({}) | combine({
+               item.item: (item.images | sort(attribute='creation_date') | last).image_id
+             }) }}
+      loop: "{{ ami_lookup.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+
+    - name: Fail if any region resolved no AMI
+      assert:
+        that:
+          - ami_map[item] is defined
+          - ami_map[item] | length > 0
+        fail_msg: "No Ubuntu 24.04 AMI found in {{ item }}"
+      loop: "{{ regions }}"
+
+    - name: Show resolved AMIs
+      debug:
+        msg: "{{ item.key }}: {{ item.value }}"
+      loop: "{{ ami_map | dict2items }}"
+      loop_control:
+        label: "{{ item.key }}"
+
+    - name: Ensure EC2 instance per node
+      amazon.aws.ec2_instance:
+        name: "signet-{{ item.name }}"
+        region: "{{ item.region }}"
+        instance_type: "{{ instance_type }}"
+        image_id: "{{ ami_map[item.region] }}"
+        key_name: "{{ ssh_key_name }}"
+        security_group: "{{ security_group_name }}"
+        network:
+          assign_public_ip: true
+        volumes:
+          - device_name: /dev/sda1
+            ebs:
+              volume_size: "{{ volume_size_gb }}"
+              volume_type: gp3
+        exact_count: 1
+        state: running
+        wait: true
+        tags:
+          Project: "{{ project_tag }}"
+          Node: "{{ item.name }}"
+        filters:
+          "tag:Project": "{{ project_tag }}"
+          "tag:Node": "{{ item.name }}"
+          instance-state-name:
+            - pending
+            - running
+      loop: "{{ nodes }}"
+      loop_control:
+        label: "{{ item.name }} ({{ item.region }})"
+      register: ec2_results
+
+    - name: Build instance IP map
+      set_fact:
+        instance_ips: >-
+          {{ instance_ips | default({}) | combine({
+               item.item.name: (item.instances[0].public_ip_address
+                                | default(item.instances[0].network_interfaces[0].association.public_ip
+                                | default('UNKNOWN')))
+             }) }}
+      loop: "{{ ec2_results.results }}"
+      loop_control:
+        label: "{{ item.item.name }}"
+
+    - name: Fail if any instance has no public IP
+      assert:
+        that:
+          - instance_ips[item.name] != 'UNKNOWN'
+        fail_msg: "{{ item.name }} ({{ item.region }}) came up without a public IP"
+      loop: "{{ nodes }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    # Fragments, appended rather than overwritten: with three clouds in play
+    # each provisioner contributes its own hosts, and build-inventory.sh merges
+    # them. This playbook no longer writes inventory-alpha.yml — that file is
+    # produced from the manifests plus these fragments, and generating it here
+    # too would mean two sources of truth diverging.
+    - name: Append to .hosts-alpha
+      lineinfile:
+        path: "{{ playbook_dir }}/../.hosts-alpha"
+        regexp: "^{{ item.key }}="
+        line: "{{ item.key }}={{ item.value }}"
+        create: true
+        mode: "0644"
+      loop: "{{ instance_ips | dict2items }}"
+      loop_control:
+        label: "{{ item.key }}"
+
+    - name: Record cloud for each node
+      lineinfile:
+        path: "{{ playbook_dir }}/../.clouds-alpha"
+        regexp: "^{{ item.name }}="
+        line: "{{ item.name }}=aws"
+        create: true
+        mode: "0644"
+      loop: "{{ nodes }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: Wait for SSH on all instances
+      wait_for:
+        host: "{{ item.value }}"
+        port: 22
+        timeout: 300
+        state: started
+      loop: "{{ instance_ips | dict2items }}"
+      loop_control:
+        label: "{{ item.key }}"
+
+    - name: Done
+      debug:
+        msg: >-
+          Provisioned {{ nodes | length }} AWS instances. Wrote ../.hosts-alpha
+          and ../.clouds-alpha. Merge the other clouds' fragments, then run
+          testnet/scripts/build-inventory.sh.

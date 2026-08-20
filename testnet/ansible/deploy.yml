@@ -56,3 +56,7 @@
     - role: kms-tss
       when: use_kms | default(false) | bool
     - signetd
+    # After signetd: Caddy's post-install check calls /v1/health through the
+    # proxy, which needs signetd already listening on loopback.
+    - role: caddy
+      when: use_tls | default(false) | bool

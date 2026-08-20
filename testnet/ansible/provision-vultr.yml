@@ -1,0 +1,200 @@
+---
+# provision-vultr.yml — Launch Signet alpha nodes on Vultr.
+#
+# O'Leary Labs' second cloud, alongside its AWS nodes in provision-alpha.yml.
+# SFLuv's two are on GCP (provision-gcp-alpha.yml).
+# Three independent providers means a control-plane or network failure at any
+# one of them costs at most the nodes hosted there — which is what makes the
+# N-(2T-1) spare capacity worth paying for in the first place.
+#
+# `sjc` (Silicon Valley) is the closest region any of the three providers
+# offers to San Francisco: AWS us-west-1 is Northern California, while GCP's
+# nearest are Oregon and Los Angeles. For a 4-round ECDSA protocol where
+# inter-node RTT is paid four times per signature, that matters.
+#
+# Prerequisites:
+#   - VULTR_API_KEY exported (the modules read it from the environment)
+#   - vultr.cloud collection:  ansible-galaxy collection install vultr.cloud
+#   - An SSH public key at ssh_public_key_path
+#
+# Usage:
+#   export VULTR_API_KEY=...
+#   ansible-playbook provision-vultr.yml
+#   ansible-playbook provision-vultr.yml -e ssh_cidr=203.0.113.7/32
+#
+# Verify plan/region availability before changing them:
+#   curl -s 'https://api.vultr.com/v2/plans?per_page=500' | jq -r \
+#     '.plans[] | select(.locations|index("sjc")) | "\(.id) \(.vcpu_count)vcpu \(.ram)MB $\(.monthly_cost)"'
+
+- name: Provision Signet alpha nodes on Vultr
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars:
+    org: oll
+    project_tag: signet-alpha
+    ssh_key_name: signet-alpha
+    ssh_public_key_path: "~/.ssh/signet-alpha.pub"
+
+    # vc2-2c-4gb: 2 vCPU, 4 GB, 80 GB NVMe, 3 TB transfer, $20/mo — the direct
+    # equivalent of the t3.medium used on AWS, and cheaper once AWS's separate
+    # IPv4 and EBS charges are counted.
+    plan: vc2-2c-4gb
+    os_name: "Ubuntu 24.04 LTS x64"
+
+    firewall_group_desc: signet-alpha
+    # SSH exposure. Override with your operator IP; unlike 9000/8080 there is
+    # no reason for 22 to be open to the internet.
+    ssh_cidr: "0.0.0.0/0"
+
+    # See provision-alpha.yml — 443 + 80 with TLS, 8080 without, never both.
+    use_tls: true
+
+    # ---- Topology: the block to edit ----
+    nodes:
+      - { name: oll3, region: sjc }   # Silicon Valley — nearest to SF
+      - { name: oll4, region: lax }   # Los Angeles
+
+  tasks:
+    - name: Assert the API key is present
+      assert:
+        that: lookup('env', 'VULTR_API_KEY') | length > 0
+        fail_msg: "VULTR_API_KEY is not set in the environment"
+
+    - name: Report plan
+      debug:
+        msg: >-
+          {{ nodes | length }} Vultr nodes for org '{{ org }}'
+          ({{ nodes | map(attribute='region') | unique | join(', ') }}),
+          plan {{ plan }}
+
+    - name: Ensure SSH key
+      vultr.cloud.ssh_key:
+        name: "{{ ssh_key_name }}"
+        ssh_key: "{{ lookup('file', ssh_public_key_path) }}"
+        state: present
+
+    - name: Ensure firewall group
+      vultr.cloud.firewall_group:
+        description: "{{ firewall_group_desc }}"
+        state: present
+
+    # Vultr firewall rules are additive and idempotent per (protocol, port,
+    # subnet), so re-running is safe.
+    - name: Ensure firewall rules
+      vultr.cloud.firewall_rule:
+        group: "{{ firewall_group_desc }}"
+        protocol: tcp
+        port: "{{ item.port }}"
+        ip_type: v4
+        subnet: "{{ item.subnet.split('/')[0] }}"
+        subnet_size: "{{ item.subnet.split('/')[1] | int }}"
+        notes: "{{ item.note }}"
+        state: present
+      loop: >-
+        {{ [{'port': '22',   'subnet': ssh_cidr,   'note': 'SSH'},
+            {'port': '9000', 'subnet': '0.0.0.0/0','note': 'libp2p'}]
+           + ([{'port': '443', 'subnet': '0.0.0.0/0', 'note': 'HTTPS API (Caddy)'},
+               {'port': '80',  'subnet': '0.0.0.0/0', 'note': 'ACME HTTP-01 + redirect'}]
+              if use_tls | bool
+              else [{'port': '8080', 'subnet': '0.0.0.0/0', 'note': 'HTTP API'}]) }}
+      loop_control:
+        label: "{{ item.note }} {{ item.port }}"
+
+    - name: Ensure instances
+      vultr.cloud.instance:
+        label: "{{ item.name }}"
+        hostname: "{{ item.name }}"
+        region: "{{ item.region }}"
+        plan: "{{ plan }}"
+        os: "{{ os_name }}"
+        ssh_keys:
+          - "{{ ssh_key_name }}"
+        firewall_group: "{{ firewall_group_desc }}"
+        enable_ipv6: false
+        backups: false
+        # Tags are how teardown-vultr.yml finds these again. Keep them
+        # distinct from any other cluster's.
+        tags:
+          - "{{ project_tag }}"
+          - "org-{{ org }}"
+        state: started
+      loop: "{{ nodes }}"
+      loop_control:
+        label: "{{ item.name }} ({{ item.region }})"
+      register: vultr_instances
+
+    - name: Build name → IP map
+      set_fact:
+        instance_ips: >-
+          {{ instance_ips | default({}) | combine({
+               item.item.name: item.vultr_instance.main_ip
+             }) }}
+      loop: "{{ vultr_instances.results }}"
+      loop_control:
+        label: "{{ item.item.name }}"
+
+    - name: Fail if any instance has no address yet
+      assert:
+        that:
+          - instance_ips[item.name] is defined
+          - instance_ips[item.name] | length > 0
+          - instance_ips[item.name] != '0.0.0.0'
+        fail_msg: >-
+          {{ item.name }} has no main_ip yet. Vultr assigns it a moment after
+          create; re-run this playbook (it is idempotent) to pick it up.
+      loop: "{{ nodes }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: Show addresses
+      debug:
+        msg: "{{ item.key }}: {{ item.value }}"
+      loop: "{{ instance_ips | dict2items }}"
+      loop_control:
+        label: "{{ item.key }}"
+
+    # Fragments, appended rather than overwritten: an operator running more
+    # than one cloud merges several of these into one .hosts-alpha before
+    # calling build-inventory.sh.
+    - name: Append to .hosts-alpha
+      lineinfile:
+        path: "{{ playbook_dir }}/../.hosts-alpha"
+        regexp: "^{{ item.key }}="
+        line: "{{ item.key }}={{ item.value }}"
+        create: true
+        mode: "0644"
+      loop: "{{ instance_ips | dict2items }}"
+      loop_control:
+        label: "{{ item.key }}"
+
+    # Vultr Linux images log in as root, where AWS and GCP use ubuntu.
+    # build-inventory.sh reads this to set ansible_user per host.
+    - name: Record cloud for each node
+      lineinfile:
+        path: "{{ playbook_dir }}/../.clouds-alpha"
+        regexp: "^{{ item.name }}="
+        line: "{{ item.name }}=vultr"
+        create: true
+        mode: "0644"
+      loop: "{{ nodes }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: Wait for SSH
+      wait_for:
+        host: "{{ item.value }}"
+        port: 22
+        timeout: 300
+        state: started
+      loop: "{{ instance_ips | dict2items }}"
+      loop_control:
+        label: "{{ item.key }}"
+
+    - name: Done
+      debug:
+        msg: >-
+          {{ nodes | length }} Vultr instances ready. Wrote ../.hosts-alpha and
+          ../.clouds-alpha. Merge the other clouds' fragments, then run
+          testnet/scripts/build-inventory.sh.

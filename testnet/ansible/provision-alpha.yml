@@ -30,8 +30,11 @@
   vars:
     org: oll
     project_tag: signet-alpha
-    ssh_key_name: signet-alpha
-    ssh_public_key_path: "~/.ssh/signet-alpha.pub"
+    # Per-cloud key. OLL spans AWS and Vultr, and the Vultr deploy may run
+    # from a different machine entirely, so one key across providers would
+    # mean a single laptop compromise reaching every node.
+    ssh_key_name: signet-alpha-aws
+    ssh_public_key_path: "~/.ssh/signet-alpha-aws.pub"
     instance_type: t3.medium
     volume_size_gb: 20
     security_group_name: signet-alpha-sg

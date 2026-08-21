@@ -103,6 +103,20 @@ output for secret field names and refuses to write a manifest that contains any.
 ## Prerequisites, per operator
 
 - Own machine, own cloud account, own SSH keypair. Not shared.
+- **One SSH key per cloud, not per operator.** OLL spans AWS and Vultr, and the
+  Vultr deploy may run from a different machine, so a single key across
+  providers would let one compromised laptop reach every node:
+
+  ```bash
+  ssh-keygen -t ed25519 -f ~/.ssh/signet-alpha-aws   -C signet-alpha-aws
+  ssh-keygen -t ed25519 -f ~/.ssh/signet-alpha-vultr -C signet-alpha-vultr
+  ssh-keygen -t ed25519 -f ~/.ssh/signet-alpha-gcp   -C signet-alpha-gcp
+  ```
+
+  Each provisioner imports its own, and `build-inventory.sh` resolves
+  `ansible_ssh_private_key_file` per host from `.clouds-alpha`. Override with
+  `ALPHA_SSH_KEY_<org>_<cloud>`, or `ALPHA_SSH_KEY_<org>` for one key across an
+  org's clouds.
 - `go`, `jq`, `openssl`, `ansible`, Foundry
 - The collection for each cloud you run, and its credentials:
 

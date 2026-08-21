@@ -34,8 +34,10 @@
   vars:
     org: oll
     project_tag: signet-alpha
-    ssh_key_name: signet-alpha
-    ssh_public_key_path: "~/.ssh/signet-alpha.pub"
+    # Per-cloud key — see provision-alpha.yml. This deploy is expected to
+    # run from a different machine than the AWS one.
+    ssh_key_name: signet-alpha-vultr
+    ssh_public_key_path: "~/.ssh/signet-alpha-vultr.pub"
 
     # vc2-2c-4gb: 2 vCPU, 4 GB, 80 GB NVMe, 3 TB transfer, $20/mo — the direct
     # equivalent of the t3.medium used on AWS, and cheaper once AWS's separate

@@ -92,6 +92,7 @@ holds what it needs.
 | `register` | **each org** | that org's node keys, its nodes only |
 | `gen-auth-key` | **manager (SFLuv)** | the group's authorization key |
 | `create-group` | **manager (SFLuv)** | manager key only — member addresses are public |
+| `accept` | **each org** | that org's operator key, its nodes only |
 | `deploy.yml` | **each org** | that org's `host_vars`, `--limit` to own nodes |
 
 The only file crossing organisational boundaries is `manifest-<org>.json`:
@@ -122,11 +123,31 @@ output for secret field names and refuses to write a manifest that contains any.
 
   | Cloud | Collection | Credentials |
   |---|---|---|
-  | AWS | `amazon.aws` (+ `pip3 install boto3`) | `aws login` / profile |
+  | AWS | `amazon.aws` (+ `boto3`, and `botocore[crt]` — see below) | `aws login` / profile |
   | GCP | `google.cloud` (+ `pip3 install google-auth requests`) | `gcloud auth application-default login` |
   | Vultr | `vultr.cloud` | `export VULTR_API_KEY=...` |
 - `../signet-circuits` cloned as a sibling — the `bb` role reads its
   `toolchain.json` and fails without it
+
+> **`aws login` needs `botocore[crt]` for Ansible.** The AWS CLI bundles its own
+> dependencies, so `aws sts get-caller-identity` succeeds while every
+> `amazon.aws` task fails with:
+>
+> ```
+> Couldn't connect to AWS: Missing Dependency: Using the login credential
+> provider requires an additional dependency.
+> ```
+>
+> Install it into the interpreter Ansible actually uses (`ansible --version`
+> prints it — a Homebrew install has its own venv, not your system Python):
+>
+> ```bash
+> "$(ansible --version | sed -n 's/.*(\(.*python\))/\1/p')" -m pip install "botocore[crt]"
+> ```
+>
+> Alternatively skip the dependency by handing Ansible static credentials:
+> `eval "$(aws configure export-credentials --format env)"`. Those are the same
+> temporary credentials and expire with the session.
 - Agreement on: node names, node count per org, and the threshold
 
 Only the deployer needs `DEPLOYER_PK` funded with Sepolia ETH.
@@ -306,7 +327,10 @@ Share the printed `CHAIN_ID` and `FACTORY_ADDRESS`. Note that whoever holds `DEP
 the factory and the `UpgradeableBeacon`, and can upgrade the `SignetGroup`
 implementation under every group. That is a standing power, not a one-time one.
 
-**3b. Deployer funds every node** (public addresses only, skips already-funded):
+**3b. Deployer funds every node and every operator** (public addresses only,
+skips already-funded). Operators need gas too: with closed nodes it is the
+operator that sends `acceptInvite`, one transaction per node, and an unfunded
+operator leaves every member stuck in Pending:
 
 ```bash
 export FACTORY_ADDRESS=0x...
@@ -337,6 +361,14 @@ changeable on-chain later via `setOperator`, so it is not a one-way door.
 
 Treat the operator address as a control key, not a hot one: it authorises
 joining and leaving groups on behalf of every node in the org.
+
+**Nodes register closed (`isOpen=false`).** An open node is added to *any*
+group the moment its manager names it — `inviteNode` skips Pending and
+activates it outright (`SignetGroup.sol:139`). A stranger could create a group
+naming your nodes, and they would run DKG and hold shards for it, on your
+hardware, without you agreeing. Closed means the node lands in Pending until
+its operator accepts, which is the consent step the invite lifecycle exists
+for. `ALPHA_OPEN_NODES=yes` overrides; `updateOpenStatus` changes it later.
 
 **3d. The manager mints the authorization key** (SFLuv, not the deployer —
 `addAuthKey` is `onlyManager`, and the key authorizes operations on SFLuv's own
@@ -401,7 +433,38 @@ That last part is informational. It refuses only for things that would not
 work — an unregistered member, or `N < 2T-1` — never for a distribution it
 disapproves of.
 
-**3f. Build the harness env file** (anyone, once the group exists and all the
+**3f. Each operator accepts its invitations:**
+
+```bash
+export FACTORY_ADDRESS=0x... GROUP_ADDRESS=0x...
+ALPHA_ORG=oll OPERATOR_PK=0x<operator key> \
+  testnet/scripts/alpha-contracts.sh accept
+```
+
+Because nodes are closed, `create-group` leaves **every member Pending and none
+Active** — `isOperational()` is false and no keygen is possible until the
+operators accept. That is not a failure state, it is the consent step:
+
+```
+  active:  []
+  pending: 6 node(s)
+  operational: false
+```
+
+`acceptInvite` must be signed by the address recorded as the node's operator
+(`SignetGroup.sol:150`), so this needs `OPERATOR_PK` — the key for the address
+you passed at registration, funded in 3b. The script checks the on-chain
+operator per node first, so a wrong key names the mismatch instead of producing
+a bare revert. Re-runnable; already-active nodes are skipped.
+
+It reports progress toward the threshold as it goes, so you can see when the
+group crosses into operational:
+
+```
+==> Accepted 4. Group now has 4 active member(s), threshold 3.
+```
+
+**3g. Build the harness env file** (anyone, once the group exists and all the
 `.hosts-alpha` fragments are merged):
 
 ```bash

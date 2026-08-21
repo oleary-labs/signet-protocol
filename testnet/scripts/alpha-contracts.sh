@@ -19,6 +19,7 @@
 #   register         each org  — signs with ITS OWN node keys, its nodes only
 #   gen-auth-key     manager   — mints the authorization key the group trusts
 #   create-group     manager   — needs MANAGER_PK; member addresses are public
+#   accept           each org  — operator consents to its nodes joining the group
 #   write-env        anyone    — builds the harness env file
 #
 # Only `register` touches private key material, and it only ever reads the
@@ -36,6 +37,7 @@
 #   FACTORY_ADDRESS=0x... ALPHA_ORG=sfluv testnet/scripts/alpha-contracts.sh register
 #   testnet/scripts/alpha-contracts.sh gen-auth-key harness
 #   MANAGER_PK=0x...  FACTORY_ADDRESS=0x... testnet/scripts/alpha-contracts.sh create-group 3
+#   OPERATOR_PK=0x... FACTORY_ADDRESS=0x... ALPHA_ORG=oll testnet/scripts/alpha-contracts.sh accept
 #
 # `fund`, `create-group` and `write-env` read every testnet/data/manifest-*.json
 # present, so collect the other operators' manifests first.
@@ -254,6 +256,26 @@ cmd_fund() {
             "$addr" --value "$amount" >/dev/null
         info "  $org/$name $addr — funded"
     done < <(all_nodes)
+
+    # Operator addresses need gas too. Nodes register themselves, but with
+    # isOpen=false it is the OPERATOR that sends acceptInvite, one transaction
+    # per node. An unfunded operator leaves the group stuck with every member
+    # Pending and none Active — isOperational() false, no keygen possible.
+    local seen_ops=""
+    while read -r _org _name _addr _pub _peer _host op; do
+        [[ -n "$op" && "$op" != "0x0000000000000000000000000000000000000000" ]] || continue
+        case " $seen_ops " in *" $op "*) continue ;; esac
+        seen_ops="$seen_ops $op"
+        local obal
+        obal=$(cast balance "$op" --rpc-url "$RPC" 2>/dev/null || echo 0)
+        if [[ "$obal" != "0" ]]; then
+            info "  operator $op — already funded ($(cast from-wei "$obal") ETH), skipping"
+            continue
+        fi
+        cast send --private-key "$DEPLOYER_PK" --rpc-url "$RPC" \
+            "$op" --value "$amount" >/dev/null
+        info "  operator $op — funded (gas for acceptInvite)"
+    done < <(all_nodes)
 }
 
 # --------------------------------------------------------------------------
@@ -323,8 +345,23 @@ cmd_register() {
 
         # Signed with the NODE's key, not the deployer's: the factory requires
         # _pubkeyToAddress(pubkey) == msg.sender.
+        #
+        # isOpen=false. An open node is added to ANY group the moment its
+        # manager names it — SignetGroup.inviteNode skips Pending entirely and
+        # activates it (SignetGroup.sol:139). So an open node can be conscripted
+        # by a stranger's group and will run DKG and hold shards for them, on
+        # this operator's hardware, without anyone here agreeing to it.
+        #
+        # Closed means the node lands in Pending and the operator must call
+        # acceptInvite. That is the consent step the invite lifecycle exists
+        # for. Reversible either way via SignetFactory.updateOpenStatus.
+        local is_open="false"
+        if [[ "${ALPHA_OPEN_NODES:-}" == "yes" ]]; then
+            is_open="true"
+            echo "WARNING: registering $name as OPEN — any group may add it without asking." >&2
+        fi
         cast send --private-key "$pk" --rpc-url "$RPC" "$FACTORY" \
-            "registerNode(bytes,bool,address)" "$pub" true "$operator" >/dev/null
+            "registerNode(bytes,bool,address)" "$pub" "$is_open" "$operator" >/dev/null
         info "  $name $addr — registered"
     done
 
@@ -506,6 +543,81 @@ EOF
 }
 
 # --------------------------------------------------------------------------
+# Accept this org's invitations into a group.
+#
+# With isOpen=false, createGroup and inviteNode put a node in Pending rather
+# than Active (SignetGroup.sol:105,142). Nothing signs for it until its operator
+# calls acceptInvite — which is the point: it is the operator agreeing to serve
+# this particular customer, not merely to exist in the registry.
+#
+# Sent by the operator address recorded at registration
+# (SignetGroup.sol:150 requires msg.sender == getNodeOperator(node)), so this
+# needs OPERATOR_PK — the key for that address, funded by `fund`.
+cmd_accept() {
+    need_chain; need_factory
+    local org="${ALPHA_ORG:-}"
+    [[ -n "$org" ]] || die "ALPHA_ORG not set — accept only handles your own org's nodes"
+    [[ -n "${OPERATOR_PK:-}" ]] || die "OPERATOR_PK not set — acceptInvite must be signed by the address recorded as this org's operator"
+
+    local group="${GROUP_ADDRESS:-}"
+    if [[ -z "$group" && -f "$DATA/factory.env" ]]; then
+        # shellcheck disable=SC1090
+        group=$(grep '^GROUP_ADDRESS=' "$DATA/factory.env" 2>/dev/null | cut -d= -f2 || true)
+    fi
+    [[ -n "$group" ]] || die "GROUP_ADDRESS not set and not in testnet/data/factory.env — the manager must create the group first and share it"
+
+    local manifest="$DATA/manifest-${org}.json"
+    [[ -f "$manifest" ]] || die "$manifest not found"
+
+    local signer
+    signer=$(cast wallet address "$OPERATOR_PK")
+    info "Accepting ${org} invitations into group $group"
+    info "  operator: $signer"
+
+    local bal
+    bal=$(cast balance "$signer" --rpc-url "$RPC" 2>/dev/null || echo 0)
+    [[ "$bal" != "0" ]] || die "operator $signer has no ETH — the deployer must run 'fund' first"
+
+    local accepted=0 count
+    count=$(jq '.nodes | length' "$manifest")
+    for i in $(seq 0 $((count - 1))); do
+        local name addr onchain_op status
+        name=$(jq -r ".nodes[$i].name"        "$manifest")
+        addr=$(jq -r ".nodes[$i].eth_address" "$manifest")
+
+        # nodeStatus: 0 None, 1 Pending, 2 Active.
+        status=$(cast call "$group" "nodeStatus(address)(uint8)" "$addr" --rpc-url "$RPC" 2>/dev/null || echo "")
+        status="${status%% *}"
+        case "$status" in
+            2) info "  $name $addr — already active, skipping"; continue ;;
+            1) ;;
+            0) info "  $name $addr — not in this group (status None), skipping"; continue ;;
+            *) die "could not read nodeStatus for $name from $group" ;;
+        esac
+
+        # The contract will reject a mismatch, but failing here names the
+        # problem instead of surfacing it as a bare revert.
+        onchain_op=$(cast call "$FACTORY" "getNodeOperator(address)(address)" "$addr" --rpc-url "$RPC" 2>/dev/null || echo "")
+        if [[ "$(printf %s "$onchain_op" | tr 'A-F' 'a-f')" != "$(printf %s "$signer" | tr 'A-F' 'a-f')" ]]; then
+            die "$name is operated by $onchain_op, not $signer — OPERATOR_PK is the wrong key for this node"
+        fi
+
+        cast send --private-key "$OPERATOR_PK" --rpc-url "$RPC" "$group" \
+            "acceptInvite(address)" "$addr" >/dev/null
+        info "  $name $addr — accepted"
+        accepted=$((accepted + 1))
+    done
+
+    echo
+    local active threshold
+    active=$(cast call "$group" "getActiveNodes()(address[])" --rpc-url "$RPC" 2>/dev/null | grep -o '0x[0-9a-fA-F]\{40\}' | wc -l | tr -d ' ')
+    threshold=$(cast call "$group" "quorum()(uint256)" --rpc-url "$RPC" 2>/dev/null | awk '{print $1}')
+    info "Accepted $accepted. Group now has $active active member(s), threshold $threshold."
+    if [[ -n "$threshold" && "$active" -lt "$threshold" ]]; then
+        echo "    Not operational yet — waiting on the other operators to accept."
+    fi
+}
+
 cmd_write_env() {
     need_rpc
     [[ -f "$DATA/factory.env" ]] || die "$DATA/factory.env not found"
@@ -567,6 +679,7 @@ case "${1:-}" in
     register)       shift; cmd_register "$@" ;;
     gen-auth-key)   shift; cmd_gen_auth_key "$@" ;;
     create-group)   shift; cmd_create_group "$@" ;;
+    accept)         shift; cmd_accept "$@" ;;
     write-env)      shift; cmd_write_env "$@" ;;
     *)
         sed -n '2,42p' "$0" | sed 's/^# \{0,1\}//'

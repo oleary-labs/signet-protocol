@@ -90,7 +90,8 @@ holds what it needs.
 | `init-alpha.sh` | **each org** | that org's node keys, KEKs, passphrases |
 | `fund` | deployer (OLL) | `DEPLOYER_PK` only — node addresses are public |
 | `register` | **each org** | that org's node keys, its nodes only |
-| `create-group` | deployer (OLL) | `DEPLOYER_PK` only — member addresses are public |
+| `gen-auth-key` | **manager (SFLuv)** | the group's authorization key |
+| `create-group` | **manager (SFLuv)** | manager key only — member addresses are public |
 | `deploy.yml` | **each org** | that org's `host_vars`, `--limit` to own nodes |
 
 The only file crossing organisational boundaries is `manifest-<org>.json`:
@@ -263,8 +264,26 @@ before registering, rather than assuming its RPC and the deployer's agree.
 export ETH_RPC_URL=https://...
 export CHAIN_ID=11155111          # Sepolia; 1 = mainnet
 export DEPLOYER_PK=0x...          # fresh key — the old one is compromised
+export ADMIN_ADDRESS=0x...        # COLD. Must not be the deployer.
 testnet/scripts/alpha-contracts.sh deploy-factory
 ```
+
+**`ADMIN_ADDRESS` is not the deploy key, and the script refuses if it is.**
+`DEPLOYER_PK` is hot by construction — it sits in a shell for the length of the
+install and signs from a laptop. The factory owner holds standing power for the
+lifetime of the deployment: `upgradeGroupImplementation` swaps the
+`SignetGroup` logic behind **every** group through the shared beacon, so it can
+rewrite auth and membership rules under groups it does not manage, and
+`_authorizeUpgrade` lets it replace the factory itself.
+
+Set it correctly at deploy rather than transferring later. The factory uses OZ
+v5 `OwnableUpgradeable`, which is **single-step** — `transferOwnership` has no
+acceptance leg, so one wrong address permanently loses the factory and the
+beacon with it, and no group could ever be upgraded again. Use a hardware
+wallet or a multisig. `ALLOW_HOT_ADMIN=yes` overrides for a throwaway devnet.
+
+After `fund`, the deployer key has no standing power at all — everything from
+that point is the manager's or the operators'.
 
 On mainnet (`CHAIN_ID=1`) each phase additionally prompts for confirmation
 before spending; set `MAINNET_CONFIRMED=yes` to skip that in automation.
@@ -284,16 +303,76 @@ testnet/scripts/alpha-contracts.sh fund
 
 ```bash
 export ETH_RPC_URL=... CHAIN_ID=11155111 FACTORY_ADDRESS=0x...
-ALPHA_ORG=sfluv testnet/scripts/alpha-contracts.sh register
+ALPHA_ORG=oll ALPHA_OPERATOR=0x<address this org controls> \
+  testnet/scripts/alpha-contracts.sh register
 ```
 
 Signed with your node keys. Re-runnable; already-registered nodes are skipped.
 
-**3d. Deployer creates the group**, once everyone has registered:
+**An operator address is required.** It is what makes several nodes one
+organisation on-chain, and `SignetGroup` checks it for every consent action —
+`acceptInvite`, `declineInvite` and `queueRemoval` all require `msg.sender` to
+be the node's effective operator (`SignetGroup.sol:150,159,167`). Unset, the
+factory falls back to treating each node as its own operator, so every consent
+action needs that individual node's key and nothing records the grouping.
+
+`ALPHA_OPERATOR` here overrides whatever `init-alpha.sh` recorded, so a missing
+or wrong operator is fixable without regenerating identities. It is also
+changeable on-chain later via `setOperator`, so it is not a one-way door.
+`ALPHA_NO_OPERATOR=yes` registers without one deliberately.
+
+Treat the operator address as a control key, not a hot one: it authorises
+joining and leaving groups on behalf of every node in the org.
+
+**3d. The manager mints the authorization key** (SFLuv, not the deployer —
+`addAuthKey` is `onlyManager`, and the key authorizes operations on SFLuv's own
+keys, so OLL should never hold it):
 
 ```bash
+testnet/scripts/alpha-contracts.sh gen-auth-key harness
+```
+
+This is not optional bookkeeping. A group created with no issuers, no auth keys
+and no resolver has **no auth policy**, and the node then skips authentication
+entirely (`node/handlers.go:1280`):
+
+```go
+if !n.auth.HasAuthPolicy(groupID) { return keyID, nil, true }
+```
+
+So a policy-less group serves `/v1/keygen` and `/v1/sign` to anyone who can
+reach the port — which after Phase 4 is the public internet. TLS and rate
+limiting would be guarding an unlocked door. `create-group` refuses to create
+such a group unless you set `ALPHA_OPEN_GROUP=yes` deliberately.
+
+The on-chain form is 34 bytes: a scheme prefix (`0x00` = secp256k1 ECDSA,
+`node/auth.go:28`) followed by the 33-byte compressed pubkey. `SignetGroup` does
+not validate the length, and the node compares the bytes verbatim against the
+certificate's `auth_key_pub`, so a malformed key surfaces only as a 401 much
+later. The script builds and checks it for you.
+
+`testnet/data/auth-key-harness.json` is written `0600` and holds the private
+key — the credential that authorizes every operation on the group. To trust a
+key held elsewhere instead, skip this phase and pass
+`ALPHA_AUTH_KEY_PUB=0x<34 bytes>` to `create-group`.
+
+**3e. The manager creates the group**, once everyone has registered:
+
+```bash
+export MANAGER_PK=0x...            # SFLuv's key — becomes the group manager
 testnet/scripts/alpha-contracts.sh create-group 3
 ```
+
+`createGroup` is permissionless and makes `msg.sender` the manager
+(`SignetFactory.sol:135`), so the key that sends it owns the group. `MANAGER_PK`
+keeps that separate from `DEPLOYER_PK`; passing only `DEPLOYER_PK` still works
+for a single-party devnet but prints a notice.
+
+**The threshold is immutable.** `initialize` sets it and there is no setter;
+`executeRemoval` refuses to drop the active set below it, because doing so would
+brick every key in the group permanently. `threshold <= nodeAddrs.length` is
+also checked at creation, so creating the group before all members are
+registered permanently caps how high `T` can ever go. Register all six first.
 
 Prints the membership, the resulting FROST/ECDSA signer requirements, how many
 nodes may be down, and the shard distribution per operator:
@@ -308,15 +387,17 @@ That last part is informational. It refuses only for things that would not
 work — an unregistered member, or `N < 2T-1` — never for a distribution it
 disapproves of.
 
-**3e. Build the harness env file** (anyone, once the group exists and all the
+**3f. Build the harness env file** (anyone, once the group exists and all the
 `.hosts-alpha` fragments are merged):
 
 ```bash
 testnet/scripts/alpha-contracts.sh write-env
 ```
 
-Writes `testnet/.env-alpha` from `testnet/data/factory.env` plus every
-`manifest-*.json` — this is the file Phase 6 runs against. It prefers each
+Writes `testnet/.env-alpha` (`0600`) from `testnet/data/factory.env` plus every
+`manifest-*.json` — this is the file Phase 6 runs against. It carries
+`HARNESS_AUTH_KEY` when an auth key exists, which is what lets the harness past
+the 401 the auth policy now produces. It prefers each
 node's TLS hostname and only falls back to `http://<ip>:8080`, which it marks
 `INSECURE` and warns about, because a cleartext endpoint leaks delegation
 tokens. A `FILL_IP` in the output means a manifest arrived without a hostname

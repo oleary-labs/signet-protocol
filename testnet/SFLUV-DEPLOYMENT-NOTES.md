@@ -104,12 +104,37 @@ GOOS=linux GOARCH=amd64 xcaddy build \
 
 ### kms-tss without Docker
 
-The runbook says `cross build`, which needs Docker. SFLuv had no Docker
-installed, and it turns out not to be necessary: **every `kms-tss` dependency
-is pure Rust** — no OpenSSL, no `ring`, and no TLS feature on `tonic` — so it
-builds natively anywhere. We used a throwaway cloud VM matching the target,
-which keeps the local machine clean and produces the exact
-`x86_64-unknown-linux-gnu` ABI the nodes run:
+The runbook says `cross build`, which needs Docker. Neither operator had Docker
+installed, and it turns out not to be necessary: **every `kms-tss` dependency is
+pure Rust** — no OpenSSL, no `ring`, and no TLS feature on `tonic` — so it
+builds anywhere a Rust toolchain does.
+
+The two operators took different routes, and both work. Prefer the first.
+
+**Cross-compile locally to static musl (OLL, canonical).** No Docker, no VM, no
+builder to clean up; ~23s. `rust-lld` ships with rustup, and Rust bundles musl
+itself, so `link-self-contained` needs no C toolchain. The result is a
+static-PIE binary with no libc coupling to the node image at all:
+
+```bash
+curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --no-modify-path
+export PATH="$HOME/.cargo/bin:$PATH"
+rustup target add x86_64-unknown-linux-musl
+
+cd kms-tss
+export CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=rust-lld
+export CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_RUSTFLAGS="-C link-self-contained=yes"
+export PATH="$(dirname "$(find ~/.rustup/toolchains -name rust-lld -type f | head -1)"):$PATH"
+cargo build --release --locked --target x86_64-unknown-linux-musl
+cp target/x86_64-unknown-linux-musl/release/kms-tss ../build/kms-tss-linux-amd64
+```
+
+`--no-modify-path` leaves an existing Homebrew `rust` alone; the `export PATH`
+above is then required in every shell that builds this.
+
+**Native build on a throwaway VM (SFLuv).** Use when the local toolchain is
+awkward. Produces a gnu-ABI binary, which is fine — the nodes run Ubuntu 24.04
+— but couples the artifact to that glibc:
 
 ```bash
 # any Ubuntu 24.04 x86_64 instance (4 vCPU is plenty; ~2 min build)
@@ -118,7 +143,7 @@ curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
 cargo build --release --locked
 ```
 
-Two things that are easy to get wrong:
+Two things that are easy to get wrong on this route:
 
 - **`build.rs` compiles `../proto/keymanager.proto`.** Copying `kms-tss/`
   alone fails. Preserve the sibling layout:
@@ -131,9 +156,15 @@ Two things that are easy to get wrong:
   toolchain. `tonic-build` shells out to `protoc`.
 
 Then pull `target/release/kms-tss` back to `build/kms-tss-linux-amd64`,
-**compare `sha256sum` on both ends**, and destroy the builder. Build the binary
-you deploy; do not accept one from another operator without at minimum
-reproducing the checksum from your own source.
+**compare `sha256sum` on both ends**, and destroy the builder.
+
+**Do not expect the two operators' binaries to match.** Different targets and
+different compiler versions produce entirely different hashes — OLL's is
+`static-pie` musl, SFLuv's is dynamically linked gnu. That is expected, not a
+tampering signal. The checksum rule is narrower than it sounds: verify the
+binary you *transported* matches the one you *built*. Build the binary you
+deploy; do not accept one from another operator without reproducing it from
+your own source.
 
 ### Also required before deploying
 
@@ -171,9 +202,23 @@ instances have no IPv6 and a stray record makes Let's Encrypt prefer it and
 fail), and no CDN proxying, which terminates TLS itself and breaks both the
 challenge and node-to-node connections.
 
-Certificates are **production** Let's Encrypt (`acme_ca` is commented out), so
-the rate limit is 5 per registered domain per week. If you expect to iterate,
-point at staging first and pass `-e tls_verify=false`.
+Certificates are **production** Let's Encrypt (`acme_ca` is commented out). The
+limits that apply are not the ones people usually quote:
+
+| Limit | Value | What trips it |
+|---|---|---|
+| Certificates per registered domain | **50 / week** | Distinct hostnames. Six nodes across two domains is nowhere near it. |
+| **Duplicate certificate** | **5 / week** | Re-issuing the *same* hostname set. This is the one that bites. |
+| Failed validations | 5 / hostname / hour | Broken DNS or a blocked port 80. Resets hourly. |
+
+So the risk is not breadth, it is repetition: five successful issuances for
+`oll1.nodes.oleary.com` in one week and that name is locked out until the window
+rolls, while the other nodes are unaffected. Failures are comparatively cheap —
+they burn the hourly validation budget, not the weekly certificate one.
+
+If you expect to iterate on one host, point at staging first and pass
+`-e tls_verify=false` (staging certificates are not publicly trusted, so the
+role's post-install HTTPS check would otherwise fail).
 
 ---
 
@@ -227,11 +272,14 @@ needs `2T-1 = 5`:
 |---|---|---|---|
 | 0 | 2 | no | no |
 | 1 | 3 | yes | no |
+| 2 | 4 | yes | no |
 | 3 | 5 | yes | yes, no spare |
 | 4 | 6 | yes | yes, one may be down |
 
 So **nothing can sign payments until three of OLL's four are up**, and all four
-are needed for any fault tolerance.
+are needed for any fault tolerance. A rolling deploy passes through every row,
+so a group that answers FROST but refuses ECDSA mid-deploy is expected, not a
+fault.
 
 Once they are, from either operator:
 
@@ -239,6 +287,16 @@ Once they are, from either operator:
 go build -o build/harness ./cmd/harness
 ./build/harness -env testnet/.env-alpha correctness
 ```
+
+**`.env-alpha` is per-machine and is not in the repo.** It is generated from
+`factory.env` plus every `manifest-*.json`, so each operator writes its own once
+all the fragments are merged:
+
+```bash
+testnet/scripts/alpha-contracts.sh write-env
+```
+
+Running it locally also avoids inheriting the stale `RPC_URL` noted in §6.
 
 ---
 
@@ -248,6 +306,10 @@ go build -o build/harness ./cmd/harness
   hand to get them up, and the fixes in `e81d443` were written afterwards to
   match. They should be equivalent, but that is a reconstruction, not an
   observation. If something unexpected happens, this is the likeliest gap.
+
+  So the first deploy on the fixed path is a test of it. Run one host —
+  `--limit oll1` — and verify it fully before the rest. A failure then costs one
+  node instead of four, and one duplicate-certificate slot instead of four.
 - `write-env` recorded `RPC_URL` as the public endpoint used for chain reads
   during stand-up, not SFLuv's Alchemy URL. It affects only the harness's own
   reads, not the nodes.

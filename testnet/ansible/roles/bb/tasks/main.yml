@@ -7,13 +7,30 @@
 # symlinked, despite what this comment used to say — a symlink breaks the CRS
 # cache.)
 #
-# Paths use ansible_env.HOME rather than a literal /home/ubuntu: AWS Ubuntu
-# images log in as `ubuntu`, GCP images derive the account from the SSH key, so
-# a hardcoded home silently breaks every non-AWS node.
+# Paths must not be a literal /home/ubuntu: AWS Ubuntu images log in as
+# `ubuntu`, GCP images derive the account from the SSH key, and Vultr logs in as
+# `root`, so a hardcoded home silently breaks most of the fleet.
+#
+# They must ALSO not be ansible_env.HOME. deploy.yml sets `become: true` at play
+# level, so facts are gathered as root and ansible_env.HOME is /root — while
+# every task here runs `become: false` as the login user. bbup then installed
+# into the login user's real $HOME while `creates:` and the version check both
+# pointed at /root, which made the install non-idempotent and failed the check
+# with EACCES. Resolve the home of the user these tasks actually run as.
 
 - name: Read bb version from signet-circuits toolchain.json
   set_fact:
     bb_version: "{{ lookup('file', playbook_dir + '/../../../signet-circuits/toolchain.json') | from_json | json_query('bb') }}"
+
+- name: Resolve the login user's home (not root's — see header)
+  become: false
+  command: sh -c 'echo "$HOME"'
+  register: bb_home_cmd
+  changed_when: false
+
+- name: Set bb_home
+  set_fact:
+    bb_home: "{{ bb_home_cmd.stdout | trim }}"
 
 - name: Install bbup
   become: false
@@ -22,19 +39,21 @@
       curl -sL https://raw.githubusercontent.com/AztecProtocol/aztec-packages/refs/heads/next/barretenberg/bbup/install | bash
     fi
   args:
-    creates: "{{ ansible_env.HOME }}/.bb/bbup"
+    creates: "{{ bb_home }}/.bb/bbup"
 
+# Deliberately NOT guarded with `creates:` on the bb binary. bbup is what
+# enforces the pin, so short-circuiting when any bb exists would make a version
+# bump in toolchain.json silently take no effect — the node would keep whatever
+# version it first installed. Let bbup run every time and decide.
 - name: Install bb at pinned version ({{ bb_version }})
   become: false
   shell: |
     export PATH="$HOME/.bb:${PATH}"
     bbup -v {{ bb_version }}
-  environment:
-    PATH: "{{ ansible_env.HOME }}/.bb:{{ ansible_env.PATH }}"
 
 - name: Check bb version
   become: false
-  command: "{{ ansible_env.HOME }}/.bb/bb --version"
+  command: "{{ bb_home }}/.bb/bb --version"
   register: bb_ver
   changed_when: false
 
@@ -44,7 +63,7 @@
 
 - name: Copy bb to /usr/local/bin
   copy:
-    src: "{{ ansible_env.HOME }}/.bb/bb"
+    src: "{{ bb_home }}/.bb/bb"
     dest: /usr/local/bin/bb
     mode: "0755"
     remote_src: true

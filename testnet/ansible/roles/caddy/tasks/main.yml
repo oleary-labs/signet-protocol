@@ -145,6 +145,22 @@
     validate: "caddy validate --adapter caddyfile --config %s"
   notify: reload caddy
 
+# The same `caddy validate` that needs /var/log/caddy to exist also OPENS the
+# log writer, and it runs as root — so it creates the access log owned by
+# root:root 0600. Caddy itself runs as User=caddy and then dies at startup with
+#   open /var/log/caddy/<host>.access.log: permission denied
+# Creating the directory as caddy:caddy is not enough; the file inside it is
+# what blocks. Re-own after validate, not before. Mode is deliberately left
+# alone — 0600 is correct once the owner is right.
+- name: Re-own log files created as root by `caddy validate`
+  become: true
+  file:
+    path: /var/log/caddy
+    state: directory
+    owner: caddy
+    group: caddy
+    recurse: true
+
 - name: Enable and start Caddy
   become: true
   systemd:
@@ -152,6 +168,23 @@
     enabled: true
     state: started
     daemon_reload: true
+
+# Handlers normally run at the END of the play, which is too late: the wait
+# below depends on changes only a handler applies, so without this it verifies
+# against a stale Caddy and fails — then the play aborts and the handler never
+# runs at all, leaving the node on the old config.
+#
+# `apt` installs Caddy already running with its stock `:80 { file_server }`
+# config, so `state: started` above is a no-op and picks up neither the new
+# Caddyfile nor the xcaddy binary copied over /usr/bin/caddy. The running
+# process keeps the OLD binary mapped, which matters because the stock build
+# does not know `rate_limit` — the config validates (that shells out to the new
+# binary on disk) while the process serving traffic could not parse it.
+#
+# Flushing here runs `reload caddy` then `restart caddy` (handler-file order,
+# not notification order), so it ends on the new binary AND the new config.
+- name: Apply pending Caddy handlers before verifying
+  meta: flush_handlers
 
 # Certificate issuance is asynchronous — Caddy starts, then talks to ACME. A
 # node that starts but never obtains a certificate is silently unreachable over

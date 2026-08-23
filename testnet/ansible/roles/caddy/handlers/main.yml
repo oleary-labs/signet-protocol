@@ -1,12 +1,33 @@
 ---
-- name: reload caddy
-  become: true
-  systemd:
-    name: caddy
-    state: reloaded
-
+# ORDER IS LOAD-BEARING. `meta: flush_handlers` runs handlers in the order they
+# are defined HERE, not the order they were notified, so `restart` must come
+# first.
+#
+# The binary copy notifies `restart` and the Caddyfile notifies `reload`, and on
+# a first deploy both fire. A reload cannot swap the executable — it re-parses
+# the config in the ALREADY RUNNING process, which is still apt's stock build.
+# That build has no `rate_limit` module, so reloading our Caddyfile into it
+# fails:
+#
+#   loading module 'rate_limit': unknown module: http.handlers.rate_limit
+#   caddy.service: Control process exited, code=exited, status=1/FAILURE
+#
+# With reload first that error aborted the play and `restart` never ran, leaving
+# the node on the stock config — the same "the check is why it stayed broken"
+# failure the flush was added to fix, just moved one step later.
+#
+# Restart first, and the process comes up on the new binary AND the new config;
+# the reload that follows re-pushes the same config to an instance that can now
+# parse it. When only the Caddyfile changed, restart is not notified at all and
+# the graceful reload still happens on its own.
 - name: restart caddy
   become: true
   systemd:
     name: caddy
     state: restarted
+
+- name: reload caddy
+  become: true
+  systemd:
+    name: caddy
+    state: reloaded

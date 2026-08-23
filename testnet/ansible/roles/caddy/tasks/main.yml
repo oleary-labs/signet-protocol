@@ -181,10 +181,40 @@
 # does not know `rate_limit` — the config validates (that shells out to the new
 # binary on disk) while the process serving traffic could not parse it.
 #
-# Flushing here runs `reload caddy` then `restart caddy` (handler-file order,
-# not notification order), so it ends on the new binary AND the new config.
+# Flushing here runs the handlers in handler-FILE order, which is why
+# handlers/main.yml defines `restart caddy` before `reload caddy` — a reload
+# cannot swap the executable, and reloading our config into the stock binary
+# fails on the unknown `rate_limit` module. See the note there.
 - name: Apply pending Caddy handlers before verifying
   meta: flush_handlers
+
+# Recovery path for a node left mid-deploy.
+#
+# The handlers above only fire when a task reported `changed`. If an earlier run
+# copied the binary and then died before restarting — which is exactly what the
+# reload-ordering bug did — the binary and Caddyfile now MATCH on disk, so a
+# re-run changes nothing, notifies nothing, and the node keeps serving from the
+# replaced executable forever. `state: started` does not help: the unit is
+# active, just wrong.
+#
+# `copy` replaces by rename, so the running process holds an unlinked inode and
+# the kernel marks it: /proc/<pid>/exe reads "/usr/bin/caddy (deleted)". That is
+# an unambiguous signal that the process is not running the file on disk.
+- name: Check whether Caddy is running a replaced binary
+  become: true
+  shell: |
+    pid=$(systemctl show -p MainPID --value caddy)
+    if [ "$pid" = "0" ]; then echo stale; exit 0; fi
+    if readlink "/proc/$pid/exe" | grep -q '(deleted)'; then echo stale; else echo current; fi
+  register: caddy_exe_state
+  changed_when: false
+
+- name: Restart Caddy if it is running a replaced binary
+  become: true
+  systemd:
+    name: caddy
+    state: restarted
+  when: "'stale' in caddy_exe_state.stdout"
 
 # Certificate issuance is asynchronous — Caddy starts, then talks to ACME. A
 # node that starts but never obtains a certificate is silently unreachable over

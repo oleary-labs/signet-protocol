@@ -513,7 +513,14 @@ than silently starting a **plaintext** store.
 
 TLS is on by default too (`use_tls: true`), which changes the shape of the
 deploy: signetd binds `127.0.0.1:8080` and Caddy serves 443 in front of it. Set
-`tls_email` (the ACME account contact) in `group_vars` or the role asserts.
+`tls_email` (the ACME account contact) in **`group_vars/org_<name>.yml`**, not
+in `group_vars/signet_nodes.yml` — that file applies to the whole fleet, and
+Caddy creates the ACME account per contact address, so a value there would put
+one operator's address on another's certificates and send them the expiry
+warnings for hosts they do not run. `org_<name>` is a child of `signet_nodes`
+in the generated inventory, so the per-operator value wins. Left unset the role
+asserts, which is the intended failure: better a refused deploy than a
+certificate issued under someone else's account.
 
 While iterating, point at Let's Encrypt staging — production rate limits are
 per registered domain and easy to exhaust across six nodes and repeated

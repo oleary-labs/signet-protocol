@@ -1,0 +1,7 @@
+---
+# SFLuv — per-operator variables.
+#
+# Applies to the org_sfluv hosts only, overriding group_vars/signet_nodes.yml.
+# See the tls_email note there for why the ACME contact is not a fleet-wide
+# value.
+tls_email: "ops@sfluv.org"

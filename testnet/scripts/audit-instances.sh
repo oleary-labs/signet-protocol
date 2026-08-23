@@ -94,7 +94,10 @@ else
 fi
 
 echo
-echo "NOTE: this sweeps AWS only. The testnet also had a GCP node"
-echo "      (136.119.229.55, provisioned by ansible/provision-gcp.yml), and"
-echo "      there is no GCP teardown playbook. Check it separately:"
-echo "        gcloud compute instances list"
+echo "NOTE: this sweeps AWS only, and Vultr not at all. The testnet's GCP node"
+echo "      (signet-signet-testnet1, 136.119.229.55, provisioned by"
+echo "      ansible/provision-gcp.yml) was deleted on 2026-08-23; the alpha's"
+echo "      GCP nodes live in project sfluv-842cb. Sweep the other clouds:"
+echo "        gcloud compute instances list --project=sfluv-842cb"
+echo "        gcloud projects list   # then repeat per project — nodes have"
+echo "                               # landed in more than one before"

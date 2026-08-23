@@ -37,7 +37,7 @@ api_port: 8080
 use_tls: true
 
 # ACME account contact. Required when use_tls is true.
-tls_email: ""
+tls_email: "ops@sfluv.org"
 
 # Staging endpoint while testing. Let's Encrypt production rate limits are per
 # registered domain and easy to exhaust across six nodes and repeated

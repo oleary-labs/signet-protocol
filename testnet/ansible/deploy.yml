@@ -36,6 +36,47 @@
           in the environment (SEPOLIA_RPC_URL is accepted as a deprecated
           alias).
 
+    # Host firewall. Vultr's Ubuntu images ship ufw ENABLED with only 22
+    # allowed and a DROP policy on INPUT; AWS's and GCP's do not run ufw at all.
+    # So the cloud-side rules the provisioning playbooks create are necessary
+    # but not sufficient, and the gap is invisible until something tries to
+    # reach the node: oll1/oll2 came up clean while both Vultr nodes failed
+    # identically, looking like a certificate problem.
+    #
+    # It presents as one, too. Caddy binds :80 and :443 fine — ufw drops the
+    # traffic — so the node answers TLS with
+    #   tlsv1 alert internal error
+    # because it is listening with no certificate for that name, while ACME's
+    # http-01 challenge can never reach :80 to get one. Caddy then burns its way
+    # through Let's Encrypt and on to the ZeroSSL fallback, failing both.
+    #
+    # Open exactly what this node serves, and only where ufw is actually
+    # running, so AWS and GCP are untouched. 22 is left alone: it is already
+    # allowed, and rewriting it here could lock out the operator mid-deploy.
+    - name: Check whether a host firewall is active
+      become: true
+      command: ufw status
+      register: ufw_status
+      changed_when: false
+      failed_when: false
+
+    - name: Open the ports this node serves, where ufw is active
+      become: true
+      community.general.ufw:
+        rule: allow
+        port: "{{ item.port | string }}"
+        proto: tcp
+        comment: "{{ item.note }}"
+      loop: >-
+        {{ [{'port': p2p_port, 'note': 'libp2p'}]
+           + ([{'port': 443, 'note': 'HTTPS API (Caddy)'},
+               {'port': 80,  'note': 'ACME HTTP-01 + redirect'}]
+              if use_tls | default(false) | bool
+              else [{'port': api_port, 'note': 'HTTP API'}]) }}
+      loop_control:
+        label: "{{ item.note }} {{ item.port }}"
+      when: "'Status: active' in ufw_status.stdout"
+
     - name: Create signet user early (needed for /run/signet ownership)
       user:
         name: "{{ signetd_user | default('signet') }}"

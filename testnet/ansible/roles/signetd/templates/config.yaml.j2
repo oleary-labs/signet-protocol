@@ -3,8 +3,14 @@ listen_addr: /ip4/0.0.0.0/tcp/{{ p2p_port }}
 api_addr: {{ api_bind }}:{{ api_port }}
 announce_addr: /ip4/{{ ansible_host }}/tcp/{{ p2p_port }}
 bootstrap_peers:
+{# build-inventory.sh writes ansible_host: 0.0.0.0 for a node that is in a
+   manifest but has no entry in .hosts-alpha yet — an operator part-way through
+   provisioning, or another org's nodes that have not been stood up. Rendering
+   those would hand every node a bootstrap address it can never dial, and libp2p
+   would retry them forever. --limit does not help here: it restricts which
+   hosts are targeted, not what groups['signet_nodes'] contains. #}
 {% for host in groups['signet_nodes'] %}
-{% if host != inventory_hostname %}
+{% if host != inventory_hostname and hostvars[host].ansible_host != '0.0.0.0' %}
   - /ip4/{{ hostvars[host].ansible_host }}/tcp/{{ p2p_port }}/p2p/{{ hostvars[host].peer_id }}
 {% endif %}
 {% endfor %}

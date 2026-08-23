@@ -11,8 +11,10 @@ Everything here was found by running it, not by reading it.
 
 ## 1. Read this first if you are deploying OLL's nodes
 
-Two bugs in **shared** roles blocked the deploy. Both are fixed in `e81d443`.
-Neither is GCP-specific and both will hit `org_oll`.
+Two bugs in **shared** roles blocked the deploy, fixed in `e81d443` — and the
+Caddy half needed a second pass in `901ad4c` after `oll1` hit the remainder.
+Neither is GCP-specific and both will hit `org_oll`. Make sure you have
+`901ad4c`, not just `e81d443`.
 
 ### `roles/bb` — installs to one path, checks another
 
@@ -72,7 +74,21 @@ running process actually loaded; ours was correct on disk the whole time.
 Worth knowing: the running process kept the **old apt binary** mapped, which
 does not know `rate_limit`. The config validates fine — `validate` shells out
 to the new binary on disk — while the process serving traffic could not have
-parsed it. Fixed with `meta: flush_handlers` before the check.
+parsed it.
+
+`e81d443` fixed this with `meta: flush_handlers` before the check, which was
+right but insufficient, and `oll1` found the rest. `flush_handlers` runs
+handlers in **handler-file order, not notification order**, and `reload` was
+defined first — but a reload cannot swap an executable, so it re-parsed our
+config inside the stock binary and died on the unknown `rate_limit` module. The
+play aborted before `restart` ran, leaving the node on the stock config: the
+same failure shape, one step later.
+
+`901ad4c` defines `restart` before `reload` and adds a recovery task, because
+ordering alone would not rescue a node already left in that state — after the
+aborted run the binary and Caddyfile match on disk, so a re-run notifies
+nothing. It detects the replaced-but-still-mapped executable via
+`/proc/<pid>/exe` reading `(deleted)`.
 
 **b. The role's own `validate` locks Caddy out of its log.**
 `caddy validate` does not merely parse; it *opens* the configured log writer.
@@ -247,6 +263,28 @@ ssh -L 8080:127.0.0.1:8080 <user>@<node> -N &
 curl -s http://127.0.0.1:8080/debug/stats | jq '.groups'
 ```
 
+### Reading the PLAY RECAP
+
+`failed=0` and `unreachable=0` on every host is the bar. Exact `ok=` counts are
+not quoted here deliberately — they move whenever a task is added, and a stale
+number reads as drift when it is not.
+
+Two things look like drift on a repeat run and are not:
+
+- **`changed=1` on a converged host is expected**, and it is
+  `bb : Install bb at pinned version`. That task deliberately has no `creates:`
+  guard — bbup is what enforces the pin, so guarding on "some bb exists" would
+  make a `toolchain.json` bump silently never take effect. Do not "fix" this to
+  reach `changed=0`.
+- **A one-task difference between hosts is expected.** `Check for the locally
+  built Caddy binary` is `run_once` and delegated to localhost, so it appears
+  against one host only.
+
+Anything *else* reporting `changed` on a second run is real drift and worth
+reading. But note the converse trap from §6: a run where nothing changed has
+also exercised none of the handler paths, so it is weak evidence that a fix to
+those paths works.
+
 ---
 
 ## 5. State as of these notes
@@ -302,14 +340,30 @@ Running it locally also avoids inheriting the stale `RPC_URL` noted in §6.
 
 ## 6. Caveats
 
-- **The playbook has not run green end-to-end.** SFLuv's nodes were repaired by
-  hand to get them up, and the fixes in `e81d443` were written afterwards to
-  match. They should be equivalent, but that is a reconstruction, not an
-  observation. If something unexpected happens, this is the likeliest gap.
+- **SFLuv's nodes were repaired by hand before `e81d443` was written**, so that
+  commit was a reconstruction rather than an observation.
 
   So the first deploy on the fixed path is a test of it. Run one host —
   `--limit oll1` — and verify it fully before the rest. A failure then costs one
   node instead of four, and one duplicate-certificate slot instead of four.
+
+- **A green re-run proves less than it looks like.** SFLuv re-ran `deploy.yml`
+  over `org_sfluv` after the hand-repair and it went green on both hosts,
+  `Wait for Caddy to serve HTTPS` included. That was read as confirming the
+  fix. It did not: `oll1` then failed on the very next real deploy, which is
+  what `901ad4c` fixes.
+
+  The reason is worth internalising, because it generalises past Caddy.
+  **Handlers only fire on `changed`.** The hand-repaired nodes already had the
+  right binary and Caddyfile on disk, so nothing reported `changed`, nothing
+  notified, and the flush ran no handlers at all. The green run therefore never
+  exercised the handler path — the only part under test. A converged host
+  cannot verify a fix to convergence.
+
+  Verifying that class of fix takes a host that is genuinely in the *before*
+  state: a fresh node, or `oll1` on its first deploy. That is the same property
+  `901ad4c`'s recovery task exists for — a node left mid-deploy looks converged
+  on disk while serving from a replaced binary.
 - `write-env` recorded `RPC_URL` as the public endpoint used for chain reads
   during stand-up, not SFLuv's Alchemy URL. It affects only the harness's own
   reads, not the nodes.

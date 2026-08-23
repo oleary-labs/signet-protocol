@@ -209,12 +209,32 @@
   register: caddy_exe_state
   changed_when: false
 
-- name: Restart Caddy if it is running a replaced binary
+# Three reasons to force a restart, in one task so a run that hits more than
+# one does not restart repeatedly:
+#
+#   1. The binary was replaced under the running process (above).
+#
+#   2. The host firewall was just opened. Caddy retries certificate issuance
+#      with a growing backoff and does not watch for the network becoming
+#      reachable, so opening ufw mid-deploy leaves it waiting on a timer far
+#      longer than the HTTPS check below is willing to wait. Observed on the
+#      Vultr nodes: last ACME attempt at 22:27:40, firewall opened at ~22:35,
+#      and by 22:37 Caddy had logged nothing further and held no certificate.
+#      A restart clears the backoff and it succeeds immediately.
+#
+#   3. force_caddy_restart=true, for the case the first two cannot cover: a
+#      node already stuck in that backoff from an EARLIER run. The firewall
+#      rules exist by then, so the ufw task reports no change, and nothing
+#      else would ever prod it. Escape hatch rather than an ssh round trip.
+- name: Restart Caddy if the binary was replaced, the firewall just opened, or forced
   become: true
   systemd:
     name: caddy
     state: restarted
-  when: "'stale' in caddy_exe_state.stdout"
+  when: >-
+    'stale' in caddy_exe_state.stdout
+    or (ufw_opened is defined and ufw_opened.changed)
+    or (force_caddy_restart | default(false) | bool)
 
 # Certificate issuance is asynchronous — Caddy starts, then talks to ACME. A
 # node that starts but never obtains a certificate is silently unreachable over

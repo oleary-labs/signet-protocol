@@ -76,6 +76,9 @@
       loop_control:
         label: "{{ item.note }} {{ item.port }}"
       when: "'Status: active' in ufw_status.stdout"
+      # Consumed by the caddy role: opening the firewall does not make Caddy
+      # retry a certificate it has already backed off from, so it must restart.
+      register: ufw_opened
 
     - name: Create signet user early (needed for /run/signet ownership)
       user:

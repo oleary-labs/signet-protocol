@@ -90,8 +90,23 @@ func run() error {
 	// Attach session auth when an authorization key is configured. Groups with
 	// any auth policy (issuers, auth keys, or a resolver) reject unauthenticated
 	// keygen/sign with 401, so this is required for anything but a bare group.
-	if authKey := os.Getenv("HARNESS_AUTH_KEY"); authKey != "" {
+	authKey := os.Getenv("HARNESS_AUTH_KEY")
+	if authKey == "" {
+		authKey = env.AuthKey
+	}
+	if authKey == "" {
+		// Say so rather than proceeding quietly. An unauthenticated run against
+		// a group with any auth policy fails every request with a bare 401, and
+		// the only signal that auth was never configured is the ABSENCE of the
+		// line below — which is exactly what makes it cost an hour to spot.
+		fmt.Println("auth: NONE configured — set HARNESS_AUTH_KEY, or run write-env " +
+			"to put it in the env file. A group with an auth policy will 401 every request.")
+	}
+	if authKey != "" {
 		identity := os.Getenv("HARNESS_AUTH_IDENTITY")
+		if identity == "" {
+			identity = env.AuthIdentity
+		}
 		if identity == "" {
 			identity = "harness"
 		}

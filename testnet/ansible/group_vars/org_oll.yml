@@ -5,3 +5,23 @@
 # See the tls_email note there for why the ACME contact is not a fleet-wide
 # value.
 tls_email: "ops@oleary.com"
+
+# Addresses exempt from every Caddy rate-limit zone, on OLL's nodes only.
+#
+# The harness runs from SFLuv's machine but drives the whole fleet: it calls
+# /v1/auth on every node (cmd/harness/main.go:143) and round-robins scenario
+# initiators across all six via ClientRing. So an exemption on SFLuv's nodes
+# alone leaves the suite hitting OLL's limits instead of SFLuv's, and the
+# failure just moves. Same address, listed here because org_sfluv.yml does
+# nothing for hosts OLL runs.
+#
+# Be clear about what this grants. The exemption is per-zone-wide, not
+# per-endpoint: the Caddyfile applies `not remote_ip` to every zone including
+# /v1/auth, which shells out to `bb verify` and broadcasts to all six members —
+# the most expensive thing an unauthenticated caller can trigger. This is OLL
+# choosing to let an address SFLuv controls bypass that protection on OLL's
+# hardware. Reasonable for a two-operator alpha validating together; it should
+# be removed once the correctness suite is no longer being run routinely, and
+# it is not a pattern to extend to further operators without revisiting.
+rate_limit_exempt_cidrs:
+  - 135.180.49.112/32   # harness runner (SFLuv)

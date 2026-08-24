@@ -5,3 +5,16 @@
 # See the tls_email note there for why the ACME contact is not a fleet-wide
 # value.
 tls_email: "ops@sfluv.org"
+
+# Addresses exempt from every Caddy rate-limit zone, on SFLuv's nodes only.
+#
+# Scoped per operator rather than fleet-wide for the same reason tls_email is:
+# this is an internet-facing exemption, and each operator decides which
+# addresses bypass the limits on hardware it runs. A value here does nothing
+# for OLL's nodes — they need the same entry in org_oll.yml.
+#
+# The correctness suite needs this, not just the perf harness. Nearly every
+# test does a keygen and rate_limit_keygen_events is 10/min, so an unexempted
+# runner exhausts its own quota around test 8 and the remainder fail 429.
+rate_limit_exempt_cidrs:
+  - 135.180.49.112/32   # harness runner

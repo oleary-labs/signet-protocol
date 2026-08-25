@@ -425,6 +425,31 @@ The run drives load from *your* machine, so it must stay awake. `caffeinate -i
 -w <pid>` holds off idle sleep and exits by itself when the run does — though it
 does not stop a lid-close.
 
+### The auth session expires mid-run, and the run does not stop
+
+`-auth-ttl` defaults to **one hour**, and the session is minted once at startup
+and never refreshed. A run longer than that keeps going and 401s every request
+from the moment it lapses — no abort, no warning, just a scenario whose numbers
+are entirely fictional.
+
+This ate the last two scenarios of a 700s × 7 run here. The arithmetic is
+unforgiving and easy to miss:
+
+```
+-duration 700s × 7 scenarios ≈ 82 min  >  60 min default TTL
+```
+
+The harness prints the expiry on the second line of output. Compare it against
+your expected finish before starting:
+
+```
+auth: identity "harness", session 020bb58d…, expires 2026-08-25T12:35:04-07:00
+```
+
+For any run over ~45 minutes, raise it: `-auth-ttl 4h`. The tell afterwards is a
+scenario reporting a huge operation count with a near-100% error rate and p50 of
+0 ms — those are 401s returning instantly, not work.
+
 ---
 
 ## 7. Validation results
@@ -481,30 +506,111 @@ signers over 4 rounds against FROST's 3 signers over 2. Scoped keys cost
 essentially nothing over plain ECDSA (37.1 vs 37.2 ops/sec), so the EIP-712
 binding is free.
 
-### Two anomalies, neither explained
+### The 404s: a real race, now fixed
 
-Success was 99.999% (`debug`, 1 error in 91,923) and 99.998% (`info`, 2 in
-100,995). Both are worth naming rather than rounding away.
+Two `HTTP 404`s on sign in the `info` run, both for keys that had *just* been
+created. They looked anomalous for a reason worth understanding, because the
+same trap will catch the next person.
 
-- **One `HTTP 504`** on a FROST sign at peak concurrency, 150 ms in, on the
-  `debug` run. That is Caddy giving up on signetd, not a signing failure, and
-  150 ms is far below any sensible proxy timeout — so more likely a transient
-  connection reset surfacing as 504. **It did not recur** on the `info` run,
-  which did more FROST sign operations than the run that produced it.
-- **Two `HTTP 404`** on sign, `info` run. The obvious guess — a propagation race
-  against a freshly wiped store, keygen landing on one node and the sign hitting
-  another before the shard is durable — **does not fit**: they occurred at
-  t+216s and t+233s, operations 2035 and 2203 of 2874, not clustered at the
-  start.
+**They are in `sequential-baseline`, the least-loaded scenario** — one operation
+at a time at ~4.8 ops/sec — while the concurrent scenarios running 25× that rate
+produced none. That inverts the usual intuition, and the explanation is
+structural rather than statistical: `sequential-baseline` is the **only**
+scenario that signs a key it just created. Every other sign scenario calls
+`BuildKeyPool` first and signs from a pool that is minutes old. So the other
+scenarios were not 25× less exposed; they were **not exposed at all**.
 
-  What makes them odd is *where*. They are in `sequential-baseline`, the
-  **least**-loaded scenario, one operation at a time at ~4.8 ops/sec. The
-  concurrent scenarios running 25× that rate produced none. So load does not
-  explain it, and a sign returning "key not found" for a key the caller just
-  created is correctness-adjacent rather than a perf artifact.
+The mechanism, from OLL's journals (key `…-1018`):
 
-  Both were served by OLL's nodes — SFLuv's logged nothing in that window — so
-  the detail behind the generic `not found` is in their journal. Unresolved.
+```
+oll1 (initiator)    01:47:45.559  keygen complete        -> HTTP 200 to client
+oll2 (participant)  01:47:45.585  404 key not found      <- 26ms after the 200
+oll2                01:47:45.602  coord: keygen complete <- 17ms too late
+```
+
+The initiator answers `/v1/keygen` when its **own** DKG run finishes, while each
+participant runs its side in a goroutine off the coord message with no ack back
+before the response. Between those two points the key is real to the client and
+absent on a participant. The harness round-robins, so the operation after a
+keygen goes to the next node in the ring — which is why both landed on the node
+following the initiator, and none elsewhere. That clustering is confirming
+evidence, not coincidence.
+
+**This is not a test artifact.** Any client that creates a key and immediately
+uses it against a different node can land in the window. A load generator just
+does it often enough to be seen.
+
+`42c31a3` fixes it, and the root cause is sharper than the symptom: the node
+already had `markKeygenPending`/`awaitKey`, and the **coord path already used
+it** — waiting rather than failing. Only the client-facing path did not, so an
+internal sign waited while a client-facing one 404'd. `handleSign` now resolves
+through `awaitKey`: present returns immediately, in flight waits up to 2s,
+genuinely absent still 404s. The 2s is ~3× the measured keygen p99 of 598 ms.
+
+The status code matters as much as the wait. "Not yet" and "never existed" were
+the same response, which is exactly why this looked unexplainable — the race's
+404 was indistinguishable from the deliberate ones `4-sign-missing-key` fires.
+In-flight is now `409` with `Retry-After`.
+
+**Verification:** 3,151 keygen→sign pairs in `sequential-baseline` after the
+fix, zero errors, zero 404s, zero 409s. Against the observed rate of 2-in-1,437
+(p ≈ 0.139%), the chance of seeing zero by luck is ~1.3%, so ~98.7% confidence.
+State plainly what that is: evidence the race no longer *manifests* at a
+detectable rate. The mechanism is established by the journals and the code path,
+which is stronger evidence than any black-box run. The zero `409`s is its own
+result — `awaitKey` never exhausted its 2s budget across 3,151 pairs, so the
+window stays well inside it.
+
+### Store size: measurable, and smaller than `du` suggests
+
+A third run reused the ~101k keys left by the second instead of wiping, which
+isolates store size (both runs `info`):
+
+| Scenario | wiped | ~101k keys | Δ |
+|---|---:|---:|---:|
+| sequential-baseline / keygen | 4.8 | 4.5 | −6.0% |
+| sequential-baseline / sign | 4.8 | 4.5 | −6.0% |
+| **concurrent-keygen-frost** | 39.4 | 33.2 | **−16.0%** |
+| concurrent-sign-frost | 120.7 | 109.2 | −9.6% |
+| concurrent-keygen-ecdsa | 30.6 | 28.0 | −8.4% |
+| concurrent-sign-ecdsa | 37.2 | 36.7 | −1.3% |
+
+Writes degrade more than reads (keygen −16% against ECDSA sign −1.3%), which is
+what sled write amplification on a larger tree looks like. Treat these as an
+upper bound: the third run used a longer per-scenario duration and the store
+kept growing *during* it, so the confound points the same way as the effect.
+
+On disk size specifically — **`du` overstates it badly**. The store measured
+~290 MB at 101k keys, and still ~290 MB after another ~46k keygens. Both numbers
+are preallocated sled segments, not live data, so dividing store size by key
+count (~3 KB/key) measures baseline overhead amortised, not marginal cost. Any
+storage optimisation should start from a before/after delta on a quiesced node,
+not from that ratio.
+
+The structural cost worth knowing is in `StoredKey.public_key_package`: it holds
+a verifying share per participant, so per-key storage is **O(committee size)**.
+At N=6 that is ~400 B; the direction of travel toward one shard per operator
+makes it the dominant term.
+
+### Still open
+
+- **One `HTTP 504`** on a FROST sign at peak concurrency in the `debug` run,
+  150 ms in. Caddy giving up on signetd, not a signing failure, and 150 ms is
+  far below any sensible proxy timeout — more likely a transient reset surfacing
+  as 504. It has not recurred across two later runs that did more FROST signing.
+- **A liveness wobble under sustained ECDSA keygen.** In the third run's
+  `concurrent-keygen-ecdsa`, seven client-side 30s timeouts across five
+  different nodes, and two 503s:
+
+  ```
+  select signers: insufficient available signers: need 5, have 2 of 6 members
+  select signers: insufficient available signers: need 5, have 1 of 6 members
+  ```
+
+  Peer health briefly collapsed to 1–2 nodes. Unrelated to the session expiry in
+  §6, and absent from the two shorter runs. **This is the one to chase**: ECDSA
+  needs 5 of 6, so there is no margin for health flapping on the payments path.
+  Health returned to 6/6 afterwards.
 
 ---
 

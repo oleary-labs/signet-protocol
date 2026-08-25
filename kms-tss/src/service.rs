@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use tokio::sync::Mutex;
 use tonic::{Request, Response, Status};
@@ -21,9 +22,32 @@ use crate::types::{OutgoingMessage, StepOutput};
 /// Sessions use per-session locking (Arc<Mutex<Session>>) so that concurrent
 /// sessions don't block each other. The session map itself uses a separate
 /// lock only for insert/remove/lookup — never held during message processing.
+/// How long an idle session may sit in the map before the reaper removes it.
+///
+/// Every legitimate session is far shorter-lived than this: the Go side bounds
+/// reshare at 15s and coord handling at 30s, so anything still here after five
+/// minutes is not going to be driven to completion by anybody.
+///
+/// The client aborts sessions it abandons, which is the primary cleanup. This
+/// is the backstop for the cases a client cannot cover — it crashed, the socket
+/// dropped, or the node was restarted mid-session — where nothing would ever
+/// send the abort. Without it those entries were immortal: sessions started but
+/// never bridged were still present 60s later with no expiry path at all.
+const SESSION_TTL: Duration = Duration::from_secs(300);
+
+/// How often the reaper sweeps. Sessions therefore live at most
+/// SESSION_TTL + SESSION_REAP_INTERVAL.
+const SESSION_REAP_INTERVAL: Duration = Duration::from_secs(60);
+
+/// A session plus the instant it was created, so the reaper can age it out.
+struct TrackedSession {
+    created: Instant,
+    session: Arc<tokio::sync::Mutex<Session>>,
+}
+
 pub struct KmsService {
     storage: Arc<Storage>,
-    sessions: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<Session>>>>>,
+    sessions: Arc<Mutex<HashMap<String, TrackedSession>>>,
 }
 
 /// Parse a curve string from proto, defaulting to secp256k1 if empty.
@@ -38,10 +62,34 @@ fn parse_curve(s: &str) -> Result<Curve, Status> {
 
 impl KmsService {
     pub fn new(storage: Arc<Storage>) -> Self {
-        KmsService {
-            storage,
-            sessions: Arc::new(Mutex::new(HashMap::new())),
-        }
+        let sessions: Arc<Mutex<HashMap<String, TrackedSession>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+
+        // Reaper. Holds the map lock only for the sweep itself, never across an
+        // await on a session lock, so it cannot block message processing.
+        let reaper_sessions = Arc::clone(&sessions);
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(SESSION_REAP_INTERVAL);
+            loop {
+                ticker.tick().await;
+                let mut guard = reaper_sessions.lock().await;
+                let before = guard.len();
+                guard.retain(|_, tracked| tracked.created.elapsed() < SESSION_TTL);
+                let reaped = before - guard.len();
+                let remaining = guard.len();
+                drop(guard);
+                if reaped > 0 {
+                    warn!(
+                        reaped,
+                        remaining,
+                        ttl_secs = SESSION_TTL.as_secs(),
+                        "reaped expired sessions — these were abandoned without an abort"
+                    );
+                }
+            }
+        });
+
+        KmsService { storage, sessions }
     }
 
     /// Convert session outgoing messages to proto SessionMessages.
@@ -110,7 +158,10 @@ impl KeyManager for KmsService {
         // Store the session with its own lock.
         self.sessions.lock().await.insert(
             session_id,
-            Arc::new(tokio::sync::Mutex::new(session)),
+            TrackedSession {
+                created: Instant::now(),
+                session: Arc::new(tokio::sync::Mutex::new(session)),
+            },
         );
 
         let outgoing = Self::to_proto_messages(output.messages);
@@ -148,7 +199,7 @@ impl KeyManager for KmsService {
             let session_arc = {
                 let sessions_guard = sessions.lock().await;
                 match sessions_guard.get(&session_id) {
-                    Some(s) => Arc::clone(s),
+                    Some(t) => Arc::clone(&t.session),
                     None => {
                         warn!(session_id = %session_id, "unknown session");
                         let _ = tx

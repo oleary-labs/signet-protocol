@@ -14,6 +14,17 @@
   hosts: signet_nodes
   become: true
 
+  # Same reasoning as deploy.yml: restart rolls one node at a time so the group
+  # keeps signing, because ECDSA needs 2T-1 signers and a 6-node T=3 group
+  # tolerates exactly one being down.
+  #
+  # Note this bounds `restart` but cannot save `stop` or `clean`, which take
+  # every targeted node down by definition. Rolling those only changes the order
+  # in which the group loses quorum.
+  #
+  #   -e deploy_serial=6   to act on the whole batch at once, deliberately
+  serial: "{{ deploy_serial | default(1) }}"
+
   tasks:
     # ---- Stop ----
     - name: Stop signetd

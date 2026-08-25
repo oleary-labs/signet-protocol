@@ -506,6 +506,19 @@ ansible-playbook -i inventory-alpha.yml deploy.yml \
 inventory, including the other operator's, which will fail on SSH — but the
 intent is that you never even attempt it.
 
+**The deploy rolls one node at a time** (`serial: 1`), so it is slower than it
+looks like it should be — each node is restarted and health-checked before the
+next is touched, and the group keeps signing throughout. That bound is
+`N-(2T-1)`: ECDSA needs `2T-1 = 5` signers, so six nodes at `T=3` tolerate
+exactly one being down. Two at once stops the payment path until the first
+returns.
+
+Note `--forks` does not do this. It caps how many hosts run a single task
+concurrently, while the play still advances task-by-task across the batch — so
+every node would have signetd stopped before any reached its health check.
+Override deliberately when nothing depends on the group, such as the initial
+stand-up: `-e deploy_serial=4`.
+
 At-rest encryption is on by default (`kms_at_rest_encryption: true`). The KEK
 lands in `/etc/signet/secrets/kms.env` mode 0640, referenced by an
 `EnvironmentFile` with no leading `-`, so a missing file fails the unit rather

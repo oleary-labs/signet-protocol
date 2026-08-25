@@ -22,6 +22,28 @@
   hosts: signet_nodes
   become: true
 
+  # Roll one node at a time by default, so the group keeps signing through a
+  # deploy.
+  #
+  # The number is not a preference, it is N-(2T-1). ECDSA needs 2T-1 signers, so
+  # a group of 6 at T=3 needs 5 up and tolerates exactly one node down. Take two
+  # down together and the group cannot produce an ECDSA signature until the
+  # first is back — the payment path stops.
+  #
+  # `serial`, not `--forks`. forks caps how many hosts run a TASK concurrently,
+  # but the play still advances task-by-task across the whole batch: every node
+  # would have signetd stopped before any node reached the health check. serial
+  # runs the entire play per batch, so a node is restarted AND verified before
+  # the next one is touched.
+  #
+  # Costs wall-clock — each batch pays the Caddy HTTPS check — which is the
+  # right trade for a fleet holding real key shards. Override deliberately when
+  # nothing is depending on the group, e.g. the initial stand-up:
+  #   -e deploy_serial=4
+  # A larger group can raise the default, but the ceiling is still N-(2T-1) for
+  # that group, not a fixed number.
+  serial: "{{ deploy_serial | default(1) }}"
+
   pre_tasks:
     - name: Validate required variables
       assert:

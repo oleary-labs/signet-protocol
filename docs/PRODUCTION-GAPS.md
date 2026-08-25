@@ -76,6 +76,43 @@ storage for incident response and compliance.
 reshare. Breaks version tracking on multiple reshares. Needs to parse
 the actual generation from the KMS result.
 
+### Liveness False-Negatives Under Sustained Load
+**Observed on mainnet, 2026-08-25, not yet diagnosed.** During a sustained
+ECDSA keygen run SFLuv saw seven 30-second timeouts across five nodes and two
+503s reporting peer health at 1–2 of 6. It recovered unattended, and neither
+shorter run reproduced it — it appears to need sustained load.
+
+This is an availability risk rather than a curiosity: ECDSA needs `2T-1 = 5` of
+6 with no margin, so a peer wrongly marked unhealthy directly removes signing
+capacity from the payments path.
+
+**Leading hypothesis — probe starvation, not peer failure.** The numbers line
+up too well to ignore (`node/liveness.go`):
+
+- `probeInterval = 15s`, `unhealthyAfter = 2` → a peer is declared unhealthy
+  after exactly **30 seconds** of failing probes, which is the reported timeout
+  duration.
+- `probeTimeout = 3s` is tight for a node saturated by concurrent 4-round ECDSA
+  sessions. Two consecutive starved probes is all it takes.
+- That fits every observed property: only under sustained load, several nodes at
+  once (all are saturated), and self-recovering once load drops.
+
+Note also that liveness probes dial their own streams, while TSS traffic goes
+over `MuxNetwork` — which exists specifically because long-lived streams hit
+yamux flow-control limits. The probe path does not share that treatment.
+
+To confirm next time, capture `/debug/stats` during the event: `consecutive_fails`
+and `rtt_ms` per peer distinguish "probes were starved" from "the peer was
+genuinely unreachable". Correlate against whether TSS sessions to that same peer
+were succeeding at the time — if they were, the peer was alive and the tracker
+was wrong.
+
+Worth considering if confirmed: **fold session success into the liveness
+tracker.** A peer we are exchanging TSS messages with right now is provably
+alive, and that evidence is currently discarded in favour of a dedicated ping.
+It is also most abundant exactly when load makes pings least reliable, so it
+inverts the failure mode instead of merely widening a timeout.
+
 ---
 
 ## Medium — before mainnet / full production

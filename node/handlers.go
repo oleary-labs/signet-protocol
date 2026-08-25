@@ -18,6 +18,19 @@ import (
 	"signet/tss"
 )
 
+// keygenSettleTimeout bounds how long a client-facing request will wait for a
+// keygen that is still in flight on this node before giving up and answering
+// 409.
+//
+// Sized against what a keygen actually costs, not arbitrarily: the first
+// mainnet load test measured keygen p50 206ms and p99 598ms under concurrency
+// 10, so 2s is a little over 3x p99 and covers the settle window with room for
+// a slow round, while staying far inside any sane client timeout (the harness
+// default is 30s). The coord path allows 10s (coord.go:584), but that is a
+// background goroutine with nobody waiting on it; an HTTP caller is holding a
+// connection open, so it gets the tighter bound.
+const keygenSettleTimeout = 2 * time.Second
+
 func (n *Node) handleHealth(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.Write([]byte(`{"status":"ok"}`))
@@ -744,9 +757,39 @@ func (n *Node) handleSign(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	keyInfo, err := n.km.GetKeyInfo(req.GroupID, keyID, signCurve)
+	// awaitKey, not GetKeyInfo: a keygen may still be in flight on THIS node
+	// for this key.
+	//
+	// The initiator answers /v1/keygen as soon as its own DKG run finishes
+	// (see "keygen complete" below), while every participant runs its side in
+	// a goroutine off the coord message (coord.go:504). So there is a window,
+	// tens of milliseconds under load, where the key exists as far as the
+	// client is concerned but is not yet persisted on some participant. A
+	// client that keygens and then immediately signs against a different node
+	// — anything round-robining across the group — lands in it.
+	//
+	// The coord path already handles this (coord.go:584) and this one did not,
+	// so an internal sign waited while a client-facing one returned 404. Two
+	// such 404s appeared in the first mainnet load test, both on the node
+	// following the initiator in the harness's ring, 17ms and 2ms before their
+	// keygen completed locally.
+	//
+	// awaitKey returns immediately when the key is present, waits on the
+	// pending-keygen channel when one is in flight, and (nil, nil) when the key
+	// is genuinely unknown here — which stays a 404.
+	keyInfo, err := n.awaitKey(req.GroupID, keyID, signCurve, keygenSettleTimeout)
 	if err != nil {
-		n.httpError(w, http.StatusInternalServerError, "load config: "+err.Error())
+		// Still converging: the keygen is registered as pending but did not
+		// finish inside the wait. That is not "not found" — reporting it as one
+		// is indistinguishable from a key that never existed, which is exactly
+		// what made those load-test 404s look anomalous. 409 says the state is
+		// transient, and Retry-After says so to clients that read it.
+		n.log.Warn("sign: keygen still pending for key",
+			zap.String("group_id", req.GroupID),
+			zap.String("key_id", keyID),
+			zap.Error(err))
+		w.Header().Set("Retry-After", "1")
+		n.httpError(w, http.StatusConflict, "keygen in progress for this key, retry shortly")
 		return
 	}
 	if keyInfo == nil {

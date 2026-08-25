@@ -64,6 +64,15 @@ the actual generation from the KMS result.
 
 ## Medium — before mainnet / full production
 
+### Key Lifecycle Endpoints During Keygen
+`handleSetKeyStatus` and `handleDeleteKey` return a bare 404 for a key whose
+keygen is still settling on that node, so disable/delete inherit the visibility
+race that sign no longer has. Sign was fixed (409 + `Retry-After`, see
+`docs/KEYGEN-VISIBILITY-RACE.md`); these were left because the correct
+behaviour differs — waiting for a keygen in order to delete the result is
+defensible, and so is refusing. Needs a decision, not a copied fix, before
+either endpoint is driven programmatically at rate.
+
 ### Keygen Attestation
 No verification that keygen ran the threshold protocol. A malicious
 coordinator could generate a key locally. Fix: each participant signs

@@ -14,3 +14,17 @@ ansible/host_vars/
 .clouds-alpha
 .env-alpha
 ansible/inventory-alpha.yml
+
+# Perf harness output from alpha runs. Raw per-operation records — roughly 90k
+# lines and 9 MB per run, one line per keygen/sign, regenerated every time.
+#
+# Note this is the SAME format as perf-baseline.jsonl and perf-local.jsonl,
+# which ARE tracked on purpose as reference data. The difference is intent, not
+# size or shape: those are two curated baselines, whereas these accumulate one
+# file per experiment (per log level, per committee, per wipe) and a reflexive
+# `git add .` after an afternoon of runs commits tens of megabytes nobody will
+# read again.
+#
+# To keep a run as a new reference point, force-add that one file:
+#   git add -f testnet/perf-alpha-<description>.jsonl
+perf-alpha*.jsonl

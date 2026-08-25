@@ -4,7 +4,24 @@
 # after running devnet-init and the deploy script.
 
 node_type: public
-log_level: debug
+
+# Drives BOTH services: signetd's -log-level (signetd.service.j2:21) and
+# kms-tss's RUST_LOG (kms-tss.service.j2:29).
+#
+# `debug` is not free at these rates. During the first mainnet load test the
+# nodes wrote ~1,200 journal lines/sec — 30k DEBUG entries a minute — which put
+# systemd-journald at 9-18% CPU and ~195MB resident on a 2-vCPU box, competing
+# with signetd and kms-tss for the same two cores. Every figure in that run is
+# therefore a floor rather than a measurement, worst for the 4-round ECDSA
+# scenarios that are most sensitive to CPU contention.
+#
+# It is also the wrong default for nodes holding real key shards: DEBUG records
+# per-peer protocol detail and session internals to disk indefinitely, and
+# journald only stops it by rotating.
+#
+# Override per run when actually debugging — `-e log_level=debug` — rather than
+# leaving the fleet verbose by default.
+log_level: info
 
 # --- Host layout ---
 #

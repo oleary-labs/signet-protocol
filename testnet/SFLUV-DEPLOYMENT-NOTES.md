@@ -281,7 +281,7 @@ Two things look like drift on a repeat run and are not:
   against one host only.
 
 Anything *else* reporting `changed` on a second run is real drift and worth
-reading. But note the converse trap from §6: a run where nothing changed has
+reading. But note the converse trap from §8: a run where nothing changed has
 also exercised none of the handler paths, so it is weak evidence that a fix to
 those paths works.
 
@@ -334,11 +334,181 @@ all the fragments are merged:
 testnet/scripts/alpha-contracts.sh write-env
 ```
 
-Running it locally also avoids inheriting the stale `RPC_URL` noted in §6.
+Running it locally also avoids inheriting the stale `RPC_URL` noted in §8.
 
 ---
 
-## 6. Caveats
+## 6. Running the harness
+
+Four traps, all of which cost time on the alpha.
+
+### The auth key has to reach the process, not just the file
+
+`write-env` writes `HARNESS_AUTH_KEY` into `.env-alpha`, and until `1abb73a` the
+harness read it **only from the process environment**. So the invocation the
+runbook documents ran completely unauthenticated and every request came back
+401 — with a correct key, on-chain, matching `getAuthKeys` the whole time.
+
+`1abb73a` makes the harness parse it from the env file, so on current `main`
+this just works. On an older build, export it first:
+
+```bash
+set -a; . ./testnet/.env-alpha; set +a
+```
+
+**The diagnostic is one line of output.** An authenticated run prints:
+
+```
+auth: identity "harness", session 029eb06f8a0a49a0…, expires ...
+registering session on all nodes... ok
+```
+
+If those lines are absent, auth is off. Since `1abb73a` an unconfigured run says
+so explicitly instead of proceeding quietly.
+
+### You cannot see why the other operator's node rejected you
+
+The node deliberately returns a generic body — `{"error":"unauthorized"}`,
+`{"error":"not found"}` — and logs the real reason server-side
+(`handlers.go`, `genericErrorMessage`). The 401 above was actually:
+
+```
+WARN  http error  {"code": 401, "detail": "authorization required (session_pub)"}
+```
+
+which names the cause immediately. **But that log is on whichever node served
+the request**, and the harness round-robins across all six. When the failing
+node belongs to the other operator you cannot read it at all — that is the key
+split working as designed, not a misconfiguration. Expect to ask them, and give
+them a UTC window:
+
+```bash
+journalctl -u signetd --since "<UTC start>" --until "<UTC end>" | grep -i "http error"
+```
+
+### Correctness trips its own rate limit
+
+Nearly every test does a keygen and `rate_limit_keygen_events` is 10/min, so an
+unexempted runner exhausts its quota around test 8 and every remaining test
+fails `429`. The runbook warns about this for the *perf* harness; correctness
+hits it just as hard.
+
+Both operators must exempt the runner — the suite touches all six nodes, so
+`org_sfluv.yml` alone leaves the tests that reach OLL's nodes failing:
+
+```yaml
+rate_limit_exempt_cidrs:
+  - <runner IP>/32
+```
+
+Note whose address that is: each operator is exempting *someone else's* client
+from the limits on its own hardware. Worth removing when the alpha ends.
+
+### perf flags: `-out` is global, `-duration` is per scenario
+
+`-out` belongs to the top-level flag set, so it must come **before** the
+subcommand. After it, you get `flag provided but not defined: -out`:
+
+```bash
+./build/harness -env testnet/.env-alpha -out testnet/perf.jsonl \
+  perf -concurrency 10 -duration 300s
+```
+
+And `-duration` is **per scenario**, not total. `RunPerf` runs seven
+(sequential-baseline, concurrent keygen/sign for FROST and ECDSA, scoped sign,
+mixed-load), plus three unmetered key-pool builds — so `-duration 300s` is a
+**~35 minute** run, not five. `83341d7` fixed the flag help; the runbook example
+still reads like a five-minute job, and it is easy to conclude it has hung
+around minute ten.
+
+The run drives load from *your* machine, so it must stay awake. `caffeinate -i
+-w <pid>` holds off idle sleep and exits by itself when the run does — though it
+does not stop a lid-close.
+
+---
+
+## 7. Validation results
+
+All figures from the six-node group above, on mainnet, `T=3`.
+
+### Correctness: 23/23
+
+Covers considerably more than the FROST-secp256k1 happy path:
+
+| Tests | Coverage |
+|---|---|
+| 1–7 | FROST secp256k1 — keygen, sign, verify, non-determinism, concurrent isolation, cross-node |
+| 8–9 | FROST Ed25519 |
+| 10–13 | Threshold ECDSA, including `s` normalization and concurrent signing |
+| 20–23 | Scoped keys — EIP-712 binding, and correctly *rejecting* raw hashes, wrong chain, wrong contract |
+| 30–35 | Key lifecycle — disable/enable/delete, coordinated cross-node, status listing |
+
+The negative cases (21–23) matter more than the positive ones: they confirm
+scoped keys refuse what they should.
+
+### Perf, and what `log_level` actually cost
+
+Two runs, `-concurrency 10 -duration 300s`, both from a wiped store, differing
+only in `log_level`:
+
+| Scenario / op | `debug` | `info` | Δ | p50 `debug`→`info` |
+|---|---:|---:|---:|---|
+| sequential-baseline / keygen | 4.6 | 4.8 | +3.1% | 108 → 115 ms |
+| sequential-baseline / sign | 4.6 | 4.8 | +3.1% | 66 → 62 ms |
+| concurrent-keygen-frost | 39.5 | 39.4 | −0.2% | 206 → 211 ms |
+| **concurrent-sign-frost** | **93.9** | **120.7** | **+28.6%** | **95 → 69 ms** |
+| concurrent-keygen-ecdsa | 29.5 | 30.6 | +3.7% | 308 → 302 ms |
+| concurrent-sign-ecdsa | 37.6 | 37.2 | −0.8% | 256 → 257 ms |
+| concurrent-sign-scoped | 35.5 | 37.1 | +4.6% | 266 → 258 ms |
+| mixed-load / sign | 42.8 | 43.9 | +2.5% | 78 → 103 ms |
+| mixed-load / keygen | 18.5 | 18.1 | −1.8% | 255 → 260 ms |
+
+Throughput in ops/sec. 91,923 operations on `debug`, 100,995 on `info`.
+
+**Only FROST sign moved.** Everything else is inside ±5%, which is noise at this
+sample size. The mechanism is consistent rather than mysterious: per-operation
+logging cost scales with operations per second, so the only scenario fast enough
+for it to matter is the only one that improved. Keygen scenarios are dominated
+by DKG rounds across the committee and swallow it whole.
+
+So `debug` was not a general drag — it was throttling the payment hot path
+specifically, by roughly a quarter. `18dc93f` moved the default to `info`.
+
+Headline: **~121 FROST sign/sec at 69 ms p50** across six nodes, two operators
+and three clouds — about 6× the ~20/sec of the old single-operator baseline.
+ECDSA runs ~37/sec at 257 ms p50, which is the expected shape: `2T-1 = 5`
+signers over 4 rounds against FROST's 3 signers over 2. Scoped keys cost
+essentially nothing over plain ECDSA (37.1 vs 37.2 ops/sec), so the EIP-712
+binding is free.
+
+### Two anomalies, neither explained
+
+Success was 99.999% (`debug`, 1 error in 91,923) and 99.998% (`info`, 2 in
+100,995). Both are worth naming rather than rounding away.
+
+- **One `HTTP 504`** on a FROST sign at peak concurrency, 150 ms in, on the
+  `debug` run. That is Caddy giving up on signetd, not a signing failure, and
+  150 ms is far below any sensible proxy timeout — so more likely a transient
+  connection reset surfacing as 504. **It did not recur** on the `info` run,
+  which did more FROST sign operations than the run that produced it.
+- **Two `HTTP 404`** on sign, `info` run. The obvious guess — a propagation race
+  against a freshly wiped store, keygen landing on one node and the sign hitting
+  another before the shard is durable — **does not fit**: they occurred at
+  t+216s and t+233s, operations 2035 and 2203 of 2874, not clustered at the
+  start.
+
+  What makes them odd is *where*. They are in `sequential-baseline`, the
+  **least**-loaded scenario, one operation at a time at ~4.8 ops/sec. The
+  concurrent scenarios running 25× that rate produced none. So load does not
+  explain it, and a sign returning "key not found" for a key the caller just
+  created is correctness-adjacent rather than a perf artifact.
+
+  Both were served by OLL's nodes — SFLuv's logged nothing in that window — so
+  the detail behind the generic `not found` is in their journal. Unresolved.
+
+---
+
+## 8. Caveats
 
 - **SFLuv's nodes were repaired by hand before `e81d443` was written**, so that
   commit was a reconstruction rather than an observation.

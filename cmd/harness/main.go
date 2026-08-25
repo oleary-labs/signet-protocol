@@ -34,7 +34,7 @@ func run() error {
 
 	perfFlags := flag.NewFlagSet("perf", flag.ExitOnError)
 	perfConc := perfFlags.Int("concurrency", 5, "number of concurrent workers")
-	perfDur := perfFlags.Duration("duration", 30*time.Second, "test duration")
+	perfDur := perfFlags.Duration("duration", 30*time.Second, "duration PER SCENARIO — perf runs 7, so the run takes at least 7x this, plus unmetered key-pool setup before the sign scenarios")
 	perfPool := perfFlags.Int("pool", 10, "key pool size for sign scenarios")
 
 	scaleFlags := flag.NewFlagSet("scale", flag.ExitOnError)

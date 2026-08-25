@@ -25,8 +25,24 @@ Go or at the reverse proxy.
 ### Backup / Recovery
 No mechanism to backup or restore key shards beyond copying the sled
 database file. Node data loss = permanent key loss (below threshold).
-Needs a documented backup procedure and ideally a threshold-restore
-protocol (reshare from remaining shares to a replacement node).
+
+Designed in `docs/DESIGN-BACKUP-RECOVERY.md`; not implemented. Two tiers:
+reshare to a replacement node for any loss up to `N-T` (the common case,
+needs no backup and already works), and sealed-shard export/restore for
+correlated loss beyond that. Online backup is safe because each record is
+independently sealed, so no atomic snapshot is required.
+
+Two things block it, and the second is the real one:
+- `ExportShards` KMS RPC (streams records still encrypted; never touches
+  the KEK).
+- **KEK escrow.** The KEK lives only in ansible-vault `host_vars` on an
+  operator laptop and `/etc/signet/secrets/kms.env` on the node. Neither
+  is a backup, so losing both loses every shard even if the ciphertext
+  survives. A ciphertext backup without KEK custody is not a backup.
+
+Note the constraint that shapes the design: `T` operators' backups
+reconstruct every key, so backups must never be aggregated across
+operators. A centralised backup store undoes the threshold scheme.
 
 ### Key Import
 No ability to import an existing private key into threshold custody.

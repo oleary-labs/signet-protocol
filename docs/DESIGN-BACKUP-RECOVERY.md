@@ -14,12 +14,31 @@ that make a *naive* backup design dangerous.
 A backup of key shards is a copy of the most sensitive material in the system,
 and threshold cryptography changes what "sensitive" means here:
 
-- **One operator's backup is worthless to an attacker.** A single shard is below
+- **A backup of fewer than `T` shards is worthless to an attacker.** It is below
   threshold and reveals nothing about the key.
-- **`T` operators' backups reconstruct every key in the group.** At `T=3`, three
-  colluding or compromised backup stores are equivalent to holding the private
-  keys outright — with no on-chain trace, no consent step, and no reshare to
-  invalidate them.
+- **A backup of `T` or more shards reconstructs every key in the group.** At
+  `T=3`, three shards are equivalent to holding the private keys outright — with
+  no on-chain trace, no consent step, and no reshare to invalidate them.
+
+**Count shards, not operators.** It is tempting to state this as "one operator's
+backup is harmless", and that is only true where an operator holds fewer than
+`T` shards. The alpha does not satisfy that: O'Leary Labs runs **4 of 6 nodes at
+`T=3`**, so OLL's backup alone is above threshold and reconstructs every key in
+the group. `create-group` prints the distribution precisely so this is visible
+rather than assumed (`shards per operator ... oll 4 of 6 <- reaches the
+threshold alone`).
+
+This is a property of the topology, not of the backup design, and the backup
+does not make it worse: an attacker who compromises OLL's infrastructure already
+holds `≥ T` shards, because each node carries both its sealed store and its KEK
+in `/etc/signet/secrets/kms.env`. What it does mean is that such an operator's
+backup custody is **key-reconstructing material** and must be treated as such —
+not as "encrypted config".
+
+The runbook's direction of travel — more operators holding fewer shards each,
+ultimately one apiece — is what makes the harmless-fragment reading true. Until
+then it is aspiration, and a design that assumes it will give the wrong answer
+to a custody question asked today.
 
 So the first design rule is not about durability at all:
 
@@ -33,10 +52,16 @@ centralised backup store silently recreates the single point of compromise the
 entire threshold design exists to remove. A backup system is one of the few
 things that can quietly undo a threshold scheme.
 
-The pleasant corollary: since one operator's backup is not a threshold, the bar
-for *where* it may live is lower than intuition suggests. Ordinary encrypted
-object storage in the operator's own account is appropriate. What is never
-appropriate is one place holding several operators' backups.
+Where a backup *is* sub-threshold, the bar for where it may live is lower than
+intuition suggests — ordinary encrypted object storage in the operator's own
+account is appropriate. Where it is not, as with OLL today, the destination is
+custody of the group's keys and should be chosen on that basis: hardware-backed
+multi-factor, deliberate limits on who inside the organisation can read it, and
+awareness that co-locating the ciphertext with whatever unlocks it collapses two
+factors into one.
+
+What is never appropriate, at any shard count, is one place holding several
+operators' backups.
 
 ## 2. Recovery is two-tier, and the common case needs no backup
 

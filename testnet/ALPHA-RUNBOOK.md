@@ -581,6 +581,36 @@ for h in oll1.nodes.olearylabs.com oll2.nodes.olearylabs.com \
 done
 ```
 
+After a coordinated deploy, confirm the whole fleet is actually on the same
+build. Operators hold no SSH access to each other's nodes — deliberately — so
+`/v1/info` is the only way to check this without asking and taking the answer on
+trust:
+
+```bash
+for h in oll1.nodes.oleary.com oll2.nodes.oleary.com \
+         oll3.nodes.oleary.com oll4.nodes.oleary.com \
+         sfluv1.nodes.sfluv.org sfluv2.nodes.sfluv.org; do
+  printf "%-26s " "$h"
+  curl -s --max-time 5 "https://$h/v1/info" \
+    | jq -r '"\(.version)  \(.binary_sha256[0:16])"'
+done
+```
+
+Every row should match. `binary_sha256` is the sha256 of the running executable,
+so it also equals `sha256sum` of the artifact you built — worth comparing
+against your local `build/signetd-linux-amd64` after a deploy.
+
+A `-dirty` suffix on the version means that node was built from a modified
+working tree, so it corresponds to no commit and a version match with another
+node would be a false match.
+
+Two things this is not. It is **not attestation**: a node reports whatever its
+binary says, so it answers "are we running the same code?" between cooperating
+operators, not "prove you are honest". And because `/v1/info` is
+unauthenticated, it discloses the running version publicly — the alternative
+would require a shared credential between operators, which is exactly the
+coupling the design avoids.
+
 Confirm the cleartext port is genuinely closed — if 8080 still answers from
 outside, the TLS termination is decorative:
 

@@ -3,18 +3,21 @@ package node
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"time"
 
-	circuits "github.com/oleary-labs/signet-circuits/packages/go"
 	"github.com/libp2p/go-libp2p/core/peer"
 	ma "github.com/multiformats/go-multiaddr"
+	circuits "github.com/oleary-labs/signet-circuits/packages/go"
 	"go.uber.org/zap"
 
 	"signet/network"
@@ -67,15 +70,15 @@ type Node struct {
 
 	// Reshare state: per-group job tracking, per-key session channels,
 	// coordinator flags. See reshare.go for methods.
-	reshareStore   *ReshareStore
-	reshareMux     *network.MuxNetwork // multiplexed streams for reshare sessions
-	reshareJobsMu  sync.RWMutex
-	reshareJobs    map[string]*ReshareJob    // groupID → active job (nil = ACTIVE)
-	reshareKeysMu      sync.Mutex
-	reshareKeys        map[reshareKeyID]chan struct{} // per-key done channels
+	reshareStore        *ReshareStore
+	reshareMux          *network.MuxNetwork // multiplexed streams for reshare sessions
+	reshareJobsMu       sync.RWMutex
+	reshareJobs         map[string]*ReshareJob // groupID → active job (nil = ACTIVE)
+	reshareKeysMu       sync.Mutex
+	reshareKeys         map[reshareKeyID]chan struct{} // per-key done channels
 	resharePendingReady map[reshareKeyID]chan struct{} // closed when pending write completes
-	reshareCoordMu     sync.Mutex
-	reshareCoord       map[string]bool // groupID → is coordinator
+	reshareCoordMu      sync.Mutex
+	reshareCoord        map[string]bool // groupID → is coordinator
 }
 
 // NodeInfo is returned by the /v1/info endpoint.
@@ -84,6 +87,91 @@ type NodeInfo struct {
 	EthereumAddress string   `json:"ethereum_address"`
 	Addrs           []string `json:"addrs"`
 	NodeType        string   `json:"node_type"`
+
+	// Build identity, so operators can confirm they are running the same code
+	// as their peers. In a multi-operator group nobody holds anybody else's SSH
+	// key — deliberately — so before this the only way to check whether another
+	// operator had actually deployed a fix was to ask them and take their word
+	// for it. Verifying a fleet after a coordinated deploy should not depend on
+	// a favour.
+	//
+	// Two honest limitations:
+	//
+	//   1. This is NOT attestation. A node reports whatever its binary says, so
+	//      a malicious or compromised operator can report anything. It answers
+	//      "are we running the same code?" between cooperating operators, which
+	//      is an operational question, not "prove you are honest".
+	//   2. /v1/info is unauthenticated, so this discloses the running version
+	//      publicly, which helps someone targeting a known bug. Putting it
+	//      behind auth would defeat the purpose: operators hold no shared
+	//      credential, and needing one is exactly the coupling being avoided.
+	//      The trade is deliberate.
+	Version      string `json:"version"`                 // vcs revision, +"-dirty" if the tree was modified
+	BuiltAt      string `json:"built_at,omitempty"`      // vcs commit time
+	BinarySHA256 string `json:"binary_sha256,omitempty"` // sha256 of the running executable
+}
+
+// Build identity is resolved once: ReadBuildInfo walks the binary's embedded
+// table, and the self-hash reads the whole executable (~46MB), neither of which
+// belongs on a request path.
+var (
+	buildOnce sync.Once
+	buildVer  string
+	buildTime string
+	buildHash string
+)
+
+func resolveBuildInfo() {
+	buildOnce.Do(func() {
+		buildVer = "unknown"
+		if bi, ok := debug.ReadBuildInfo(); ok {
+			var rev, modified string
+			for _, s := range bi.Settings {
+				switch s.Key {
+				case "vcs.revision":
+					rev = s.Value
+				case "vcs.time":
+					buildTime = s.Value
+				case "vcs.modified":
+					modified = s.Value
+				}
+			}
+			if rev != "" {
+				if len(rev) > 12 {
+					rev = rev[:12]
+				}
+				buildVer = rev
+				// A dirty tree is worth surfacing loudly: it means the deployed
+				// artifact does not correspond to any commit, so "same version"
+				// between two operators would be a false match.
+				if modified == "true" {
+					buildVer += "-dirty"
+				}
+			}
+		}
+		buildHash = selfSHA256()
+	})
+}
+
+// selfSHA256 hashes the running executable. Best-effort: an empty string simply
+// omits the field rather than failing /v1/info, since the endpoint is also the
+// liveness probe and must not start returning errors because a checksum could
+// not be taken.
+func selfSHA256() string {
+	path, err := os.Executable()
+	if err != nil {
+		return ""
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return ""
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return ""
+	}
+	return hex.EncodeToString(h.Sum(nil))
 }
 
 // New creates a Node from cfg: loads/generates the secp256k1 key, starts the
@@ -382,11 +470,16 @@ func (n *Node) Info() NodeInfo {
 		}
 	}
 
+	resolveBuildInfo()
+
 	return NodeInfo{
 		PeerID:          pid.String(),
 		EthereumAddress: ethAddr,
 		Addrs:           n.host.Addrs(),
 		NodeType:        n.cfg.NodeType,
+		Version:         buildVer,
+		BuiltAt:         buildTime,
+		BinarySHA256:    buildHash,
 	}
 }
 

@@ -598,19 +598,28 @@ makes it the dominant term.
   150 ms in. Caddy giving up on signetd, not a signing failure, and 150 ms is
   far below any sensible proxy timeout — more likely a transient reset surfacing
   as 504. It has not recurred across two later runs that did more FROST signing.
-- **A liveness wobble under sustained ECDSA keygen.** In the third run's
-  `concurrent-keygen-ecdsa`, seven client-side 30s timeouts across five
-  different nodes, and two 503s:
+- **A liveness wobble under sustained ECDSA keygen** — seven client-side 30s
+  timeouts across five nodes in the third run's `concurrent-keygen-ecdsa`.
+  Recorded with analysis in `docs/PRODUCTION-GAPS.md` (`103161e`); the lead is
+  that `liveness.go` uses `probeInterval 15s` × `unhealthyAfter 2` = exactly the
+  30s observed, with a `probeTimeout` of 3s that is tight for a node saturated
+  by 4-round ECDSA sessions. If that is right the peers were never unreachable
+  and the tracker was wrong, which costs real signing capacity on a path with no
+  margin. Capture per-peer `consecutive_fails` and `rtt_ms` from `/debug/stats`
+  next time it appears.
+
+  **Two 503s in the same run are probably a different thing** and should not be
+  folded in:
 
   ```
   select signers: insufficient available signers: need 5, have 2 of 6 members
-  select signers: insufficient available signers: need 5, have 1 of 6 members
   ```
 
-  Peer health briefly collapsed to 1–2 nodes. Unrelated to the session expiry in
-  §6, and absent from the two shorter runs. **This is the one to chase**: ECDSA
-  needs 5 of 6, so there is no margin for health flapping on the payments path.
-  Health returned to 6/6 afterwards.
+  `9b9de30` records that a parallel deploy across OLL's four-node batch left the
+  group at exactly two healthy members — the same figure. A deploy overlapping a
+  load run reproduces this precisely, and it is now prevented by `serial: 1`
+  rather than being a load phenomenon. Check whether a deploy was in flight
+  before treating a 503 of this shape as the liveness issue above.
 
 ---
 

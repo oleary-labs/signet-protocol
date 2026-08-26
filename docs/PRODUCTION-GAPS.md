@@ -78,9 +78,22 @@ the actual generation from the KMS result.
 
 ### Liveness False-Negatives Under Sustained Load
 **Observed on mainnet, 2026-08-25, not yet diagnosed.** During a sustained
-ECDSA keygen run SFLuv saw seven 30-second timeouts across five nodes and two
-503s reporting peer health at 1–2 of 6. It recovered unattended, and neither
-shorter run reproduced it — it appears to need sustained load.
+ECDSA keygen run SFLuv saw seven 30-second timeouts across five nodes. It
+recovered unattended, and neither shorter run reproduced it — it appears to
+need sustained load.
+
+Two symptoms were originally filed together here and have since been separated
+(`3f30ef7`). **The 503s reporting peer health at 1–2 of 6 are not part of this
+finding.** A parallel deploy across OLL's four-node batch takes four nodes down
+at once and leaves exactly the two that were reported, and a deploy overlapping
+a load run reproduces the figure precisely; `serial: 1` (`9b9de30`) now prevents
+it. Only the 30-second timeouts remain unexplained.
+
+Keeping them apart matters because their implications are opposite: a tracker
+false-negative under load is a design problem on the payments path, while
+concurrent restarts were a procedure that has since been fixed. Filed as one
+finding, it would have sent the next person hunting a load bug that a deploy
+caused.
 
 This is an availability risk rather than a curiosity: ECDSA needs `2T-1 = 5` of
 6 with no margin, so a peer wrongly marked unhealthy directly removes signing

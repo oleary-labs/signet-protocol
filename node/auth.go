@@ -110,9 +110,10 @@ func IssuerHash(issuer string) [32]byte {
 // Supports two auth policies: OAuth issuers and authorization keys.
 type GroupAuth struct {
 	mu        sync.RWMutex
-	groups    map[string][]IssuerInfo // groupID hex → trusted issuers
-	authKeys  map[string][][]byte    // groupID hex → trusted auth keys (34-byte: scheme prefix + compressed pubkey)
+	groups    map[string][]IssuerInfo   // groupID hex → trusted issuers
+	authKeys  map[string][][]byte       // groupID hex → trusted auth keys (34-byte: scheme prefix + compressed pubkey)
 	resolvers map[string]ResolverConfig // groupID hex → on-chain auth resolver binding
+	siweDoms  map[string][]string       // groupID hex → accepted SIWE domains (canonical)
 	cache     *jwk.Cache
 	circuitVK []byte // verification key for the jwt_auth circuit (bb format)
 	log       *zap.Logger
@@ -132,6 +133,7 @@ func newGroupAuth(ctx context.Context, circuitVK []byte, log *zap.Logger) *Group
 		groups:    make(map[string][]IssuerInfo),
 		authKeys:  make(map[string][][]byte),
 		resolvers: make(map[string]ResolverConfig),
+		siweDoms:  make(map[string][]string),
 		cache:     cache,
 		circuitVK: circuitVK,
 		log:       log,
@@ -201,6 +203,35 @@ func (g *GroupAuth) HasAuthPolicy(groupID string) bool {
 	return len(g.groups[groupID]) > 0 ||
 		len(g.authKeys[groupID]) > 0 ||
 		g.resolvers[groupID].Resolver != (common.Address{})
+}
+
+// SetSiweDomains records the group's accepted SIWE domains. An empty or nil
+// list disables the onchain_resolver scheme for that group — empty never means
+// "any domain".
+func (g *GroupAuth) SetSiweDomains(groupID string, domains []string) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if len(domains) == 0 {
+		delete(g.siweDoms, groupID)
+		return
+	}
+	cp := make([]string, len(domains))
+	copy(cp, domains)
+	g.siweDoms[groupID] = cp
+}
+
+// SiweDomains returns the group's accepted SIWE domains. A nil result means the
+// resolver scheme is disabled for this group.
+func (g *GroupAuth) SiweDomains(groupID string) []string {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	d := g.siweDoms[groupID]
+	if len(d) == 0 {
+		return nil
+	}
+	cp := make([]string, len(d))
+	copy(cp, d)
+	return cp
 }
 
 // SetAuthResolver records (or, when cfg.Resolver is the zero address, clears)
@@ -517,13 +548,13 @@ type AuthProof struct {
 	Proof []byte `cbor:"1,keyasint,omitempty"`
 
 	// Claims extracted from the JWT (public inputs to the ZK circuit).
-	Sub        string   `cbor:"2,keyasint"`
-	Iss        string   `cbor:"3,keyasint,omitempty"`
-	Exp        uint64   `cbor:"4,keyasint"`
-	Aud        string   `cbor:"5,keyasint,omitempty"`
-	Azp        string   `cbor:"6,keyasint,omitempty"`
-	ClaimsHash [32]byte `cbor:"7,keyasint,omitempty"`
-	JWKSModulus []byte  `cbor:"8,keyasint,omitempty"`
+	Sub         string   `cbor:"2,keyasint"`
+	Iss         string   `cbor:"3,keyasint,omitempty"`
+	Exp         uint64   `cbor:"4,keyasint"`
+	Aud         string   `cbor:"5,keyasint,omitempty"`
+	Azp         string   `cbor:"6,keyasint,omitempty"`
+	ClaimsHash  [32]byte `cbor:"7,keyasint,omitempty"`
+	JWKSModulus []byte   `cbor:"8,keyasint,omitempty"`
 
 	// Session binding.
 	SessionPub []byte `cbor:"9,keyasint"`  // 33-byte compressed secp256k1

@@ -16,8 +16,8 @@ import (
 	"github.com/ethereum/go-ethereum/ethclient"
 	"go.uber.org/zap"
 
-	"signet/tss"
 	"signet/network"
+	"signet/tss"
 )
 
 const (
@@ -33,6 +33,7 @@ const (
 		{"name":"threshold","type":"function","inputs":[],"outputs":[{"name":"","type":"uint256"}],"stateMutability":"view"},
 		{"name":"getIssuers","type":"function","inputs":[],"outputs":[{"name":"","type":"tuple[]","components":[{"name":"issuer","type":"string"},{"name":"clientIds","type":"string[]"}]}],"stateMutability":"view"},
 		{"name":"getAuthKeys","type":"function","inputs":[],"outputs":[{"name":"","type":"bytes[]"}],"stateMutability":"view"},
+		{"name":"siweDomains","type":"function","inputs":[],"outputs":[{"name":"","type":"string[]"}],"stateMutability":"view"},
 		{"name":"getAuthResolver","type":"function","inputs":[],"outputs":[{"name":"","type":"tuple","components":[{"name":"chainId","type":"uint64"},{"name":"resolver","type":"address"},{"name":"requireCanonicalSubject","type":"bool"}]}],"stateMutability":"view"},
 		{"name":"NodeJoined","type":"event","inputs":[{"name":"node","type":"address","indexed":true}],"anonymous":false},
 		{"name":"NodeRemoved","type":"event","inputs":[{"name":"node","type":"address","indexed":true}],"anonymous":false},
@@ -355,10 +356,54 @@ func (c *ChainClient) buildGroupInfo(ctx context.Context, grpAddr common.Address
 		c.n.auth.SetAuthResolver(strings.ToLower(grpAddr.Hex()), cfg)
 	}
 
+	// Accepted SIWE domains. Like getAuthResolver this is new, so a group
+	// deployed against an older implementation reverts — treat that as "no
+	// domains", which disables the resolver scheme rather than opening it.
+	if doms, err := c.callSiweDomains(ctx, grpAddr); err != nil {
+		c.log.Debug("chain: siweDomains", zap.String("group", grpAddr.Hex()), zap.Error(err))
+		c.n.auth.SetSiweDomains(strings.ToLower(grpAddr.Hex()), nil)
+	} else {
+		c.n.auth.SetSiweDomains(strings.ToLower(grpAddr.Hex()), doms)
+	}
+
 	return &GroupInfo{
 		Threshold: int(thresh.Int64()),
 		Members:   ids,
 	}, nil
+}
+
+// HomeChainID is the chain the group itself lives on — whatever ETH_RPC_URL
+// points at. Used as the expected ERC-4361 Chain ID, deliberately decoupled
+// from the resolver's chain.
+func (c *ChainClient) HomeChainID() uint64 {
+	if c == nil {
+		return 0
+	}
+	return c.homeChainID
+}
+
+// callSiweDomains reads the group's accepted SIWE domain list.
+func (c *ChainClient) callSiweDomains(ctx context.Context, grpAddr common.Address) ([]string, error) {
+	data, err := c.grpABI.Pack("siweDomains")
+	if err != nil {
+		return nil, err
+	}
+	result, err := c.eth.CallContract(ctx, ethereum.CallMsg{To: &grpAddr, Data: data}, nil)
+	if err != nil {
+		return nil, err
+	}
+	out, err := c.grpABI.Unpack("siweDomains", result)
+	if err != nil {
+		return nil, err
+	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("empty siweDomains result")
+	}
+	doms, ok := out[0].([]string)
+	if !ok {
+		return nil, fmt.Errorf("unexpected type %T for siweDomains result", out[0])
+	}
+	return doms, nil
 }
 
 // resolvePartyID fetches the node's pubkey from the factory and derives its tss.PartyID.

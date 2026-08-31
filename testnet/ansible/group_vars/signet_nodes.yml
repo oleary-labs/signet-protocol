@@ -156,11 +156,15 @@ chain_poll_secs: 60
 
 # --- On-chain auth resolver (onchain_resolver scheme) ---
 #
-# Both are unset by default, which leaves the scheme disabled. The node rejects
-# onchain_resolver outright when siwe_domain is empty, so enabling the scheme
-# means setting this to the exact ERC-4361 domain clients sign against.
+# The accepted ERC-4361 domains are NOT set here. They live on the group
+# contract (SignetGroup.siweDomains, manager-only and timelocked) and the node
+# reads them from chain.
 #
-# siwe_domain: "testnet.signet.example"
+# siwe_domain was removed rather than deprecated. The domain check gates session
+# creation and is consensus-relevant, so a per-node value can drift into some
+# nodes accepting a session while others reject it — which fails intermittently
+# and reports a threshold error rather than an auth one. An empty on-chain list
+# leaves the scheme disabled, which is the same fail-closed default as before.
 #
 # Only needed if a group's resolver lives on a chain other than eth_rpc's.
 # chain_rpcs:

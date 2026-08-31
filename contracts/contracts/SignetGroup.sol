@@ -55,15 +55,34 @@ contract SignetGroup is Initializable, ISignetGroup {
     PendingResolver internal _pendingResolver; // 3 slots (nested struct breaks slot)
 
     // -------------------------------------------------------------------------
+    // State — SIWE domains (timelocked)
+    // -------------------------------------------------------------------------
+    //
+    // APPENDED, deliberately not added to AuthResolver. That struct packs into a
+    // single slot and is nested inside PendingResolver, so widening it would
+    // shift every slot beneath: _pendingResolver.executeAfter would then be read
+    // from the old packed `next`, which is non-zero on any group that ever
+    // configured a resolver, and the `executeAfter == 0` guard in
+    // queueAuthResolver would permanently reject every future resolver change.
+    // On a beacon upgrade that breaks deployed groups with no recovery short of
+    // another upgrade. New fields go here, at the end, always.
+
+    string[] internal _siweDomains;         // 1 slot (dynamic array header)
+    string[] internal _pendingSiweDomains;  // 1 slot
+    uint256  internal _siweExecuteAfter;    // 1 slot — 0 = no pending change
+    address  internal _siweInitiator;       // 1 slot
+
+    // -------------------------------------------------------------------------
     // Upgrade-safe storage gap
     // -------------------------------------------------------------------------
     //
     // Reduced from [50] to [46] when the auth-resolver storage above (4 slots:
-    // _authResolver = 1, _pendingResolver = 3) was appended. New storage must be
+    // _authResolver = 1, _pendingResolver = 3) was appended, then to [42] when
+    // the SIWE domain storage (4 slots) was appended. New storage must be
     // added ABOVE this gap and the gap shrunk by the same number of slots so the
     // total layout footprint stays constant across beacon upgrades.
 
-    uint256[46] private __gap;
+    uint256[42] private __gap;
 
     // -------------------------------------------------------------------------
     // Modifiers
@@ -335,6 +354,138 @@ contract SignetGroup is Initializable, ISignetGroup {
             pending.next.resolver,
             pending.next.requireCanonicalSubject
         );
+    }
+
+    // -------------------------------------------------------------------------
+    // SIWE domains (manager-only, timelocked)
+    // -------------------------------------------------------------------------
+
+    /// @dev Maximum entries. Bounds the node's per-auth membership loop and keeps
+    ///      the list short enough to actually be audited by a human.
+    uint256 internal constant MAX_SIWE_DOMAINS = 16;
+
+    /// @inheritdoc ISignetGroup
+    function queueSiweDomains(string[] calldata domains) external onlyManager {
+        require(_siweExecuteAfter == 0, "siwe domain change already queued");
+        require(domains.length <= MAX_SIWE_DOMAINS, "too many domains");
+
+        // Validate and reject duplicates. Both are guardrails that fail fast on a
+        // typo — the node re-validates every entry regardless, because it serves
+        // groups it did not deploy and cannot assume this contract version
+        // checked anything.
+        for (uint256 i = 0; i < domains.length; i++) {
+            require(_isCanonicalDomain(bytes(domains[i])), "domain not canonical");
+            for (uint256 j = 0; j < i; j++) {
+                require(
+                    keccak256(bytes(domains[i])) != keccak256(bytes(domains[j])),
+                    "duplicate domain"
+                );
+            }
+        }
+
+        delete _pendingSiweDomains;
+        for (uint256 i = 0; i < domains.length; i++) {
+            _pendingSiweDomains.push(domains[i]);
+        }
+
+        // Same timelock as the resolver and node removal. Not a separate shorter
+        // delay: the resolver's "ceremony" is removalDelay too, so there is
+        // nothing for a shorter one to escape.
+        _siweExecuteAfter = block.timestamp + removalDelay;
+        _siweInitiator = msg.sender;
+
+        emit SiweDomainsQueued(domains, _siweExecuteAfter);
+    }
+
+    /// @inheritdoc ISignetGroup
+    function cancelSiweDomains() external {
+        require(_siweExecuteAfter != 0, "no queued siwe domain change");
+        require(msg.sender == _siweInitiator, "not initiator");
+        delete _pendingSiweDomains;
+        _siweExecuteAfter = 0;
+        _siweInitiator = address(0);
+        emit SiweDomainsCancelled(msg.sender);
+    }
+
+    /// @inheritdoc ISignetGroup
+    function executeSiweDomains() external {
+        require(_siweExecuteAfter != 0, "no queued siwe domain change");
+        require(block.timestamp >= _siweExecuteAfter, "delay not elapsed");
+
+        delete _siweDomains;
+        uint256 n = _pendingSiweDomains.length;
+        for (uint256 i = 0; i < n; i++) {
+            _siweDomains.push(_pendingSiweDomains[i]);
+        }
+        delete _pendingSiweDomains;
+        _siweExecuteAfter = 0;
+        _siweInitiator = address(0);
+
+        emit SiweDomainsSet(_siweDomains);
+    }
+
+    /// @inheritdoc ISignetGroup
+    function siweDomains() external view returns (string[] memory) {
+        return _siweDomains;
+    }
+
+    /// @dev Canonical form, byte-for-byte. Must match the node's rule exactly:
+    ///      the two are a single protocol constant expressed twice, and a
+    ///      disagreement is worse than a wildcard because it fails intermittently
+    ///      — some nodes accept a session, others reject it, and the group never
+    ///      reaches threshold.
+    ///
+    ///      ASCII only, lowercase, authority only: [a-z0-9.-] with an optional
+    ///      :port. No scheme, path, at-sign, asterisk, or whitespace. Unicode is excluded
+    ///      outright because Go's and Solidity's case folding will not agree;
+    ///      punycode is ASCII, so IDNs remain representable.
+    function _isCanonicalDomain(bytes memory d) internal pure returns (bool) {
+        if (d.length == 0 || d.length > 255) return false;
+
+        uint256 i = 0;
+        uint256 labelLen = 0;
+        bool sawColon = false;
+
+        for (; i < d.length; i++) {
+            uint8 c = uint8(d[i]);
+            if (c == 0x3A) { sawColon = true; break; }        // ':'
+
+            if (c == 0x2E) {                                   // '.'
+                if (labelLen == 0) return false;               // leading '.' or '..'
+                if (d[i - 1] == 0x2D) return false;            // label ends with '-'
+                labelLen = 0;
+                continue;
+            }
+            if (c == 0x2D) {                                   // '-'
+                if (labelLen == 0) return false;               // label starts with '-'
+            } else if (!((c >= 0x61 && c <= 0x7A) || (c >= 0x30 && c <= 0x39))) {
+                return false;                                  // not [a-z0-9]
+            }
+            labelLen++;
+            if (labelLen > 63) return false;
+        }
+
+        // Host must not end on an empty label, '-', or '.'.
+        if (labelLen == 0) return false;
+        if (d[i - 1] == 0x2D) return false;
+
+        if (!sawColon) return true;
+
+        // Port: 1-65535, no leading zeros. "1-5 digits" would admit :0 and
+        // :99999, and would make :080 a second entry for port 80 that could
+        // never match anything a browser sends.
+        uint256 start = i + 1;
+        if (start >= d.length) return false;                   // trailing ':'
+        if (d.length - start > 5) return false;
+        if (d[start] == 0x30) return false;                    // leading zero (covers :0)
+
+        uint256 port = 0;
+        for (uint256 k = start; k < d.length; k++) {
+            uint8 c = uint8(d[k]);
+            if (c < 0x30 || c > 0x39) return false;
+            port = port * 10 + (c - 0x30);
+        }
+        return port <= 65535;
     }
 
     // -------------------------------------------------------------------------

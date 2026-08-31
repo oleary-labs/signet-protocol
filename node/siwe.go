@@ -28,7 +28,7 @@ const (
 // siweResult is the verified outcome of an onchain_resolver SIWE message.
 type siweResult struct {
 	Address common.Address // SIWE-recovered signer; the resolver's input
-	ChainID uint64         // SIWE Chain ID (must equal the resolver's chainId)
+	ChainID uint64         // SIWE Chain ID (must equal the group's home chainId)
 	Nonce   string         // SIWE nonce, routed through the replay cache by the caller
 	Expiry  time.Time      // bounds the session (R-4)
 }
@@ -37,7 +37,9 @@ type siweResult struct {
 // scheme, enforcing the §10 R-4 bindings:
 //   - the signature recovers to the message's address,
 //   - domain equals expectedDomain (vacuous-check guard: empty config is rejected),
-//   - Chain ID equals expectedChainID (the resolver's chain),
+//   - Chain ID equals expectedChainID (the group's HOME chain, not the
+//     resolver's — ERC-4361's chainId is the account's context, i.e. where an
+//     ERC-1271 contract account resolves, not where the identity contract lives),
 //   - the message commits to sessionPub via a fixed Resources URI,
 //   - an expiration time is present (used to bound the session TTL).
 //

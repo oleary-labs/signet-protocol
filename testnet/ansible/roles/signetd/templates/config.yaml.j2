@@ -18,12 +18,6 @@ node_type: {{ node_type }}
 eth_rpc: {{ eth_rpc }}
 factory_address: {{ factory_address }}
 chain_poll_secs: {{ chain_poll_secs | default(60) }}
-{% if siwe_domain is defined and siwe_domain %}
-# ERC-4361 domain the node requires in SIWE messages for the onchain_resolver
-# auth scheme. Pinning it is what stops a SIWE signature minted for another
-# site from opening a Signet session. Omitted => scheme rejected (fail-closed).
-siwe_domain: "{{ siwe_domain }}"
-{% endif %}
 {% if chain_rpcs is defined and chain_rpcs %}
 # RPC reach for chains OTHER than the home chain, for groups whose auth
 # resolver lives off-chain-of-home. The home chain is registered automatically.

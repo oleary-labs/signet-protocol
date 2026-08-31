@@ -77,6 +77,15 @@ interface ISignetGroup {
     event AuthResolverCancelled (address indexed initiator);
     event AuthResolverSet       (uint64 chainId, address indexed resolver, bool requireCanonicalSubject);
 
+    /// @notice A SIWE domain list change was queued / cancelled / applied.
+    ///         The domains are emitted in plaintext: the list is a trust
+    ///         declaration, and an auditor should be able to read which
+    ///         applications may act for this group's users without reconstructing
+    ///         it from storage.
+    event SiweDomainsQueued    (string[] domains, uint256 executeAfter);
+    event SiweDomainsCancelled (address indexed initiator);
+    event SiweDomainsSet       (string[] domains);
+
     // -------------------------------------------------------------------------
     // Events — reshare
     // -------------------------------------------------------------------------
@@ -167,6 +176,40 @@ interface ISignetGroup {
     function executeAuthResolver() external;
 
     // -------------------------------------------------------------------------
+    // SIWE domains (manager-only, timelocked)
+    // -------------------------------------------------------------------------
+
+    /// @notice Queue the complete future list of SIWE domains this group accepts.
+    ///
+    ///         Replaces the list wholesale rather than adding or removing one at
+    ///         a time, deliberately unlike addIssuer/removeIssuer: a timelocked
+    ///         change should be auditable before it executes, and a complete list
+    ///         answers "what will this group accept" where a diff only answers
+    ///         "what is changing". Consequence, accepted: concurrent queues are
+    ///         last-write-wins.
+    ///
+    ///         Entries must already be in canonical form (lowercase ASCII
+    ///         authority, optional :port in 1-65535); non-canonical entries
+    ///         revert. Validation here is a guardrail that fails fast on a typo,
+    ///         NOT the enforcement point — a node serves groups it did not deploy
+    ///         and re-validates every entry itself.
+    ///
+    ///         An empty list disables the onchain_resolver scheme for this group.
+    ///         Empty never means "any domain".
+    function queueSiweDomains(string[] calldata domains) external;
+
+    /// @notice Cancel a queued SIWE domain change (only the original initiator).
+    function cancelSiweDomains() external;
+
+    /// @notice Apply a queued SIWE domain change after its delay has elapsed
+    ///         (permissionless, mirroring executeAuthResolver).
+    ///
+    ///         Removing a domain does NOT revoke sessions already minted under
+    ///         it — they sign until they expire. Revocation latency is the
+    ///         session TTL (R-5), not the execution of this call.
+    function executeSiweDomains() external;
+
+    // -------------------------------------------------------------------------
     // Reshare (manager-only)
     // -------------------------------------------------------------------------
 
@@ -222,6 +265,10 @@ interface ISignetGroup {
     /// @notice Returns the active auth resolver binding (resolver == address(0)
     ///         when none is configured).
     function getAuthResolver() external view returns (AuthResolver memory);
+
+    /// @notice The SIWE domains this group currently accepts, canonical form.
+    ///         Empty means the onchain_resolver scheme is disabled here.
+    function siweDomains() external view returns (string[] memory);
 
     /// @notice Returns the currently queued auth-resolver change (executeAfter
     ///         == 0 when none is pending).

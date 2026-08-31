@@ -204,6 +204,28 @@ Group membership and threshold are resolved from the chain — they are not pass
 
 All keygen, sign, delegate, and key-lifecycle endpoints accept a `curve` parameter — one of `frost_secp256k1`, `frost_ed25519`, or `ecdsa_secp256k1`. See [`docs/CURVES.md`](docs/CURVES.md) for the canonical reference (per-curve algorithm, response shapes, picking guidance).
 
+### CORS
+
+`/v1/*` is callable from a browser from any origin:
+
+```
+Access-Control-Allow-Origin:    *
+Access-Control-Allow-Methods:   GET, POST, OPTIONS      (preflight only)
+Access-Control-Allow-Headers:   Content-Type            (preflight only)
+Access-Control-Max-Age:         86400                   (preflight only)
+Access-Control-Expose-Headers:  Retry-After
+```
+
+`Access-Control-Allow-Credentials` is **never** set, and the origin is a literal `*` rather than a reflection of the request's `Origin`.
+
+The wildcard is safe because `/v1/*` carries **no ambient authority**: the per-request signature travels in the JSON body (`request_sig`), there are no cookies, and no `Authorization` header is read. A hostile page can make requests, but gets nothing it could not have obtained with `curl` — every mutating call is rejected without a signature it cannot produce. If session state ever moves to a cookie or an `Authorization` header this policy must be redesigned, not amended.
+
+**`Retry-After` is exposed deliberately.** It is not on the CORS safelist, so without this a browser client cannot read it at all. Two responses depend on it: `409` while a key is still settling after keygen, and `429` when a rate-limit zone trips. Both tell the client exactly how to recover, so a browser SDK should honour it rather than hardcoding backoff.
+
+`/admin/*` and `/debug/*` are **not** browser APIs and carry no CORS headers. Admin endpoints are authenticated by an ECDSA signature from a group-trusted key; `/debug/*` exposes group membership and per-peer RTT and is CIDR-restricted at the proxy.
+
+One consequence worth knowing: a wildcard means any page a user visits can drive `/v1/*` requests **from that user's IP**, which can consume their per-IP rate limit — notably the `/v1/auth` zone at 10/min. Nothing is compromised, but a browser SDK should not treat rate limits as private to itself.
+
 ### `GET /v1/health`
 
 Liveness check.

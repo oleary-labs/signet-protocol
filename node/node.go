@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"path"
 	"path/filepath"
 	"runtime/debug"
 	"strings"
@@ -372,9 +373,82 @@ func New(cfg *Config, log *zap.Logger) (*Node, error) {
 	mux.HandleFunc("POST /admin/reshare", n.handleStartReshare)
 	mux.HandleFunc("POST /admin/reshare/status", n.handleReshareStatus)
 	mux.HandleFunc("GET /debug/stats", n.handleDebugStats)
-	n.server = &http.Server{Addr: cfg.APIAddr, Handler: limitRequestBody(mux)}
+	// CORS outermost: a preflight must be answered before anything else looks
+	// at the request, and it never reaches the mux.
+	n.server = &http.Server{Addr: cfg.APIAddr, Handler: withCORS(limitRequestBody(mux))}
 
 	return n, nil
+}
+
+// CORS policy for the browser-facing API.
+//
+// A literal wildcard is safe here for one specific reason, and it is worth
+// stating as an invariant rather than a fact: /v1/* carries NO ambient
+// authority. The per-request signature travels in the JSON body (request_sig),
+// there are no cookies, and nothing under /v1 reads an Authorization header. A
+// hostile page can therefore make requests a browser will send, and get
+// nothing back it could not have obtained with curl, because every mutating
+// call is rejected without a signature it cannot produce.
+//
+// Which is why Access-Control-Allow-Credentials is never set. The spec forbids
+// pairing it with "*", but the real point is upstream of the header: if session
+// state ever moves into a cookie or an Authorization header, the browser starts
+// attaching it automatically, and this entire policy has to be redesigned
+// rather than patched.
+//
+// The origin is a literal "*", never a reflection of the Origin header.
+// Reflection is the usual route to an accidental credentialed wildcard, and it
+// also makes every response origin-dependent, which requires Vary: Origin or
+// caches serve one site's response to another.
+//
+// Scope is /v1/* only. /admin/* is authenticated by an ECDSA signature from a
+// group-trusted key and /debug/* leaks group membership and per-peer RTT and is
+// CIDR-restricted at the proxy; neither is a browser API and neither gets CORS
+// headers. That exclusion lives here, in code shared by every operator, rather
+// than in each operator's Caddyfile — six nodes across two operators must
+// answer identically, and per-operator proxy config has already had to diverge
+// for tls_email and rate-limit exemptions.
+const (
+	corsAllowOrigin  = "*"
+	corsAllowMethods = "GET, POST, OPTIONS"
+	corsAllowHeaders = "Content-Type"
+	corsMaxAge       = "86400" // browsers clamp this (Chrome 2h); it costs nothing to ask
+
+	// Retry-After is not on the CORS-safelist, so without exposing it a browser
+	// client cannot read the header at all — it is stripped before JS sees the
+	// response. Two live cases depend on it: the 409 returned while a key is
+	// still settling after keygen, and Caddy's 429 when a rate-limit zone
+	// trips. Both are the server telling a client exactly how to recover, and
+	// both would be invisible without this line.
+	corsExposeHeaders = "Retry-After"
+)
+
+// withCORS applies the policy above to /v1/* and answers preflights.
+//
+// Preflights must be intercepted rather than routed: routes are registered
+// method-qualified ("POST /v1/sign"), and Go's ServeMux answers 405 for a known
+// path with an unlisted method. A browser treats any non-2xx preflight as a
+// hard failure, so without this every cross-origin call fails before the real
+// request is ever sent — and listing OPTIONS in Allow-Methods does not help,
+// because something still has to respond.
+func withCORS(h http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Match on the cleaned path so a traversal like /v1/../admin/x cannot
+		// pick up /v1 headers on its way to a redirect.
+		if strings.HasPrefix(path.Clean(r.URL.Path)+"/", "/v1/") {
+			w.Header().Set("Access-Control-Allow-Origin", corsAllowOrigin)
+			w.Header().Set("Access-Control-Expose-Headers", corsExposeHeaders)
+
+			if r.Method == http.MethodOptions {
+				w.Header().Set("Access-Control-Allow-Methods", corsAllowMethods)
+				w.Header().Set("Access-Control-Allow-Headers", corsAllowHeaders)
+				w.Header().Set("Access-Control-Max-Age", corsMaxAge)
+				w.WriteHeader(http.StatusNoContent)
+				return
+			}
+		}
+		h.ServeHTTP(w, r)
+	})
 }
 
 // Request body size limits. Bounds memory/CPU spent parsing untrusted POST

@@ -31,7 +31,13 @@
 # the chain:
 #
 #   Recorded  : 2026-08-31 (after the SIWE-domain beacon upgrade)
-#   Source    : 862b2cf ("feat(siwe): move domain binding on-chain, per-group")
+#   Source    : 1d77f2a ("feat(upgrade): tooling to apply a beacon upgrade…")
+#               NOT 862b2cf, which introduced the SIWE domain list but not
+#               getPendingSiweDomains. Building 862b2cf yields init-code hash
+#               0xe3a84db1… at address 0x3A5EE988…, neither of which is what is
+#               deployed — so anyone verifying against that commit would find a
+#               mismatch and reasonably conclude the chain had been tampered
+#               with. Checked by building it, not by reading the diff.
 #   Impl      : 0x790c546357ca7f588c68DC8A2C42baB5025276c4 (Ethereum mainnet)
 #   Beacon    : 0xE37C3768C12fF0ECFb78e63ED26De98c08a7d716
 #   Verified  : the deployed runtime bytecode at that address is a byte-for-byte

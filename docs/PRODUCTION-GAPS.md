@@ -32,13 +32,20 @@ needs no backup and already works), and sealed-shard export/restore for
 correlated loss beyond that. Online backup is safe because each record is
 independently sealed, so no atomic snapshot is required.
 
-Two things block it, and the second is the real one:
+One thing blocks it now:
 - `ExportShards` KMS RPC (streams records still encrypted; never touches
-  the KEK).
-- **KEK escrow.** The KEK lives only in ansible-vault `host_vars` on an
-  operator laptop and `/etc/signet/secrets/kms.env` on the node. Neither
-  is a backup, so losing both loses every shard even if the ciphertext
-  survives. A ciphertext backup without KEK custody is not a backup.
+  the KEK). Not built.
+
+**KEK escrow was the other blocker and is done**, arranged per operator and out
+of band. See `testnet/ALPHA-RUNBOOK.md` §"Identity escrow" for the custody
+requirement; locations are deliberately not recorded in this repo.
+
+That closes the custody half and none of the durability half. Escrow covers
+identity — enough that a rebuilt node keeps its peer ID and on-chain
+registration — and **no shards at all**. Restoring from it gives the right node
+with an empty key store, so read it as identity escrow, not as backup. The gap
+above is unchanged in substance; what changed is that the key which would unwrap
+a shard export now has custody, and the export does not exist to be unwrapped.
 
 Note the constraint that shapes the design: `T` operators' backups
 reconstruct every key, so backups must never be aggregated across

@@ -652,6 +652,9 @@ makes it the dominant term.
 - `write-env` recorded `RPC_URL` as the public endpoint used for chain reads
   during stand-up, not SFLuv's Alchemy URL. It affects only the harness's own
   reads, not the nodes.
-- **No backup mechanism exists** (`docs/PRODUCTION-GAPS.md`). Destroying an
-  instance destroys its key shard. Losing more than `N-T` nodes is permanent
-  key loss.
+- **No shard backup exists** (`docs/PRODUCTION-GAPS.md`). Destroying an instance
+  destroys its key shard, and losing more than `N-T` nodes is permanent key
+  loss. Node *identity* is escrowed per operator
+  (`testnet/ALPHA-RUNBOOK.md` §"Identity escrow"), which is a different thing:
+  it rebuilds a lost node with its peer ID and on-chain registration intact, and
+  with an empty key store. Do not read it as the alpha being backed up.

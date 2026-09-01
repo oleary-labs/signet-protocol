@@ -29,11 +29,11 @@ rather than assumed (`shards per operator ... oll 4 of 6 <- reaches the
 threshold alone`).
 
 This is a property of the topology, not of the backup design, and the backup
-does not make it worse: an attacker who compromises OLL's infrastructure already
-holds `≥ T` shards, because each node carries both its sealed store and its KEK
-in `/etc/signet/secrets/kms.env`. What it does mean is that such an operator's
-backup custody is **key-reconstructing material** and must be treated as such —
-not as "encrypted config".
+does not make it worse: an attacker who compromises an above-threshold
+operator's infrastructure already holds `≥ T` shards, because a node necessarily
+has access to both its sealed store and the key that unseals it. What it does
+mean is that such an operator's backup custody is **key-reconstructing
+material** and must be treated as such — not as "encrypted config".
 
 The runbook's direction of travel — more operators holding fewer shards each,
 ultimately one apiece — is what makes the harmless-fragment reading true. Until
@@ -164,11 +164,32 @@ bucket. They must have different custodians, different credentials, and ideally
 different providers — the property being that compromising one storage account
 yields nothing.
 
-Today the KEK lives in ansible-vault `host_vars` on an operator laptop and in
-`/etc/signet/secrets/kms.env` on the node. Neither is a backup. **A KEK escrow
-step is required and is currently missing** — if the laptop and the node are lost
-together, the ciphertext backup is unrecoverable and the shards are gone even
-though the bytes survived.
+A KEK's working copies — wherever an operator's deploy tooling holds it, and the
+node's own environment — are not a backup. They are the live copies, and they
+fail together in exactly the scenario that needs one. Escrow therefore has to be
+a deliberate third copy, held out of band.
+
+**That escrow is in place.** It is arranged per operator, and the specifics —
+where, under what name, in what form — are deliberately not recorded in this
+repo, which is public. `testnet/ALPHA-RUNBOOK.md` §"Identity escrow" states the
+custody requirement and the verification practice; the locations live in each
+operator's internal notes.
+
+This section previously asserted that escrow was missing. That was written
+before it existed and was wrong from 2026-08-25 — noted rather than silently
+corrected, because a reader who took the old text at face value would have
+concluded the wrong thing about what recovery was available.
+
+The distinction that matters is that **escrowing the KEK is not backing up the
+shards**, and having the first reads a great deal like having the second.
+Identity escrow is what lets a rebuilt node keep its peer ID and its on-chain
+registration. It holds no shards, because `ExportShards` (§4.1) does not exist
+yet, so restoring from it yields the right node with an empty key store.
+
+So the gap that remains is the shard export, not the key that would unwrap it.
+Until §4.1 is built, Tier 2 has nothing to restore from and the real coverage for
+node loss is Tier 1 reshare — which needs neither a backup nor the dead node's
+KEK.
 
 `node.key` is worth backing up but is a different class: losing it costs a
 peer-ID change and on-chain re-registration (real ETH, and the operator consent
@@ -236,16 +257,31 @@ risk better than a nightly cron.
 
 ## 7. Open questions
 
-1. **KEK escrow mechanism.** The gap that makes the rest moot. Options: split
-   across operator-internal custodians (Shamir, but *within* one operator —
-   splitting across operators does not help, since one operator's KEK unlocks
-   only its own sub-threshold shard), a cloud KMS in a separate account, or an
-   HSM. Needs a decision.
-2. **Backup destination per operator.** Each operator chooses, but the runbook
-   should state the requirement (separate credentials from the KEK) rather than
-   leave it to taste.
-3. **Does Tier 1 actually work end to end?** The reshare machinery supports
+1. **Does Tier 1 actually work end to end?** The reshare machinery supports
    disjoint committees (`docs/DESIGN-RESHARE.md`), and the chain poller creates
    jobs on membership change, but node-replacement has not been rehearsed on the
    alpha. It should be, before it is needed in anger — and it is testable today
    without any of §4 existing.
+
+   Promoted to first because it is now the largest untested assumption. With the
+   shard export unbuilt, Tier 1 is not the preferred recovery path, it is the
+   *only* one for anything short of catastrophic loss.
+
+2. **Backup destination per operator.** Each operator chooses, but the runbook
+   should state the requirement (separate credentials from the KEK) rather than
+   leave it to taste. Moot until §4.1 exists — there is nothing to put there.
+
+3. **Does the manual escrow want replacing with a mechanism?** It closes the
+   immediate gap and is verified, but it is taken and refreshed by hand, so
+   nothing detects a copy that went stale because a KEK was rotated or
+   identities were regenerated. Options if that is judged insufficient: split
+   across operator-internal custodians (Shamir, but *within* one operator —
+   splitting across operators does not help, since one operator's KEK unlocks
+   only its own sub-threshold shard), a cloud KMS in a separate account, or an
+   HSM.
+
+   Lower priority than it looks. The staleness conditions are narrow and legible
+   — regenerating identities, rotating the KEK, or changing the vault password —
+   and none of keygen, signing or reshare touches the material. A periodic
+   verify against the live files is most of the value of a mechanism at a
+   fraction of the cost.

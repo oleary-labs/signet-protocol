@@ -872,6 +872,67 @@ default 60s.
 
 ---
 
+## Identity escrow (what it covers, and what it does not)
+
+Each operator is expected to hold an encrypted escrow copy of its own node
+identity material, independently of this repo and of the deploy machine.
+
+**Where it lives, and what it is called, belongs in each operator's internal ops
+notes — not here.** This document is public. Naming the store, the item, or the
+file layout would publish a target list and tell a reader exactly what a given
+compromise is worth, which is a meaningful advantage handed over for no
+operational benefit. What is worth stating publicly is the *shape* of the
+requirement and, more importantly, its limits.
+
+### Custody requirement
+
+The escrow copy and the credential that opens it must have **separate custody**.
+Together they reconstruct an operator's node identities; apart, neither is worth
+much. Storing them in one place collapses two factors into one and is the single
+most likely way this arrangement fails.
+
+The same rule applies across operators: at `T=3` over six nodes, some operators
+clear the threshold alone, so escrow copies must never be aggregated into a
+shared store. See `docs/DESIGN-BACKUP-RECOVERY.md` §1.
+
+### What escrow does NOT cover
+
+**It is not a backup of the alpha, and reading it as one is the mistake this
+section exists to prevent.** Identity escrow holds no key shards — the KMS sled
+store is not in it, because `ExportShards`
+(`docs/DESIGN-BACKUP-RECOVERY.md` §4.1) is designed but not built. Restoring
+from escrow rebuilds a node with its original identity and on-chain registration
+and an **empty key store**.
+
+Losing more than `N-T` nodes at once is still permanent key loss. For the common
+case — up to `N-T` lost — the recovery path is **reshare to a replacement**,
+which needs neither an escrow copy nor the dead node's KEK, and which gives the
+new node a share at the current generation. Escrow is for the case where reshare
+is not available.
+
+What escrow actually buys: a rebuilt node keeps its peer ID, so its
+`SignetFactory` registration is not orphaned. Without it, a replacement gets a
+new peer ID and must re-register on mainnet (real ETH) and be re-accepted into
+the group.
+
+### Verifying a copy
+
+Verify **currency**, not just integrity. A copy can pass its own checksums
+perfectly and still be stale — one taken before a KEK rotation restores a node
+that cannot read its own store, which is the failure that looks like success.
+Integrity checks catch corruption; only comparison against the live files
+catches staleness. Do both, and delete any extracted copy afterwards.
+
+Staleness conditions are narrow and worth knowing, because they bound how often
+this needs redoing: regenerating node identities (`init-alpha.sh`), rotating a
+KEK, or changing the vault password. Keygen, signing and reshare do **not** touch
+this material, so ordinary operation never invalidates an escrow copy.
+
+Each operator verifies its own and records the date in its own ops notes. SFLuv's
+was last verified 2026-09-01, current against the live files.
+
+---
+
 ## Teardown
 
 Each operator tears down its own:
@@ -883,7 +944,8 @@ ansible-playbook teardown-gcp-alpha.yml -e gcp_project=<id>      # SFLuv, GCP
 ```
 
 All three prompt before destroying, because destroying an instance destroys its
-key shard and there is no backup mechanism.
+key shard and there is no shard backup. Identity escrow does NOT cover this — it
+restores a node's identity, not its key material. See §"Identity escrow".
 
 `teardown-vultr.yml` finds instances by the `signet-alpha` **tag**, so it
 catches nodes dropped from the playbook's `nodes` block. The AWS and GCP
@@ -900,8 +962,13 @@ gcloud compute instances list --filter="labels.project=signet-alpha"  # all GCP 
 
 - **The old `teardown.yml` only sweeps us-east-1** and covers the retired
   testnet, not the alpha.
-- **No backup mechanism** (`docs/PRODUCTION-GAPS.md`). Losing more than `N-T`
-  nodes is permanent key loss.
+- **No shard backup** (`docs/PRODUCTION-GAPS.md`). Losing more than `N-T` nodes
+  is permanent key loss. Identity is escrowed (§"Identity escrow"); key
+  material is not, and the two are easy to confuse in the direction that gets
+  you hurt.
+- **Tier 1 reshare is unrehearsed.** It is the recovery path for every routine
+  failure and the only one that works today, and node replacement has never been
+  exercised on the alpha (`docs/DESIGN-BACKUP-RECOVERY.md` §7).
 - **No CI.** Nothing verifies a PR server-side; the repo is not `gofmt`-clean.
 - **Rate limiting is per node, not per group.** Caddy counts per client IP on
   each machine independently, so a caller spread across six nodes gets six times

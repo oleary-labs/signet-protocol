@@ -102,36 +102,79 @@ concurrent restarts were a procedure that has since been fixed. Filed as one
 finding, it would have sent the next person hunting a load bug that a deploy
 caused.
 
-This is an availability risk rather than a curiosity: ECDSA needs `2T-1 = 5` of
-6 with no margin, so a peer wrongly marked unhealthy directly removes signing
-capacity from the payments path.
+### ~~Leading hypothesis — probe starvation~~ (withdrawn, 2026-09-01)
 
-**Leading hypothesis — probe starvation, not peer failure.** The numbers line
-up too well to ignore (`node/liveness.go`):
+The original reading was that `probeInterval = 15s` × `unhealthyAfter = 2` = the
+observed 30 seconds, with `probeTimeout = 3s` starved under 4-round ECDSA load.
+Recorded here rather than deleted, because the reasoning was seductive and
+someone will reconstruct it from the same constants.
 
-- `probeInterval = 15s`, `unhealthyAfter = 2` → a peer is declared unhealthy
-  after exactly **30 seconds** of failing probes, which is the reported timeout
-  duration.
-- `probeTimeout = 3s` is tight for a node saturated by concurrent 4-round ECDSA
-  sessions. Two consecutive starved probes is all it takes.
-- That fits every observed property: only under sustained load, several nodes at
-  once (all are saturated), and self-recovering once load drops.
+It fails on two independent counts, either sufficient:
 
-Note also that liveness probes dial their own streams, while TSS traffic goes
-over `MuxNetwork` — which exists specifically because long-lived streams hit
-yamux flow-control limits. The probe path does not share that treatment.
+1. **The 30s was the observer's own clock.** `cmd/harness/main.go` defaulted
+   `-timeout` to 30s, and the run that produced the finding did not override it.
+   A "client-side 30s timeout" measured the client's patience, not anything about
+   the nodes. The agreement with 15 × 2 is a coincidence between unrelated
+   constants.
+
+2. **The tracker cannot deny a signature.** `selectSigners` filters candidates by
+   `exclude` — peers that failed a real session — and never by health
+   (`node/signers.go`). `rank()` sorts unhealthy peers last but leaves them
+   eligible, deliberately: *"Liveness is a hint, not an oracle."* Marking every
+   peer unhealthy would not reduce the candidate set or trip the capacity check.
+   So a tracker false-negative costs preference ordering, not signing capacity,
+   and the premise that it "directly removes capacity from the payments path" was
+   wrong.
+
+Corollary worth keeping: `insufficient available signers` can *only* arise from
+`exclude`, which independently confirms the deploy attribution above.
+
+**Current hypothesis — the client's deadline equalled the node's.** Three 30s
+values were in play and two of them collide:
+
+| Source | Value |
+|---|---|
+| harness `-timeout` default (`cmd/harness/main.go`) | 30s, now 90s |
+| participant session context (`node/coord.go`) | 30s |
+| `probeInterval` × `unhealthyAfter` | 30s — coincidence |
+
+Participants bound each session at 30s. `runThresholdSign` (`node/signers.go`)
+retries with a fresh signer set on failure, carrying the failed peer forward in
+`excluded`, and each attempt costs a full round of latency. With the client
+timing out at 30s as well, there was no time in which a retry could run: the
+client gave up at the instant the first attempt failed. The fault tolerance
+existed and could not engage.
+
+The client default is now 90s, which is the cheap half of the fix and enough to
+tell whether the timeouts were retryable failures all along. The remaining
+question is whether the 30s participant bound is itself right for a saturated
+4-round ECDSA session; lowering it would surface failures earlier and leave more
+room to retry, at the cost of abandoning sessions that would have completed.
+
+**General rule this is an instance of:** a client deadline must exceed the
+server's internal attempt bound by at least one retry, or the retry is
+decorative. That relationship was accidental here rather than chosen.
 
 To confirm next time, capture `/debug/stats` during the event: `consecutive_fails`
 and `rtt_ms` per peer distinguish "probes were starved" from "the peer was
 genuinely unreachable". Correlate against whether TSS sessions to that same peer
-were succeeding at the time — if they were, the peer was alive and the tracker
-was wrong.
+were succeeding at the time. That evidence is still worth having — it is now
+diagnosis of a secondary effect rather than of the cause.
 
-Worth considering if confirmed: **fold session success into the liveness
+Two observations from reading `node/liveness.go`, neither load-bearing for the
+above:
+
+- Liveness probes dial their own streams, while TSS traffic goes over
+  `MuxNetwork` — which exists specifically because long-lived streams hit yamux
+  flow-control limits. The probe path does not share that treatment.
+- `record()` returns early on failure without updating `rtt`, so a timed-out
+  probe contributes nothing to the ranking and a slow peer retains its old fast
+  round-trip. Minor, given ranking is all health affects.
+
+Still worth doing on its own merits: **fold session success into the liveness
 tracker.** A peer we are exchanging TSS messages with right now is provably
 alive, and that evidence is currently discarded in favour of a dedicated ping.
-It is also most abundant exactly when load makes pings least reliable, so it
-inverts the failure mode instead of merely widening a timeout.
+It is also most abundant exactly when load makes pings least reliable.
 
 ---
 

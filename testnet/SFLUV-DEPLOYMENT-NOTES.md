@@ -598,15 +598,24 @@ makes it the dominant term.
   150 ms in. Caddy giving up on signetd, not a signing failure, and 150 ms is
   far below any sensible proxy timeout — more likely a transient reset surfacing
   as 504. It has not recurred across two later runs that did more FROST signing.
-- **A liveness wobble under sustained ECDSA keygen** — seven client-side 30s
-  timeouts across five nodes in the third run's `concurrent-keygen-ecdsa`.
-  Recorded with analysis in `docs/PRODUCTION-GAPS.md` (`103161e`); the lead is
-  that `liveness.go` uses `probeInterval 15s` × `unhealthyAfter 2` = exactly the
-  30s observed, with a `probeTimeout` of 3s that is tight for a node saturated
-  by 4-round ECDSA sessions. If that is right the peers were never unreachable
-  and the tracker was wrong, which costs real signing capacity on a path with no
-  margin. Capture per-peer `consecutive_fails` and `rtt_ms` from `/debug/stats`
-  next time it appears.
+- **Seven client-side 30s timeouts** across five nodes in the third run's
+  `concurrent-keygen-ecdsa`. Analysis in `docs/PRODUCTION-GAPS.md`.
+
+  This was originally filed as a liveness-tracker fault, on the grounds that
+  `liveness.go` has `probeInterval 15s` × `unhealthyAfter 2` = the same 30s.
+  **That reading is withdrawn.** The 30s was the harness's own `-timeout`
+  default measuring itself, and the tracker only reorders signer preference —
+  `selectSigners` never excludes on health — so it cannot deny a signature at
+  all. Two unrelated constants both happened to be 30s.
+
+  The current lead is a third 30s: participants bound each session at 30s
+  (`coord.go`), which equalled the client's patience, leaving no window for the
+  retry in `runThresholdSign` to run. The harness default is now 90s. If the
+  timeouts were retryable failures, they should stop.
+
+  Still worth capturing per-peer `consecutive_fails` and `rtt_ms` from
+  `/debug/stats` if it recurs — as diagnosis of a secondary effect, not the
+  cause.
 
   **Two 503s in the same run are probably a different thing** and should not be
   folded in:

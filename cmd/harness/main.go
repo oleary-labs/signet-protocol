@@ -24,7 +24,24 @@ func run() error {
 	var (
 		envFile   = flag.String("env", "devnet/.env", "path to environment file")
 		outFile   = flag.String("out", "", "path to write JSON lines output (optional)")
-		timeout   = flag.Duration("timeout", 30*time.Second, "per-request timeout")
+		// 90s, not 30s: the client's patience has to exceed the node's own
+		// attempt bound by at least one retry, or the node's fault tolerance
+		// cannot engage.
+		//
+		// Participants bound each session at 30s (node/coord.go), and
+		// runThresholdSign retries with a fresh signer set on failure, carrying
+		// the failed peer forward in `excluded` (node/signers.go). At a 30s
+		// client timeout those two deadlines were equal, so the client gave up
+		// at the exact moment the first attempt failed — the retry existed but
+		// could never be observed to run. 3x leaves room for two full attempts
+		// and margin.
+		//
+		// This is why the earlier reading of the alpha's 30s timeouts as a
+		// liveness-tracker fault did not hold: 15s x 2 also happens to be 30s,
+		// but the tracker only reorders signer preference and never removes a
+		// candidate (node/signers.go), so it cannot deny a signature. The 30s
+		// in the logs was this flag's old default measuring itself.
+		timeout   = flag.Duration("timeout", 90*time.Second, "per-request timeout")
 		stopAfter = flag.Bool("stop-after", false, "stop testnet nodes via ansible after run completes")
 		authTTL   = flag.Duration("auth-ttl", time.Hour, "session lifetime for HARNESS_AUTH_KEY auth")
 	)

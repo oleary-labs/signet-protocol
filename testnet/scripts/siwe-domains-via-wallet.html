@@ -1,0 +1,309 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Signet — SIWE domains via wallet</title>
+<style>
+  body { font: 14px/1.6 ui-monospace, SFMono-Regular, Menlo, monospace;
+         max-width: 46rem; margin: 3rem auto; padding: 0 1.5rem;
+         background: #111; color: #ddd; }
+  h1 { font-size: 1.1rem; color: #fff; }
+  h2 { font-size: .95rem; color: #fff; margin-top: 2rem; }
+  .row { display: grid; grid-template-columns: 7rem 1fr; gap: .4rem 1rem; margin: .3rem 0; }
+  .k { color: #888; }
+  .v { word-break: break-all; color: #9ecbff; }
+  .warn { border-left: 3px solid #d29922; padding: .6rem 1rem; margin: 1.5rem 0;
+          background: #1c1a12; color: #e3c07b; }
+  .step { border: 1px solid #333; border-radius: 6px; padding: 1rem 1.2rem; margin: 1rem 0; }
+  .step.active { border-color: #2f81f7; background: #0d1117; }
+  .step.done { opacity: .5; }
+  .step h3 { font-size: .9rem; margin: 0 0 .6rem; color: #fff; }
+  .badge { font-size: .75rem; padding: .1rem .5rem; border-radius: 10px; margin-left: .5rem; }
+  .badge.wait { background: #341a00; color: #e3c07b; }
+  .badge.ok { background: #0f2916; color: #7ee787; }
+  .badge.now { background: #0c2d6b; color: #9ecbff; }
+  button { font: inherit; padding: .6rem 1.2rem; margin-top: .6rem; cursor: pointer;
+           background: #21262d; color: #ddd; border: 1px solid #444; border-radius: 6px; }
+  button:disabled { opacity: .4; cursor: not-allowed; }
+  #log { white-space: pre-wrap; margin-top: 1.5rem; color: #7ee787; }
+  .err { color: #ff7b72; }
+  code { color: #9ecbff; }
+</style>
+</head>
+<body>
+<h1>SIWE domains — SignetGroup</h1>
+
+<p>Sets the ERC-4361 domains this group accepts. Two transactions with a timelock
+between them. Nothing here holds or sees your key; your wallet signs.</p>
+
+<div class="row"><span class="k">chain</span><span class="v">1 (mainnet)</span></div>
+<div class="row"><span class="k">group</span><span class="v" id="group"></span></div>
+<div class="row"><span class="k">manager</span><span class="v" id="manager"></span></div>
+<div class="row"><span class="k">target</span><span class="v" id="target"></span></div>
+
+<div class="warn">
+<b>The list is replaced wholesale, not appended to.</b> Whatever is queued below
+becomes the complete set of domains this group will accept — anything currently
+listed and not repeated here is removed. An empty list disables the
+<code>onchain_resolver</code> scheme; empty never means "any domain".
+<br><br>
+Domains are matched <b>exactly</b>. <code>sfluv.org</code> and
+<code>app.sfluv.org</code> are different entries, as are
+<code>app.sfluv.org</code> and <code>app.sfluv.org:443</code>. This must match
+what the application actually puts in the SIWE message it asks users to sign.
+</div>
+
+<h2>On-chain state</h2>
+<div class="row"><span class="k">accepted now</span><span class="v" id="current">—</span></div>
+<div class="row"><span class="k">queued</span><span class="v" id="pending">—</span></div>
+<div class="row"><span class="k">executable</span><span class="v" id="eta">—</span></div>
+
+<div class="step" id="step1">
+  <h3>1 — queueSiweDomains<span class="badge" id="b1"></span></h3>
+  <div class="row"><span class="k">signer</span><span class="v">the group manager, and only the manager</span></div>
+  <div class="row"><span class="k">data</span><span class="v" id="data1"></span></div>
+  <p>Nothing changes on-chain when this lands. It starts the timelock.</p>
+  <button id="go1" disabled>Queue domains</button>
+</div>
+
+<div class="step" id="step2">
+  <h3>2 — executeSiweDomains<span class="badge" id="b2"></span></h3>
+  <div class="row"><span class="k">signer</span><span class="v">anyone with gas — permissionless, like executeRemoval</span></div>
+  <div class="row"><span class="k">data</span><span class="v" id="data2"></span></div>
+  <p><b>This is the step that gets forgotten.</b> Until it runs, the group still
+  accepts the old list and the change is inert. It does not fire on its own.</p>
+  <button id="go2" disabled>Apply queued domains</button>
+</div>
+
+<button id="refresh" disabled>Re-read on-chain state</button>
+<div id="log"></div>
+
+<script>
+// ---------------------------------------------------------------------------
+// Configuration. Change DOMAINS and regenerate DATA_QUEUE together — the page
+// deliberately does not encode the calldata itself.
+//
+// A hand-rolled ABI encoder here would be one more thing to get wrong on a
+// mainnet manager-only call, and it would be encoding the same intent twice:
+// once in DOMAINS for display, once in the bytes actually sent. Generating the
+// bytes with `cast` from the real ABI and pasting them keeps one source of
+// truth, and the page verifies the two agree by decoding DATA_QUEUE back and
+// comparing against DOMAINS before it will enable the button.
+//
+//   cast calldata 'queueSiweDomains(string[])' '["app.sfluv.org"]'
+//   cast calldata 'executeSiweDomains()'
+// ---------------------------------------------------------------------------
+const GROUP      = "0x86fe28144034fdaf86d3c964296dd33e4b94ac59";
+const MANAGER    = "0x762F96819a7705448843E96D63D638Ec2f39403B";
+const CHAIN_ID   = "0x1";
+
+const DOMAINS    = ["app.sfluv.org"];
+
+const DATA_QUEUE =
+  "0xf8ea5427" +
+  "0000000000000000000000000000000000000000000000000000000000000020" +
+  "0000000000000000000000000000000000000000000000000000000000000001" +
+  "0000000000000000000000000000000000000000000000000000000000000020" +
+  "000000000000000000000000000000000000000000000000000000000000000d" +
+  "6170702e73666c75762e6f726700000000000000000000000000000000000000";
+
+const DATA_EXEC  = "0xa9e34a29";
+
+// Read selectors, from `cast sig` — not derived by hand. A wrong selector here
+// does not revert loudly; eth_call to an unknown selector can return empty, and
+// the page would render "nothing queued" over a real pending change.
+const SEL_CURRENT = "0x6de07adb";   // siweDomains()
+const SEL_PENDING = "0xb460a7d0";   // getPendingSiweDomains()
+
+// ---------------------------------------------------------------------------
+// Minimal ABI decoding — only the two shapes this page reads.
+// ---------------------------------------------------------------------------
+const strip = h => h.startsWith("0x") ? h.slice(2) : h;
+const word  = (h, i) => h.slice(i * 64, i * 64 + 64);
+const num   = w => parseInt(w, 16);
+
+// Decodes a string[] whose data begins at byte offset `at` within `h`.
+function decodeStringArray(h, at) {
+  const base = at * 2;                                  // byte offset → nibbles
+  const n = num(h.slice(base, base + 64));
+  const out = [];
+  for (let i = 0; i < n; i++) {
+    const rel = num(h.slice(base + 64 + i * 64, base + 128 + i * 64));
+    const p   = base + 64 + rel * 2;
+    const len = num(h.slice(p, p + 64));
+    let s = "";
+    for (let b = 0; b < len; b++) {
+      s += String.fromCharCode(parseInt(h.slice(p + 64 + b * 2, p + 66 + b * 2), 16));
+    }
+    out.push(s);
+  }
+  return out;
+}
+
+// queueSiweDomains(string[]) calldata → the domains it would set.
+function decodeQueueCalldata(cd) {
+  const h = strip(cd).slice(8);                         // drop selector
+  return decodeStringArray(h, num(word(h, 0)));
+}
+
+// siweDomains() returns (string[])
+function decodeCurrent(ret) {
+  const h = strip(ret);
+  if (!h) return [];
+  return decodeStringArray(h, num(word(h, 0)));
+}
+
+// getPendingSiweDomains() returns (string[], uint256, address)
+function decodePending(ret) {
+  const h = strip(ret);
+  if (!h) return { domains: [], executeAfter: 0, initiator: null };
+  return {
+    domains:      decodeStringArray(h, num(word(h, 0))),
+    executeAfter: num(word(h, 1)),
+    initiator:    "0x" + word(h, 2).slice(24),
+  };
+}
+
+// ---------------------------------------------------------------------------
+const $ = id => document.getElementById(id);
+const log = (m, cls) => { const d = $("log"); d.className = cls || ""; d.textContent += m + "\n"; };
+const fmt = a => a.length ? a.map(d => '"' + d + '"').join(", ") : "(empty — scheme disabled)";
+
+$("group").textContent   = GROUP;
+$("manager").textContent = MANAGER;
+$("target").textContent  = fmt(DOMAINS);
+$("data1").textContent   = DATA_QUEUE;
+$("data2").textContent   = DATA_EXEC;
+
+let account = null;
+let state   = null;
+
+// Refuse to run at all if the displayed intent and the bytes disagree. Someone
+// editing DOMAINS and forgetting to regenerate DATA_QUEUE is the likely
+// mistake, and it would otherwise queue one thing while the page showed
+// another — visible only after the timelock had already elapsed.
+let encodingOK = false;
+try {
+  const decoded = decodeQueueCalldata(DATA_QUEUE);
+  encodingOK = JSON.stringify(decoded) === JSON.stringify(DOMAINS);
+  if (!encodingOK) {
+    log("REFUSING TO RUN — the calldata does not match the domains shown.\n" +
+        "  page says : " + fmt(DOMAINS) + "\n" +
+        "  bytes say : " + fmt(decoded) + "\n" +
+        "Regenerate DATA_QUEUE with cast and paste it in.", "err");
+  }
+} catch (e) {
+  log("REFUSING TO RUN — could not decode DATA_QUEUE: " + e.message, "err");
+}
+
+if (!window.ethereum) {
+  log("No injected wallet found. Serve this over http://localhost — wallets do " +
+      "not inject into file:// pages by default.\n" +
+      "Rabby and MetaMask both work; the page only uses standard EIP-1193 calls.", "err");
+} else if (encodingOK) {
+  $("refresh").disabled = false;
+  $("refresh").textContent = "Connect wallet";
+}
+
+async function readState() {
+  const [curRet, penRet] = await Promise.all([
+    ethereum.request({ method: "eth_call", params: [{ to: GROUP, data: SEL_CURRENT }, "latest"] }),
+    ethereum.request({ method: "eth_call", params: [{ to: GROUP, data: SEL_PENDING }, "latest"] }),
+  ]);
+  const current = decodeCurrent(curRet);
+  const pending = decodePending(penRet);
+  state = { current, pending };
+  render();
+}
+
+function render() {
+  const { current, pending } = state;
+  const now  = Math.floor(Date.now() / 1000);
+  const has  = pending.executeAfter > 0;
+  const ripe = has && now >= pending.executeAfter;
+  const done = JSON.stringify(current) === JSON.stringify(DOMAINS) && !has;
+
+  $("current").textContent = fmt(current);
+  $("pending").textContent = has ? fmt(pending.domains) : "nothing queued";
+  $("eta").textContent = !has ? "—"
+    : ripe ? "now — the delay has elapsed"
+    : new Date(pending.executeAfter * 1000).toLocaleString() +
+      "  (" + Math.ceil((pending.executeAfter - now) / 60) + " min)";
+
+  const isManager = account && account.toLowerCase() === MANAGER.toLowerCase();
+
+  $("step1").className = "step" + (done ? " done" : has ? " done" : " active");
+  $("b1").className = "badge " + (has || done ? "ok" : "now");
+  $("b1").textContent = done ? "not needed" : has ? "done" : "do this";
+  $("go1").disabled = !account || has || done || !isManager;
+  $("go1").textContent = !account ? "Queue domains"
+    : isManager ? "Queue domains"
+    : "Queue domains — connect as the manager";
+
+  $("step2").className = "step" + (ripe ? " active" : " done");
+  $("b2").className = "badge " + (ripe ? "now" : has ? "wait" : "ok");
+  $("b2").textContent = ripe ? "do this" : has ? "waiting on the timelock" : "nothing queued";
+  $("go2").disabled = !account || !ripe;
+
+  if (done) log("Group already accepts exactly the target list. Nothing to do.");
+}
+
+$("refresh").onclick = async () => {
+  try {
+    if (!account) {
+      const accts = await ethereum.request({ method: "eth_requestAccounts" });
+      const chain = await ethereum.request({ method: "eth_chainId" });
+
+      // The chain check is the load-bearing one. A wrong account merely reverts
+      // (onlyManager) and costs gas; wrong-chain calldata is meaningless and
+      // could reach an unrelated contract at the same address.
+      if (chain !== CHAIN_ID) {
+        log("Wrong network: " + chain + ". Switch your wallet to Ethereum mainnet.", "err");
+        return;
+      }
+      account = accts[0];
+      $("refresh").textContent = "Re-read on-chain state";
+      log("Connected as " + account + " on mainnet.");
+      if (account.toLowerCase() !== MANAGER.toLowerCase()) {
+        log("Note: this is not the manager (" + MANAGER + "). You can still run " +
+            "step 2, which is permissionless. Step 1 would revert.");
+      }
+    }
+    await readState();
+  } catch (e) {
+    log("Error: " + (e && e.message ? e.message : String(e)), "err");
+  }
+};
+
+async function send(data, label) {
+  log("Requesting signature for " + label + "…");
+  const hash = await ethereum.request({
+    method: "eth_sendTransaction",
+    params: [{ from: account, to: GROUP, value: "0x0", data }],
+  });
+  log("Sent: " + hash);
+  log("Re-read state once it confirms.");
+}
+
+$("go1").onclick = async () => {
+  try {
+    await send(DATA_QUEUE, "queueSiweDomains");
+    log("The timelock starts now. Come back and run step 2 — until then the " +
+        "group still accepts the old list.");
+    $("go1").disabled = true;
+  } catch (e) { log("Error: " + (e && e.message ? e.message : String(e)), "err"); }
+};
+
+$("go2").onclick = async () => {
+  try {
+    await send(DATA_EXEC, "executeSiweDomains");
+    log("Nodes pick this up on their next chain poll (chain_poll_secs, default 60s).");
+    $("go2").disabled = true;
+  } catch (e) { log("Error: " + (e && e.message ? e.message : String(e)), "err"); }
+};
+
+// Keep the countdown and button states honest without needing a reload.
+setInterval(() => { if (state) render(); }, 15000);
+</script>
+</body>
+</html>

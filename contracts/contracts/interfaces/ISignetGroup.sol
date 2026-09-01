@@ -270,6 +270,20 @@ interface ISignetGroup {
     ///         Empty means the onchain_resolver scheme is disabled here.
     function siweDomains() external view returns (string[] memory);
 
+    /// @notice The queued SIWE domain list, if any (executeAfter == 0 when
+    ///         nothing is pending).
+    ///
+    ///         The timelock exists so the change can be READ before it takes
+    ///         effect, which requires that it be readable — `SiweDomainsQueued`
+    ///         carries the list, but recovering current pending state from event
+    ///         history means replaying queue/cancel/execute in order, and a
+    ///         cancelled change looks identical to a live one until you do.
+    ///         Mirrors getPendingAuthResolver for the same reason.
+    function getPendingSiweDomains()
+        external
+        view
+        returns (string[] memory domains, uint256 executeAfter, address initiator);
+
     /// @notice Returns the currently queued auth-resolver change (executeAfter
     ///         == 0 when none is pending).
     function getPendingAuthResolver() external view returns (PendingResolver memory);

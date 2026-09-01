@@ -146,6 +146,55 @@ contract SignetGroupSiweDomainsTest is Test {
         g.executeSiweDomains();
     }
 
+    // The timelock only buys anything if the pending change can be READ during
+    // it. SiweDomainsQueued carries the list, but recovering current pending
+    // state from event history means replaying queue/cancel/execute in order —
+    // and a cancelled change looks exactly like a live one until you do.
+    function testPendingIsReadableThroughItsWholeLifecycle() public {
+        ISignetGroup g = _makeGroup();
+
+        (string[] memory d, uint256 ea, address who) = g.getPendingSiweDomains();
+        assertEq(d.length, 0);
+        assertEq(ea, 0, "nothing pending on a fresh group");
+        assertEq(who, address(0));
+
+        vm.prank(manager);
+        g.queueSiweDomains(_one("app.example.org"));
+
+        (d, ea, who) = g.getPendingSiweDomains();
+        assertEq(d.length, 1);
+        assertEq(d[0], "app.example.org", "the queued list is visible before it executes");
+        assertEq(ea, vm.getBlockTimestamp() + DELAY);
+        assertEq(who, manager);
+
+        // Still readable, and still not applied, right up to the boundary.
+        assertEq(g.siweDomains().length, 0);
+
+        _advance();
+        g.executeSiweDomains();
+
+        (d, ea, who) = g.getPendingSiweDomains();
+        assertEq(d.length, 0, "executing clears the queue");
+        assertEq(ea, 0, "executeAfter == 0 is what 'nothing pending' looks like");
+        assertEq(who, address(0));
+        assertEq(g.siweDomains().length, 1);
+    }
+
+    // Cancel must be distinguishable from execute by reading state alone.
+    function testPendingClearedOnCancel() public {
+        ISignetGroup g = _makeGroup();
+        vm.startPrank(manager);
+        g.queueSiweDomains(_one("app.example.org"));
+        g.cancelSiweDomains();
+        vm.stopPrank();
+
+        (string[] memory d, uint256 ea, address who) = g.getPendingSiweDomains();
+        assertEq(d.length, 0);
+        assertEq(ea, 0);
+        assertEq(who, address(0));
+        assertEq(g.siweDomains().length, 0, "cancel applies nothing");
+    }
+
     // Replace-wholesale semantics: the new list is the complete future state,
     // not a diff applied to the old one.
     function testExecuteReplacesRatherThanAppends() public {

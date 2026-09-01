@@ -22,6 +22,13 @@
 #   accept           each org  — operator consents to its nodes joining the group
 #   write-env        anyone    — builds the harness env file
 #
+# Upgrade phases, run long after stand-up:
+#
+#   check-layout       anyone    — storage-layout diff; no chain, no key
+#   deploy-group-impl  deployer  — deploys a new SignetGroup logic contract
+#   upgrade-beacon     COLD OWNER— points the beacon at it (see the warning below)
+#   siwe-domains       manager   — show/queue/execute the group's SIWE domain list
+#
 # Only `register` touches private key material, and it only ever reads the
 # running operator's own testnet/data/nodes-<org>.json.
 #
@@ -39,8 +46,17 @@
 #   MANAGER_PK=0x...  FACTORY_ADDRESS=0x... testnet/scripts/alpha-contracts.sh create-group 3
 #   OPERATOR_PK=0x... FACTORY_ADDRESS=0x... ALPHA_ORG=oll testnet/scripts/alpha-contracts.sh accept
 #
+#   testnet/scripts/alpha-contracts.sh check-layout
+#   DEPLOYER_PK=0x... testnet/scripts/alpha-contracts.sh deploy-group-impl
+#   FACTORY_ADDRESS=0x... GROUP_IMPL=0x... testnet/scripts/alpha-contracts.sh upgrade-beacon
+#   MANAGER_PK=0x... GROUP_ADDRESS=0x... testnet/scripts/alpha-contracts.sh siwe-domains queue app.sfluv.org
+#
 # `fund`, `create-group` and `write-env` read every testnet/data/manifest-*.json
 # present, so collect the other operators' manifests first.
+#
+# Rehearse the upgrade phases before running them for real:
+# testnet/scripts/rehearse-upgrade.sh forks the live chain into anvil and drives
+# deploy → upgrade → queue → execute against a copy of real group state.
 
 set -euo pipefail
 
@@ -131,6 +147,15 @@ need_deployer() {
 MANAGER_KEY=""
 need_manager() {
     MANAGER_KEY="${MANAGER_PK:-}"
+    # UNLOCKED impersonates rather than signs, so there is no key to require.
+    # See _send — it refuses to do this anywhere but a fork.
+    #
+    # Written as an `if` and not `[[ … ]] && return 0`: under `set -e` that idiom
+    # exits the whole script when the test is false, because the && chain's
+    # status becomes the function's.
+    if [[ "${UNLOCKED:-}" == "yes" ]]; then
+        return 0
+    fi
     if [[ -z "$MANAGER_KEY" && -n "${DEPLOYER_PK:-}" ]]; then
         MANAGER_KEY="$DEPLOYER_PK"
         echo "NOTE: using DEPLOYER_PK as the group manager. The manager owns the group" >&2
@@ -673,6 +698,429 @@ cmd_write_env() {
 }
 
 # --------------------------------------------------------------------------
+# Upgrade phases.
+#
+# These run long after stand-up and against groups that already hold key
+# material, so they are deliberately more suspicious than the deploy phases.
+# --------------------------------------------------------------------------
+
+BASELINE="$CONTRACTS/storage-layout-baseline.tsv"
+
+# _send <signer> <key-or-empty> <cast-send-args...>
+#
+# UNLOCKED=yes sends from an impersonated account instead of a signature, which
+# is how the fork rehearsal drives phases whose real signer is a hardware wallet
+# it does not have. It is refused on any chain that is not a local fork, because
+# the whole value of rehearsing is that the code path is the same one — a mode
+# that quietly worked on a real chain too would be a way to skip the signer.
+_send() {
+    local from="$1" key="$2"; shift 2
+    if [[ "${UNLOCKED:-}" == "yes" ]]; then
+        [[ "$CHAIN_ID" == "31337" ]] || die "UNLOCKED=yes is fork-rehearsal only, and CHAIN_ID is $CHAIN_ID.
+     It impersonates the signer instead of signing. Start anvil with
+     --chain-id 31337 (rehearse-upgrade.sh does), or use the real key."
+        cast send --unlocked --from "$from" --rpc-url "$RPC" "$@"
+    else
+        [[ -n "$key" ]] || die "no key available to sign as $from"
+        cast send --private-key "$key" --rpc-url "$RPC" "$@"
+    fi
+}
+
+# _layout emits the normalized storage layout of SignetGroup as
+# "slot<TAB>offset<TAB>label<TAB>type" lines.
+#
+# The normalization drops the AST node ids solc appends to struct and enum type
+# names. Those move whenever a line is added anywhere above the declaration, so
+# an unnormalized comparison reports drift on every build and would train the
+# reader to ignore it. Array lengths are deliberately NOT stripped: the gap
+# shrinking from 46 to 42 is the measurement, not noise.
+#
+# It cleans first, every time. `forge inspect ... storage` reads a cached
+# artifact, and the storage layout is not in the default output selection, so a
+# tree built by an ordinary `forge build` yields "storage layout missing from
+# artifact" — and, worse in principle, a tree built from different source could
+# answer from cache. A slow check that describes the code being deployed beats a
+# fast one that might describe the previous build; this gates a beacon upgrade,
+# so the rebuild is cheap at the price.
+_layout() {
+    ( cd "$CONTRACTS" \
+        && forge clean >/dev/null 2>&1 \
+        && forge inspect SignetGroup storage --json 2>/dev/null ) \
+        | jq -r '.storage[] | "\(.slot)\t\(.offset)\t\(.label)\t\(.type)"' \
+        | sed -e 's/\(t_struct([A-Za-z0-9_]*)\)[0-9]*/\1/g' \
+              -e 's/\(t_enum([A-Za-z0-9_]*)\)[0-9]*/\1/g'
+}
+
+_baseline_rows() { grep -v '^#' "$BASELINE" | grep -v '^[[:space:]]*$'; }
+
+# cmd_check_layout compares the working tree's SignetGroup against the layout
+# that is deployed, and refuses the upgrade unless the new one is a pure
+# extension of it.
+#
+# This is the check that a beacon upgrade actually needs. BeaconProxy keeps
+# state in the proxy and takes only code from the implementation, so a new
+# implementation does not migrate storage — it reinterprets it in place, for
+# every group behind the beacon at once, including groups this repo does not
+# manage. There is no failed transaction to notice: the upgrade succeeds and the
+# data quietly means something else.
+cmd_check_layout() {
+    [[ -f "$BASELINE" ]] || die "missing $BASELINE"
+
+    local write_baseline=""
+    if [[ "${1:-}" == "--write-baseline" ]]; then write_baseline=yes; fi
+
+    info "Building SignetGroup and reading its storage layout..."
+    local new_layout
+    new_layout=$(_layout) || die "forge inspect failed — does the contract compile?"
+    [[ -n "$new_layout" ]] || die "empty storage layout from forge inspect"
+
+    if [[ -n "$write_baseline" ]]; then
+        local tmp
+        tmp=$(mktemp)
+        grep '^#' "$BASELINE" > "$tmp"
+        printf '%s\n' "$new_layout" >> "$tmp"
+        mv "$tmp" "$BASELINE"
+        info "Rewrote $BASELINE from the working tree."
+        echo "    Update the provenance header — the addresses in it are now stale." >&2
+        return 0
+    fi
+
+    # 1. Every non-gap baseline entry must survive unchanged. Slot, offset,
+    #    label and type all matter: a rename with the same type still means the
+    #    two implementations disagree about what the slot holds, which is
+    #    exactly the confusion this is meant to catch.
+    local failed=0 line slot offset label type match
+    while IFS=$'\t' read -r slot offset label type; do
+        [[ "$label" == "__gap" ]] && continue
+        match=$(printf '%s\n' "$new_layout" | awk -F'\t' -v s="$slot" '$1 == s')
+        if [[ -z "$match" ]]; then
+            echo "  MISSING  slot $slot — baseline has '$label' ($type), candidate has nothing" >&2
+            failed=1
+        elif [[ "$match" != "$slot	$offset	$label	$type" ]]; then
+            echo "  CHANGED  slot $slot" >&2
+            echo "             baseline : $label ($type) offset $offset" >&2
+            echo "             candidate: $(printf '%s' "$match" | cut -f3) ($(printf '%s' "$match" | cut -f4)) offset $(printf '%s' "$match" | cut -f2)" >&2
+            failed=1
+        fi
+    done < <(_baseline_rows)
+
+    # 2 and 3. The gap absorbs the new state and the footprint does not move.
+    #    Reading the length out of the type string is not elegant, but it is the
+    #    only place solc reports it, and the alternative — trusting the
+    #    declaration in the source — is the thing being verified.
+    local old_gap new_gap old_slot old_len new_slot new_len
+    old_gap=$(_baseline_rows | awk -F'\t' '$3 == "__gap"')
+    new_gap=$(printf '%s\n' "$new_layout" | awk -F'\t' '$3 == "__gap"')
+    [[ -n "$old_gap" ]] || die "baseline has no __gap entry"
+    [[ -n "$new_gap" ]] || die "candidate has no __gap entry — the upgrade-safe gap was removed"
+
+    old_slot=$(printf '%s' "$old_gap" | cut -f1)
+    new_slot=$(printf '%s' "$new_gap" | cut -f1)
+    old_len=$(printf '%s' "$old_gap" | cut -f4 | sed 's/.*)\([0-9]*\)_storage/\1/')
+    new_len=$(printf '%s' "$new_gap" | cut -f4 | sed 's/.*)\([0-9]*\)_storage/\1/')
+
+    local old_end=$(( old_slot + old_len )) new_end=$(( new_slot + new_len ))
+    local added=$(( new_slot - old_slot ))
+
+    if [[ "$new_slot" -lt "$old_slot" ]]; then
+        echo "  GAP MOVED BACKWARDS — candidate __gap starts at $new_slot, deployed at $old_slot." >&2
+        echo "                        State was removed, not added." >&2
+        failed=1
+    fi
+    if [[ "$old_end" != "$new_end" ]]; then
+        echo "  FOOTPRINT CHANGED — deployed occupies slots 0..$(( old_end - 1 )), candidate 0..$(( new_end - 1 ))." >&2
+        echo "                      New state must be taken FROM the gap, not added beside it:" >&2
+        echo "                      shrink __gap by the number of slots you added." >&2
+        failed=1
+    fi
+
+    if [[ "$failed" != 0 ]]; then
+        die "storage layout is NOT upgrade-safe — see above. Do not deploy this."
+    fi
+
+    if [[ "$added" == 0 ]]; then
+        info "Storage layout unchanged from the deployed implementation."
+    else
+        info "Storage layout is upgrade-safe: $added new slot(s) taken from __gap."
+        printf '%s\n' "$new_layout" \
+            | awk -F'\t' -v lo="$old_slot" -v hi="$new_slot" \
+                  '$1 >= lo && $1 < hi { printf "      + slot %s  %s  %s\n", $1, $3, $4 }'
+        echo
+        echo "    These slots must be ZERO on every live proxy before the upgrade."
+        echo "    'upgrade-beacon' checks that on the group it is pointed at; it cannot"
+        echo "    check groups it does not know about."
+    fi
+}
+
+# --------------------------------------------------------------------------
+cmd_deploy_group_impl() {
+    cmd_check_layout
+    echo
+    need_chain; need_deployer
+
+    info "Deploying a new SignetGroup implementation (does NOT touch the beacon)"
+
+    local out
+    out=$(cd "$CONTRACTS" && forge script script/DeployGroupImpl.s.sol \
+            --rpc-url "$RPC" --broadcast --private-key "$DEPLOYER_PK" 2>&1)
+
+    local impl hash
+    impl=$(grep "UPGRADE:groupImpl=" <<< "$out" | sed 's/.*UPGRADE:groupImpl=//')
+    hash=$(grep "UPGRADE:initCodeHash=" <<< "$out" | sed 's/.*UPGRADE:initCodeHash=//')
+    [[ -n "$impl" ]] || { echo "$out" >&2; die "could not parse the implementation address"; }
+
+    cat <<EOF
+
+GroupImpl:    $impl
+InitCodeHash: $hash
+
+Nothing is upgraded yet. The beacon still serves the old implementation and
+every group is untouched — deploying logic and adopting it are separate acts,
+and only the second one is irreversible.
+
+Give the cold signer BOTH values. The address is derived from the init code via
+CREATE2, so they can rebuild this source and confirm the address holds the code
+they think it does rather than taking your word for it.
+
+  FACTORY_ADDRESS=${FACTORY_ADDRESS:-0x<factory>} GROUP_IMPL=$impl \\
+    testnet/scripts/alpha-contracts.sh upgrade-beacon
+EOF
+}
+
+# --------------------------------------------------------------------------
+# cmd_upgrade_beacon is the irreversible one.
+#
+# It prints the transaction for a cold signer rather than sending it. ADMIN_PK
+# exists only so the anvil rehearsal can drive the same code path; on a real
+# chain the owner is a hardware wallet or a multisig, and a phase that reads a
+# cold key out of the environment would defeat the reason it is cold.
+cmd_upgrade_beacon() {
+    need_chain; need_factory
+    local impl="${GROUP_IMPL:-}"
+    [[ -n "$impl" ]] || die "GROUP_IMPL not set — the implementation address from 'deploy-group-impl'"
+    [[ "$impl" =~ ^0x[0-9a-fA-F]{40}$ ]] || die "GROUP_IMPL must be a 0x-prefixed 20-byte address, got '$impl'"
+
+    local beacon owner current code
+    beacon=$(cast call "$FACTORY" 'groupBeacon()(address)' --rpc-url "$RPC") \
+        || die "could not read groupBeacon() — is FACTORY_ADDRESS a SignetFactory?"
+    owner=$(cast call "$FACTORY" 'owner()(address)' --rpc-url "$RPC")
+    current=$(cast call "$beacon" 'implementation()(address)' --rpc-url "$RPC")
+
+    # An address with no code is the whole failure mode in one mistake: the
+    # beacon accepts it, every group behind it delegatecalls into nothing, and
+    # every call returns success with empty data. Recovery needs the cold key
+    # again.
+    code=$(cast code "$impl" --rpc-url "$RPC")
+    [[ "$code" != "0x" && -n "$code" ]] || die "GROUP_IMPL $impl has NO CODE on this chain.
+     Pointing the beacon at it bricks every group behind it — calls would
+     succeed and do nothing. Check the address and the chain."
+
+    if [[ "$(printf %s "$current" | tr 'A-F' 'a-f')" == "$(printf %s "$impl" | tr 'A-F' 'a-f')" ]]; then
+        info "Beacon already serves $impl — nothing to do."
+        return 0
+    fi
+
+    # Where a group address is known, confirm the slots the new implementation
+    # claims are still zero. This is a spot check, not a proof: the beacon backs
+    # every group, and this can only see the one it was given.
+    local group="${GROUP_ADDRESS:-}"
+    if [[ -n "$group" ]]; then
+        local old_slot new_slot s v dirty=0
+        old_slot=$(_baseline_rows | awk -F'\t' '$3 == "__gap" {print $1}')
+        new_slot=$(_layout | awk -F'\t' '$3 == "__gap" {print $1}')
+        for (( s = old_slot; s < new_slot; s++ )); do
+            v=$(cast storage "$group" "$s" --rpc-url "$RPC")
+            if [[ "$v" != "0x0000000000000000000000000000000000000000000000000000000000000000" ]]; then
+                echo "  slot $s on $group is NOT zero: $v" >&2
+                dirty=1
+            fi
+        done
+        if [[ "$dirty" != 0 ]]; then
+            die "the group already has data in slots the new implementation claims.
+     Upgrading would read that data as SIWE state. Stop and work out what wrote it."
+        fi
+        info "Checked $group: slots $old_slot..$(( new_slot - 1 )) are zero."
+    else
+        echo "NOTE: GROUP_ADDRESS unset, so the new slots were not checked against a" >&2
+        echo "      live group. Set it to have this verified." >&2
+    fi
+
+    local calldata
+    calldata=$(cast calldata 'upgradeGroupImplementation(address)' "$impl")
+
+    cat <<EOF
+
+=== BEACON UPGRADE — this replaces the logic under EVERY group ===
+
+  chain    : $(chain_name "$CHAIN_ID") ($CHAIN_ID)
+  factory  : $FACTORY
+  beacon   : $beacon
+  from     : $current
+  to       : $impl
+  signer   : $owner   <-- must be this address, and nothing else can do it
+
+  to       : $FACTORY
+  value    : 0
+  data     : $calldata
+
+This takes effect on the next block, for every group behind the beacon at once.
+There is no per-group rollout and no staging: groups other organisations manage
+change implementation in the same transaction as yours.
+
+EOF
+
+    if [[ -n "${ADMIN_PK:-}" || "${UNLOCKED:-}" == "yes" ]]; then
+        if [[ -n "${ADMIN_PK:-}" ]]; then
+            local signer
+            signer=$(cast wallet address "$ADMIN_PK")
+            if [[ "$(printf %s "$signer" | tr 'A-F' 'a-f')" != "$(printf %s "$owner" | tr 'A-F' 'a-f')" ]]; then
+                die "ADMIN_PK is $signer but the factory owner is $owner — that key cannot upgrade."
+            fi
+            if [[ "$CHAIN_ID" == "1" && "${ALLOW_HOT_ADMIN:-}" != "yes" ]]; then
+                die "refusing to send a MAINNET beacon upgrade from a key in the environment.
+     The factory owner holds standing power over every group; putting it in a
+     shell to save a step is how it stops being cold. Sign the transaction above
+     with the hardware wallet or multisig that owns the factory.
+     ALLOW_HOT_ADMIN=yes overrides, and should not be needed on chain 1."
+            fi
+        fi
+        info "Sending upgradeGroupImplementation as $owner..."
+        _send "$owner" "${ADMIN_PK:-}" \
+            "$FACTORY" 'upgradeGroupImplementation(address)' "$impl" >/dev/null
+        local now
+        now=$(cast call "$beacon" 'implementation()(address)' --rpc-url "$RPC")
+        info "Beacon now serves: $now"
+        [[ "$(printf %s "$now" | tr 'A-F' 'a-f')" == "$(printf %s "$impl" | tr 'A-F' 'a-f')" ]] \
+            || die "beacon did not change — expected $impl"
+        echo
+        echo "Update contracts/storage-layout-baseline.tsv now, while it is true:"
+        echo "  testnet/scripts/alpha-contracts.sh check-layout --write-baseline"
+    else
+        echo "Send it with the owner's key. Ledger, for example:"
+        echo
+        echo "  cast send --ledger --rpc-url \"\$ETH_RPC_URL\" \\"
+        echo "    $FACTORY 'upgradeGroupImplementation(address)' $impl"
+        echo
+        echo "Then confirm, from any key:"
+        echo
+        echo "  cast call $beacon 'implementation()(address)' --rpc-url \"\$ETH_RPC_URL\""
+    fi
+}
+
+# --------------------------------------------------------------------------
+# cmd_siwe_domains manages the group's SIWE domain list.
+#
+# The list is replaced wholesale, so `queue` takes the COMPLETE future list and
+# not a delta. Passing one domain to a group that already trusts three removes
+# the other two.
+cmd_siwe_domains() {
+    local action="${1:-show}"; shift || true
+    need_chain
+    local group="${GROUP_ADDRESS:-}"
+    [[ -n "$group" ]] || die "GROUP_ADDRESS not set"
+
+    # An implementation without siweDomains() reverts here rather than returning
+    # empty, which is the tell that the beacon upgrade has not happened yet.
+    _read_domains() {
+        cast call "$group" 'siweDomains()(string[])' --rpc-url "$RPC" 2>/dev/null \
+            || die "siweDomains() reverted on $group.
+     The group is still on an implementation that predates the SIWE domain list.
+     Run 'upgrade-beacon' first."
+    }
+
+    # cast renders a uint256 as "1788223447 [1.788e9]" — the bracketed part is a
+    # readability aid, not part of the value. Comparing or date-formatting the
+    # whole string silently misbehaves, so take the first field.
+    _execute_after() {
+        cast call "$group" 'getPendingSiweDomains()(string[],uint256,address)' --rpc-url "$RPC" \
+            | sed -n '2p' | awk '{print $1}'
+    }
+
+    # Read once, here: every mutating branch sends as the manager, and the
+    # impersonated path needs the address even when there is no key.
+    local onchain_manager
+    onchain_manager=$(cast call "$group" 'manager()(address)' --rpc-url "$RPC")
+
+    case "$action" in
+    show)
+        echo "current : $(_read_domains)"
+        local pending ea
+        pending=$(cast call "$group" 'getPendingSiweDomains()(string[],uint256,address)' --rpc-url "$RPC")
+        ea=$(awk 'NR==2 {print $1}' <<< "$pending")
+        if [[ -n "$ea" && "$ea" != "0" ]]; then
+            echo "pending : $(sed -n '1p' <<< "$pending")"
+            echo "          executes after $ea ($(date -r "$ea" 2>/dev/null || echo "$ea"))"
+            echo "          queued by $(sed -n '3p' <<< "$pending")"
+        else
+            echo "pending : none"
+        fi
+        ;;
+
+    queue)
+        need_manager
+        [[ $# -gt 0 ]] || die "usage: siwe-domains queue <domain> [domain...]
+     Pass the COMPLETE future list — it replaces the current one wholesale.
+     To disable the scheme, pass no domains via: siwe-domains queue-empty"
+        local signer
+        if [[ -n "$MANAGER_KEY" ]]; then
+            signer=$(cast wallet address "$MANAGER_KEY")
+            [[ "$(printf %s "$onchain_manager" | tr 'A-F' 'a-f')" == "$(printf %s "$signer" | tr 'A-F' 'a-f')" ]] \
+                || die "MANAGER_PK is $signer but the group manager is $onchain_manager"
+        fi
+
+        # Validate locally before spending gas. The contract checks this too,
+        # but a revert string costs a transaction to read and this costs
+        # nothing — and the rule is subtle enough to trip on (lowercase only,
+        # no scheme, no path, no trailing dot).
+        local d
+        for d in "$@"; do
+            [[ "$d" =~ ^[a-z0-9.-]+(:[0-9]{1,5})?$ ]] \
+                || die "'$d' is not a canonical SIWE domain.
+     Lowercase ASCII authority only: no scheme, no path, no uppercase.
+     'https://app.example.org/' is wrong; 'app.example.org' is right."
+        done
+
+        echo "Replacing the list with:"
+        printf '  %s\n' "$@"
+        echo "Current list: $(_read_domains)"
+        echo
+
+        local args
+        args=$(printf '"%s",' "$@"); args="[${args%,}]"
+        _send "$onchain_manager" "$MANAGER_KEY" \
+            "$group" 'queueSiweDomains(string[])' "$args" >/dev/null
+
+        local ea delay
+        ea=$(_execute_after)
+        delay=$(cast call "$group" 'removalDelay()(uint256)' --rpc-url "$RPC")
+        info "Queued. Executable after $ea (removalDelay is ${delay}s)."
+        echo "    Nothing changes until 'siwe-domains execute'. Until then the group"
+        echo "    still accepts only: $(_read_domains)"
+        ;;
+
+    execute)
+        # Permissionless, mirroring executeRemoval — any funded key will do.
+        need_manager
+        _send "$onchain_manager" "$MANAGER_KEY" \
+            "$group" 'executeSiweDomains()' >/dev/null
+        info "Applied. The group now accepts: $(_read_domains)"
+        echo "    Nodes pick this up on their next chain poll (chain_poll_secs, default 60s)."
+        ;;
+
+    cancel)
+        need_manager
+        _send "$onchain_manager" "$MANAGER_KEY" \
+            "$group" 'cancelSiweDomains()' >/dev/null
+        info "Cancelled. The list is unchanged: $(_read_domains)"
+        ;;
+
+    *)
+        die "unknown action '$action' — one of: show, queue, execute, cancel"
+        ;;
+    esac
+}
+
+# --------------------------------------------------------------------------
 case "${1:-}" in
     deploy-factory) shift; cmd_deploy_factory "$@" ;;
     fund)           shift; cmd_fund "$@" ;;
@@ -681,8 +1129,13 @@ case "${1:-}" in
     create-group)   shift; cmd_create_group "$@" ;;
     accept)         shift; cmd_accept "$@" ;;
     write-env)      shift; cmd_write_env "$@" ;;
+
+    check-layout)      shift; cmd_check_layout "$@" ;;
+    deploy-group-impl) shift; cmd_deploy_group_impl "$@" ;;
+    upgrade-beacon)    shift; cmd_upgrade_beacon "$@" ;;
+    siwe-domains)      shift; cmd_siwe_domains "$@" ;;
     *)
-        sed -n '2,42p' "$0" | sed 's/^# \{0,1\}//'
+        sed -n '2,59p' "$0" | sed 's/^# \{0,1\}//'
         exit 1
         ;;
 esac

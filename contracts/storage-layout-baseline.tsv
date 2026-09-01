@@ -1,0 +1,68 @@
+# SignetGroup storage layout — the layout that is DEPLOYED.
+#
+# This is the baseline `alpha-contracts.sh check-layout` compares a candidate
+# implementation against before it will let one be deployed for a beacon
+# upgrade. It is not documentation of the current source; it is a record of what
+# the live proxies' storage already means. Those two are the same thing only
+# between upgrades, which is exactly when the check has nothing to say.
+#
+# Why a beacon upgrade needs this at all: BeaconProxy keeps its state in the
+# proxy and takes only code from the implementation, so a new implementation
+# that assigns different meanings to the same slots does not migrate anything —
+# it reinterprets live data in place. Every existing group, including ones this
+# repo does not manage, silently changes meaning in the same transaction.
+#
+# The rule the check enforces:
+#
+#   1. Every non-gap entry here must appear in the candidate at the same slot,
+#      the same offset, and with the same type. No reordering, no widening, no
+#      removal, no repurposing.
+#   2. New state may only occupy slots taken from the head of __gap.
+#   3. The total footprint (__gap slot + __gap length) must be unchanged, so
+#      the contract occupies the same slot range before and after.
+#
+# Types are normalized before comparison: solc suffixes struct and enum type
+# ids with an AST node id that moves whenever an unrelated line is added above,
+# so comparing them raw reports drift that does not exist. Array lengths are
+# NOT stripped — `t_array(t_uint256)46_storage` differing from `...42_storage`
+# is the gap shrinking, which is the thing being measured.
+#
+# Provenance — this was not transcribed from the source, it was read back from
+# the chain:
+#
+#   Recorded  : 2026-08-31
+#   Source    : cddc5a2 ("fix(contracts): reject empty client ids in addIssuer")
+#   Impl      : 0x44B09BCD4Ec1B5faF9E8D35b607B0dDc39020D98 (Ethereum mainnet)
+#   Beacon    : 0xE37C3768C12fF0ECFb78e63ED26De98c08a7d716
+#   Verified  : the deployed runtime bytecode at that address is a byte-for-byte
+#               match for a local build of cddc5a2, metadata included — so this
+#               layout is the one the live groups are actually using, not an
+#               assumption about which commit was deployed.
+#
+# UPDATE THIS FILE WHEN AN UPGRADE LANDS, not when the source changes. Regenerate
+# with:
+#
+#   testnet/scripts/alpha-contracts.sh check-layout --write-baseline
+#
+# and record the new implementation address above.
+#
+# slot	offset	label	type
+0	0	factory	t_address
+1	0	manager	t_address
+2	0	threshold	t_uint256
+3	0	removalDelay	t_uint256
+4	0	nodeStatus	t_mapping(t_address,t_enum(NodeStatus))
+5	0	_activeNodes	t_array(t_address)dyn_storage
+6	0	_activeNodeIndex	t_mapping(t_address,t_uint256)
+7	0	_pendingNodes	t_array(t_address)dyn_storage
+8	0	_pendingNodeIndex	t_mapping(t_address,t_uint256)
+9	0	_removalRequests	t_mapping(t_address,t_struct(RemovalRequest)_storage)
+10	0	_issuers	t_mapping(t_bytes32,t_struct(OAuthIssuer)_storage)
+11	0	_issuerHashes	t_array(t_bytes32)dyn_storage
+12	0	_issuerHashIndex	t_mapping(t_bytes32,t_uint256)
+13	0	_authKeys	t_mapping(t_bytes32,t_bytes_storage)
+14	0	_authKeyHashes	t_array(t_bytes32)dyn_storage
+15	0	_authKeyHashIndex	t_mapping(t_bytes32,t_uint256)
+16	0	_authResolver	t_struct(AuthResolver)_storage
+17	0	_pendingResolver	t_struct(PendingResolver)_storage
+20	0	__gap	t_array(t_uint256)46_storage

@@ -684,6 +684,194 @@ gone on restart; keygen writes nothing on-chain. So the wipe is complete.
 
 ---
 
+## Phase 7 — Upgrading the group implementation
+
+Applies to any change to `SignetGroup.sol` after the group exists. Written
+against the SIWE domain change (`862b2cf`), which is the first one.
+
+### What makes this different from a deploy
+
+`SignetGroup` sits behind a `BeaconProxy`. The proxy holds the state; the
+implementation supplies only code. So an upgrade does not migrate anything — it
+**reinterprets live storage in place**, for every group behind the beacon, in a
+single transaction. Get the layout wrong and there is no failed transaction to
+notice: the upgrade succeeds and the data quietly means something else.
+
+Two consequences worth internalising before touching anything:
+
+- **There is no per-group rollout.** `upgradeGroupImplementation` swaps the logic
+  under *every* group at once, including groups other organisations manage.
+  Today sfluv's is the only group, so "upgrade sfluv's group" and "upgrade every
+  group" are the same act. That stops being true the moment there is a second.
+- **Unit tests cannot verify it.** They build their state with the *new*
+  contract. The only state that proves anything was written by the *old* one, and
+  it exists in exactly one place. Hence the fork rehearsal below, which is not
+  optional.
+
+### Who can do what
+
+| Action | Address | Notes |
+|---|---|---|
+| Deploy the implementation | anyone with gas | Permissionless. Deploying is not adopting. |
+| `upgradeGroupImplementation` | **factory owner** `0x180E9a32…` | Cold. The only address that can. |
+| `queueSiweDomains` | **group manager** `0x762F9681…` | Cannot upgrade anything. |
+| `executeSiweDomains` | anyone with gas | Permissionless, mirroring `executeRemoval`. |
+
+**The manager cannot perform the upgrade.** `upgradeGroupImplementation` is
+`onlyOwner` on the factory, the beacon's owner *is* the factory, and the
+factory's owner is the cold key. There is no manager path to it, by design —
+that separation is the reason `deploy-factory` refuses to make the deploy key the
+admin.
+
+### 0. Fund the cold key first
+
+`0x180E9a32…` has been used exactly once, to be set as owner at deploy, and
+**holds no ETH**. It cannot send the upgrade transaction as it stands. Send it
+gas before the ceremony, not during it.
+
+Measured on a fork of live state:
+
+| Step | Gas | Signer |
+|---|---:|---|
+| Deploy implementation | 4,557,923 | deployer (anyone) |
+| `upgradeGroupImplementation` | 45,590 | cold owner |
+| `queueSiweDomains(["app.sfluv.org"])` | 135,509 | manager |
+| `executeSiweDomains()` | 99,574 | anyone |
+
+The deploy dominates by two orders of magnitude. Total cost is entirely a
+function of gas price on the day — at 1 gwei the whole sequence is ~0.005 ETH,
+at 30 gwei ~0.14 ETH. Check `cast gas-price` rather than budgeting from a figure
+written here.
+
+### 1. Rehearse against a fork — every time
+
+```bash
+ETH_RPC_URL=<archive-capable RPC> testnet/scripts/rehearse-upgrade.sh
+```
+
+Forks the live chain into anvil, confirms it is running the *old* implementation,
+then drives the real phase scripts through deploy → upgrade → queue → timelock →
+execute against a copy of real group state. It asserts that members, threshold,
+quorum, manager, auth keys and operational status all read back identically, and
+that the new fields start empty rather than inheriting whatever those slots held.
+
+It aborts if the forked chain already has the upgrade, because that run would go
+green while testing nothing.
+
+**Use an RPC that serves archive requests.** `ethereum-rpc.publicnode.com` works
+only at `latest` and rejects a pinned `FORK_BLOCK` with "Archive requests require
+a personal token", which makes runs racy. Alchemy — what the nodes already use —
+is the better source here.
+
+### 2. Check the layout
+
+```bash
+testnet/scripts/alpha-contracts.sh check-layout
+```
+
+Compares the working tree against `contracts/storage-layout-baseline.tsv`, which
+records the layout that is **deployed** — not what is in the source. New state
+may only come from the head of `__gap`, and the total footprint must not move.
+
+It runs `forge clean` first, deliberately. `forge inspect … storage` reads a
+cached artifact and the layout is not in the default output selection, so a tree
+built by an ordinary `forge build` either fails outright or, worse in principle,
+answers from a build that is not the one being deployed. The rebuild is the price
+of the check meaning anything.
+
+### 3. Deploy the implementation
+
+```bash
+export ETH_RPC_URL=<RPC> CHAIN_ID=1
+DEPLOYER_PK=0x... FACTORY_ADDRESS=0x86EB99… \
+  testnet/scripts/alpha-contracts.sh deploy-group-impl
+```
+
+Runs `check-layout` first and refuses to proceed if it fails. Nothing is upgraded
+by this — the beacon still serves the old implementation and every group is
+untouched.
+
+The address is CREATE2-derived from the init code alone, so it does not depend on
+which key deployed it. Give the cold signer both the address and the init-code
+hash: they can rebuild this source and confirm the address holds the code they
+think it does, rather than taking the deployer's word for it.
+
+### 4. The cold key signs
+
+```bash
+FACTORY_ADDRESS=0x86EB99… GROUP_ADDRESS=0x86fe2814… GROUP_IMPL=0x<new> \
+  testnet/scripts/alpha-contracts.sh upgrade-beacon
+```
+
+Prints the exact transaction and stops. It verifies the target has code — an
+address with none is accepted by the beacon and bricks every group behind it,
+with every call returning success and empty data — and checks that the slots the
+new implementation claims are still zero on `GROUP_ADDRESS`.
+
+That last check sees only the group it was given. It cannot speak for groups it
+does not know about.
+
+Then, on the machine holding the key:
+
+```bash
+cast send --ledger --rpc-url "$ETH_RPC_URL" \
+  0x86EB99… 'upgradeGroupImplementation(address)' 0x<new>
+```
+
+The phase refuses to send this itself on chain 1 even if `ADMIN_PK` is set. A
+cold key read out of a shell to save a step is not cold.
+
+Confirm, from any key:
+
+```bash
+cast call 0xE37C3768… 'implementation()(address)' --rpc-url "$ETH_RPC_URL"
+```
+
+### 5. Re-baseline immediately
+
+```bash
+testnet/scripts/alpha-contracts.sh check-layout --write-baseline
+```
+
+Then edit the provenance header in `contracts/storage-layout-baseline.tsv` with
+the new implementation address. Do this while it is true — the file's whole value
+is that it describes what is deployed, and a stale one silently approves the next
+upgrade against the wrong layout.
+
+### 6. Set the SIWE domains
+
+```bash
+export GROUP_ADDRESS=0x86fe2814…
+MANAGER_PK=0x... testnet/scripts/alpha-contracts.sh siwe-domains queue app.sfluv.org
+# wait removalDelay (600s on this group), then:
+MANAGER_PK=0x... testnet/scripts/alpha-contracts.sh siwe-domains execute
+testnet/scripts/alpha-contracts.sh siwe-domains show
+```
+
+`queue` takes the **complete future list**, not a delta — it replaces the list
+wholesale. Passing one domain to a group that already trusts three removes the
+other two.
+
+An empty list disables the `onchain_resolver` scheme for the group. Empty never
+means "any domain".
+
+### 7. Roll the nodes
+
+Only after the above. The node reads the domain list from the group contract and
+`siwe_domain` is gone from node config entirely — no fallback, no deprecation
+period.
+
+Ordering is not delicate here, because SIWE is unused today and empty already
+meant disabled: a new node against an old contract sees the call revert and
+treats it as an empty list, which disables the scheme rather than opening it. An
+old node never calls it at all. So there is no window in which anything
+regresses, in either order.
+
+Nodes pick up an executed change on their next chain poll — `chain_poll_secs`,
+default 60s.
+
+---
+
 ## Teardown
 
 Each operator tears down its own:

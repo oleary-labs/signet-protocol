@@ -429,6 +429,15 @@ contract SignetGroup is Initializable, ISignetGroup {
         return _siweDomains;
     }
 
+    /// @inheritdoc ISignetGroup
+    function getPendingSiweDomains()
+        external
+        view
+        returns (string[] memory domains, uint256 executeAfter, address initiator)
+    {
+        return (_pendingSiweDomains, _siweExecuteAfter, _siweInitiator);
+    }
+
     /// @dev Canonical form, byte-for-byte. Must match the node's rule exactly:
     ///      the two are a single protocol constant expressed twice, and a
     ///      disagreement is worse than a wildcard because it fails intermittently

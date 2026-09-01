@@ -30,14 +30,25 @@
 # Provenance — this was not transcribed from the source, it was read back from
 # the chain:
 #
-#   Recorded  : 2026-08-31
-#   Source    : cddc5a2 ("fix(contracts): reject empty client ids in addIssuer")
-#   Impl      : 0x44B09BCD4Ec1B5faF9E8D35b607B0dDc39020D98 (Ethereum mainnet)
+#   Recorded  : 2026-08-31 (after the SIWE-domain beacon upgrade)
+#   Source    : 862b2cf ("feat(siwe): move domain binding on-chain, per-group")
+#   Impl      : 0x790c546357ca7f588c68DC8A2C42baB5025276c4 (Ethereum mainnet)
 #   Beacon    : 0xE37C3768C12fF0ECFb78e63ED26De98c08a7d716
 #   Verified  : the deployed runtime bytecode at that address is a byte-for-byte
-#               match for a local build of cddc5a2, metadata included — so this
-#               layout is the one the live groups are actually using, not an
-#               assumption about which commit was deployed.
+#               match for a local build of this tree, metadata included
+#               (sha256 d93ddcc1…, 29,974 chars), and its init-code hash matches
+#               the 0x542a1c4d… reported at deploy — so this layout is the one
+#               live groups actually use, not an assumption about which commit
+#               was deployed.
+#
+#   Upgrade    : beacon moved 0x44B09BCD -> 0x790c5463, signed by the factory
+#               owner 0x180E9a320BD5bD59375191571bB9C1Ca8825515A. Slots 20-23
+#               read zero on the live group both before and after, so the four
+#               new fields landed on virgin storage rather than reinterpreting
+#               anything.
+#
+#   Previous  : 0x44B09BCD4Ec1B5faF9E8D35b607B0dDc39020D98, source cddc5a2,
+#               __gap[46] at slot 20.
 #
 # UPDATE THIS FILE WHEN AN UPGRADE LANDS, not when the source changes. Regenerate
 # with:
@@ -65,4 +76,8 @@
 15	0	_authKeyHashIndex	t_mapping(t_bytes32,t_uint256)
 16	0	_authResolver	t_struct(AuthResolver)_storage
 17	0	_pendingResolver	t_struct(PendingResolver)_storage
-20	0	__gap	t_array(t_uint256)46_storage
+20	0	_siweDomains	t_array(t_string_storage)dyn_storage
+21	0	_pendingSiweDomains	t_array(t_string_storage)dyn_storage
+22	0	_siweExecuteAfter	t_uint256
+23	0	_siweInitiator	t_address
+24	0	__gap	t_array(t_uint256)42_storage

@@ -1,0 +1,114 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Signet — beacon upgrade via MetaMask</title>
+<style>
+  body { font: 14px/1.6 ui-monospace, SFMono-Regular, Menlo, monospace;
+         max-width: 46rem; margin: 3rem auto; padding: 0 1.5rem;
+         background: #111; color: #ddd; }
+  h1 { font-size: 1.1rem; color: #fff; }
+  .row { display: grid; grid-template-columns: 6rem 1fr; gap: .4rem 1rem; margin: .3rem 0; }
+  .k { color: #888; }
+  .v { word-break: break-all; color: #9ecbff; }
+  .warn { border-left: 3px solid #d29922; padding: .6rem 1rem; margin: 1.5rem 0;
+          background: #1c1a12; color: #e3c07b; }
+  button { font: inherit; padding: .6rem 1.2rem; margin-top: 1rem; cursor: pointer;
+           background: #21262d; color: #ddd; border: 1px solid #444; border-radius: 6px; }
+  button:disabled { opacity: .4; cursor: not-allowed; }
+  #log { white-space: pre-wrap; margin-top: 1.5rem; color: #7ee787; }
+  .err { color: #ff7b72; }
+</style>
+</head>
+<body>
+<h1>Beacon upgrade — SignetGroup implementation</h1>
+
+<p>Sends one transaction from the factory owner. Nothing here holds or sees your
+key; MetaMask signs.</p>
+
+<div class="row"><span class="k">chain</span><span class="v">1 (mainnet)</span></div>
+<div class="row"><span class="k">to</span><span class="v" id="to"></span></div>
+<div class="row"><span class="k">value</span><span class="v">0</span></div>
+<div class="row"><span class="k">data</span><span class="v" id="data"></span></div>
+<div class="row"><span class="k">means</span><span class="v">upgradeGroupImplementation(0x790c546357ca7f588c68DC8A2C42baB5025276c4)</span></div>
+<div class="row"><span class="k">signer</span><span class="v" id="owner"></span></div>
+
+<div class="warn">
+This replaces the logic under <b>every group behind the beacon</b>, in one
+transaction, on the next block. There is no per-group rollout and no staging —
+groups other organisations manage change implementation at the same moment as
+yours. It is not reversible except by another upgrade.
+</div>
+
+<button id="go" disabled>Connect MetaMask</button>
+<div id="log"></div>
+
+<script>
+const FACTORY  = "0x86EB99D569AaD51c3160C5C50ec3093e6771c07a";
+const DATA     = "0xb8dff130000000000000000000000000790c546357ca7f588c68dc8a2c42bab5025276c4";
+const OWNER    = "0x180E9a320BD5bD59375191571bB9C1Ca8825515A";
+const CHAIN_ID = "0x1";
+
+document.getElementById("to").textContent    = FACTORY;
+document.getElementById("data").textContent  = DATA;
+document.getElementById("owner").textContent = OWNER;
+
+const log = (m, cls) => {
+  const d = document.getElementById("log");
+  d.className = cls || "";
+  d.textContent += m + "\n";
+};
+const btn = document.getElementById("go");
+
+if (!window.ethereum) {
+  log("No injected wallet found. Serve this over http://localhost — MetaMask does " +
+      "not inject into file:// pages by default.", "err");
+} else {
+  btn.disabled = false;
+}
+
+let account = null;
+
+btn.onclick = async () => {
+  try {
+    if (!account) {
+      const accts = await ethereum.request({ method: "eth_requestAccounts" });
+      account = accts[0];
+      const chain = await ethereum.request({ method: "eth_chainId" });
+
+      // Both checks matter. The wrong account simply reverts (onlyOwner), which
+      // is survivable. The wrong CHAIN is the dangerous one: this calldata is
+      // meaningless elsewhere and could hit an unrelated contract at the same
+      // address.
+      if (chain !== CHAIN_ID) {
+        log("Wrong network: " + chain + ". Switch MetaMask to Ethereum mainnet.", "err");
+        account = null;
+        return;
+      }
+      if (account.toLowerCase() !== OWNER.toLowerCase()) {
+        log("Connected as " + account + "\nbut the factory owner is " + OWNER +
+            "\nSelect that account in MetaMask. Any other account reverts.", "err");
+        account = null;
+        return;
+      }
+      log("Connected as owner " + account + " on mainnet.");
+      btn.textContent = "Send beacon upgrade";
+      return;
+    }
+
+    log("Requesting signature…");
+    const hash = await ethereum.request({
+      method: "eth_sendTransaction",
+      params: [{ from: account, to: FACTORY, value: "0x0", data: DATA }],
+    });
+    log("Sent: " + hash);
+    log("Verify with:\n  cast call " + FACTORY +
+        " 'groupBeacon()(address)' --rpc-url $ETH_RPC_URL");
+    btn.disabled = true;
+  } catch (e) {
+    log("Error: " + (e && e.message ? e.message : String(e)), "err");
+  }
+};
+</script>
+</body>
+</html>

@@ -366,6 +366,15 @@ func (c *ChainClient) buildGroupInfo(ctx context.Context, grpAddr common.Address
 		c.n.auth.SetSiweDomains(strings.ToLower(grpAddr.Hex()), nil)
 	} else {
 		c.n.auth.SetSiweDomains(strings.ToLower(grpAddr.Hex()), doms)
+		// Log at startup as well as on SiweDomainsSet. Only the event handler
+		// logged, so a list loaded at boot left no trace — which is how the
+		// refresh bug (ee85d75) stayed quiet: the chain said one thing, the node
+		// believed another, and nothing on either side said so. A node's
+		// accepted domains are worth being able to read back from the journal
+		// without inferring them from restart timestamps.
+		c.log.Info("chain: siwe domains loaded",
+			zap.String("group", strings.ToLower(grpAddr.Hex())),
+			zap.Strings("domains", doms))
 	}
 
 	return &GroupInfo{

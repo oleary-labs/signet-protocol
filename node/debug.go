@@ -45,15 +45,31 @@ type debugStats struct {
 // groupLiveness reports a group's membership health and the per-scheme signer
 // counts derived from its threshold.
 type groupLiveness struct {
-	GroupID   string       `json:"group_id"`
-	Threshold int          `json:"threshold"`
-	Members   int          `json:"members"`
-	Healthy   int          `json:"healthy"`
-	NeedFROST int          `json:"need_frost"`
-	NeedECDSA int          `json:"need_ecdsa"`
-	CanFROST  bool         `json:"can_sign_frost"`
-	CanECDSA  bool         `json:"can_sign_ecdsa"`
-	Peers     []PeerStatus `json:"peers"`
+	GroupID   string `json:"group_id"`
+	Threshold int    `json:"threshold"`
+	Members   int    `json:"members"`
+	Healthy   int    `json:"healthy"`
+	NeedFROST int    `json:"need_frost"`
+	NeedECDSA int    `json:"need_ecdsa"`
+	CanFROST  bool   `json:"can_sign_frost"`
+	CanECDSA  bool   `json:"can_sign_ecdsa"`
+
+	// SiweDomains is the accepted ERC-4361 domain list this node currently
+	// holds for the group, as loaded from the group contract.
+	//
+	// Reported so a fleet can be checked against the chain from outside. The
+	// refresh bug (ee85d75) was quiet precisely because nothing exposed this:
+	// executeSiweDomains updated the chain, nodes went on serving the list they
+	// booted with, every operator watching the transaction saw it succeed, and
+	// no session could be minted under the new domain. Comparing this against
+	// siweDomains() on the contract turns that from an inference about restart
+	// timestamps into one request per node.
+	//
+	// Empty means the resolver scheme is disabled for this group — never "any
+	// domain". Distinguishing those two is the whole point of reporting it.
+	SiweDomains []string `json:"siwe_domains"`
+
+	Peers []PeerStatus `json:"peers"`
 }
 
 type peerInfo struct {
@@ -122,15 +138,16 @@ func (n *Node) handleDebugStats(w http.ResponseWriter, r *http.Request) {
 			needFrost := requiredSigners(CurveSecp256k1, g.Threshold)
 			needEcdsa := requiredSigners(CurveEcdsaSecp256k1, g.Threshold)
 			groupStats = append(groupStats, groupLiveness{
-				GroupID:   gid,
-				Threshold: g.Threshold,
-				Members:   len(g.Members),
-				Healthy:   healthy,
-				NeedFROST: needFrost,
-				NeedECDSA: needEcdsa,
-				CanFROST:  healthy >= needFrost,
-				CanECDSA:  healthy >= needEcdsa,
-				Peers:     peerStats,
+				GroupID:     gid,
+				Threshold:   g.Threshold,
+				Members:     len(g.Members),
+				Healthy:     healthy,
+				NeedFROST:   needFrost,
+				NeedECDSA:   needEcdsa,
+				CanFROST:    healthy >= needFrost,
+				CanECDSA:    healthy >= needEcdsa,
+				SiweDomains: n.auth.SiweDomains(gid),
+				Peers:       peerStats,
 			})
 		}
 		n.groupsMu.RUnlock()

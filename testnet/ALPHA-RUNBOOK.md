@@ -631,6 +631,20 @@ ssh -L 8080:127.0.0.1:8080 <user>@<node> -N &
 curl -s http://127.0.0.1:8080/debug/stats | jq '.groups'
 ```
 
+`.groups[].siwe_domains` is the accepted ERC-4361 domain list each node actually
+holds. Check it against the contract whenever a domain change has been executed:
+
+```bash
+cast call <group> 'siweDomains()(string[])' --rpc-url "$ETH_RPC_URL"
+```
+
+They must agree on every node. A node serving a stale list is silent — the
+change lands on-chain, every operator watching the transaction sees it succeed,
+and no session can be minted under the new domain until that node restarts. That
+was a real bug (`ee85d75`, fixed) and this is how it would be caught next time
+rather than inferred from restart timestamps. An empty list means the resolver
+scheme is disabled for that group; it never means "any domain".
+
 ```json
 { "threshold": 3, "members": 6, "healthy": 6,
   "need_frost": 3, "need_ecdsa": 5,

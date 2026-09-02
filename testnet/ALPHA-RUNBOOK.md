@@ -868,7 +868,18 @@ old node never calls it at all. So there is no window in which anything
 regresses, in either order.
 
 Nodes pick up an executed change on their next chain poll — `chain_poll_secs`,
-default 60s.
+default 60s — **provided they are running a build that watches `SiweDomainsSet`.**
+
+That qualifier is not hypothetical. The event was emitted by the contract from
+the start but not watched by the node until the fix, so `SetSiweDomains` was
+reachable only from group load: the list was read once at startup and never
+again. Executing a domain change updated the chain, looked correct to everyone
+watching the transaction, and changed nothing on any node. There is no error to
+notice — the domain reads as configured and no session can be minted under it.
+
+If in doubt, restart the node: startup always re-reads. Confirm the build from
+`/v1/info` first, since a node predating the fix will never converge on its own
+however long you wait.
 
 ---
 

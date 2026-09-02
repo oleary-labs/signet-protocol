@@ -1,6 +1,8 @@
 package node
 
 import (
+	"os"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -41,6 +43,7 @@ func TestWatchedTopicsCoversAllEvents(t *testing.T) {
 		"AuthKeyAdded":           grpABI.Events["AuthKeyAdded"].ID,
 		"AuthKeyRemoved":         grpABI.Events["AuthKeyRemoved"].ID,
 		"AuthResolverSet":        grpABI.Events["AuthResolverSet"].ID,
+		"SiweDomainsSet":         grpABI.Events["SiweDomainsSet"].ID,
 		"ReshareRequested":       grpABI.Events["ReshareRequested"].ID,
 	}
 	if len(topics) != len(want) {
@@ -151,5 +154,88 @@ func TestHeadCacheReusesRecentReadAndNeverGoesBackwards(t *testing.T) {
 	c.headCache[chainID] = headEntry{num: 105, at: time.Now().Add(-2 * headCacheTTL)}
 	if e := c.headCache[chainID]; time.Since(e.at) < headCacheTTL {
 		t.Fatal("expected entry to be considered stale")
+	}
+}
+
+// Every event SignetGroup declares must be either watched or explicitly listed
+// as ignored, with a reason.
+//
+// This exists because SiweDomainsSet was not. The domain list was read once at
+// group load and never again, so executing a timelocked domain change updated
+// the chain, satisfied every operator watching the transaction, and changed
+// nothing on any node until an unrelated restart. Nothing failed; the feature
+// was simply inert. Config the node caches needs a refresh path, and "we
+// remembered to add one" is not a property a reader can check.
+//
+// The existing topic test cannot catch this. It compares watchedTopics against
+// a hand-written list, so an event missing from both is consistent with itself.
+// Ground truth has to come from outside the node package, and the contract
+// interface is the closest thing in the repo that is not a build artifact.
+//
+// The parse is deliberately crude — a regex over the interface source rather
+// than a compiled ABI — because requiring `forge build` before `go test` would
+// couple the two toolchains for a check whose whole value is that it always
+// runs. It costs a false failure if someone writes an event declaration across
+// two lines, which is a cheap and obvious failure to fix.
+func TestEveryContractEventIsWatchedOrExplicitlyIgnored(t *testing.T) {
+	const ifacePath = "../contracts/contracts/interfaces/ISignetGroup.sol"
+
+	src, err := os.ReadFile(ifacePath)
+	if err != nil {
+		t.Skipf("contract interface not readable (%v) — skipping", err)
+	}
+
+	// Events the node deliberately does not react to. Adding an entry here is a
+	// decision that should be defensible in review; the reason is the point.
+	ignored := map[string]string{
+		"NodeInvited":           "membership is acted on at NodeJoined, once consent has actually happened",
+		"NodeDeclined":          "no local state changes when an invite is refused",
+		"RemovalQueued":         "queuing starts a timelock; the node reacts to NodeRemoved when it fires",
+		"RemovalCancelled":      "nothing was applied at queue time, so nothing is undone",
+		"AuthResolverQueued":    "timelocked; AuthResolverSet is the event that means it took effect",
+		"AuthResolverCancelled": "nothing was applied at queue time",
+		"SiweDomainsQueued":     "timelocked; SiweDomainsSet is the event that means it took effect",
+		"SiweDomainsCancelled":  "nothing was applied at queue time",
+		"ManagerTransferred":    "the node does not cache the manager; group config reads are unauthenticated",
+	}
+
+	factABI, grpABI := testABIs(t)
+	watched := make(map[common.Hash]bool)
+	for _, h := range watchedTopics(factABI, grpABI) {
+		watched[h] = true
+	}
+
+	re := regexp.MustCompile(`(?m)^\s*event\s+([A-Za-z0-9_]+)`)
+	matches := re.FindAllStringSubmatch(string(src), -1)
+	if len(matches) == 0 {
+		t.Fatalf("parsed no events out of %s — the regex or the file layout changed", ifacePath)
+	}
+
+	for _, m := range matches {
+		name := m[1]
+		if reason, ok := ignored[name]; ok {
+			if reason == "" {
+				t.Errorf("event %s is ignored with no reason given", name)
+			}
+			if _, inABI := grpABI.Events[name]; inABI {
+				t.Errorf("event %s is listed as ignored but is present in the node's ABI — "+
+					"decide which it is", name)
+			}
+			continue
+		}
+
+		ev, ok := grpABI.Events[name]
+		if !ok {
+			t.Errorf("event %s is declared by SignetGroup but is absent from the node's "+
+				"embedded ABI, and is not listed as deliberately ignored.\n"+
+				"  If the node should react to it: add it to groupABIJSON, to watchedTopics, "+
+				"and handle it in handleGroupLogs.\n"+
+				"  If it should not: add it to `ignored` above with the reason.", name)
+			continue
+		}
+		if !watched[ev.ID] {
+			t.Errorf("event %s is in the node's ABI but not in watchedTopics, so it can be "+
+				"decoded but will never be fetched", name)
+		}
 	}
 }

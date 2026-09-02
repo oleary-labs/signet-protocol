@@ -297,7 +297,10 @@ $("go1").onclick = async () => {
 $("go2").onclick = async () => {
   try {
     await send(DATA_EXEC, "executeSiweDomains");
-    log("Nodes pick this up on their next chain poll (chain_poll_secs, default 60s).");
+    log("Applied on-chain. Nodes on a build that watches SiweDomainsSet pick it up\n" +
+        "on their next chain poll (~60s). Older builds read the list only at startup\n" +
+        "and will keep enforcing the old one until restarted — confirm the node build\n" +
+        "before assuming this is live.");
     $("go2").disabled = true;
   } catch (e) { log("Error: " + (e && e.message ? e.message : String(e)), "err"); }
 };

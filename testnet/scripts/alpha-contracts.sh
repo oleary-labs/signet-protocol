@@ -1104,7 +1104,11 @@ cmd_siwe_domains() {
         _send "$onchain_manager" "$MANAGER_KEY" \
             "$group" 'executeSiweDomains()' >/dev/null
         info "Applied. The group now accepts: $(_read_domains)"
-        echo "    Nodes pick this up on their next chain poll (chain_poll_secs, default 60s)."
+        echo "    Nodes on a build that watches SiweDomainsSet pick this up on their next"
+        echo "    chain poll (chain_poll_secs, default 60s). Builds before that event was"
+        echo "    watched read the list ONLY at startup and will keep enforcing whatever"
+        echo "    they loaded when they booted — restart them, or the change is inert."
+        echo "    Check /v1/info against a build that has the handler."
         ;;
 
     cancel)

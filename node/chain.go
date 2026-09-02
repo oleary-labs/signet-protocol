@@ -42,6 +42,7 @@ const (
 		{"name":"AuthKeyAdded","type":"event","inputs":[{"name":"keyHash","type":"bytes32","indexed":true},{"name":"pubkey","type":"bytes","indexed":false}],"anonymous":false},
 		{"name":"AuthKeyRemoved","type":"event","inputs":[{"name":"keyHash","type":"bytes32","indexed":true},{"name":"pubkey","type":"bytes","indexed":false}],"anonymous":false},
 		{"name":"AuthResolverSet","type":"event","inputs":[{"name":"chainId","type":"uint64","indexed":false},{"name":"resolver","type":"address","indexed":true},{"name":"requireCanonicalSubject","type":"bool","indexed":false}],"anonymous":false},
+		{"name":"SiweDomainsSet","type":"event","inputs":[{"name":"domains","type":"string[]","indexed":false}],"anonymous":false},
 		{"name":"ReshareRequested","type":"event","inputs":[{"name":"requestedBy","type":"address","indexed":true}],"anonymous":false}
 	]`
 
@@ -222,7 +223,8 @@ func newChainClient(cfg *Config, h *network.Host, n *Node, log *zap.Logger) (*Ch
 func watchedTopics(factABI, grpABI abi.ABI) []common.Hash {
 	factEvents := []string{"NodeActivatedInGroup", "NodeDeactivatedInGroup"}
 	grpEvents := []string{"NodeJoined", "NodeRemoved", "IssuerAdded", "IssuerRemoved",
-		"AuthKeyAdded", "AuthKeyRemoved", "AuthResolverSet", "ReshareRequested"}
+		"AuthKeyAdded", "AuthKeyRemoved", "AuthResolverSet", "SiweDomainsSet",
+		"ReshareRequested"}
 
 	out := make([]common.Hash, 0, len(factEvents)+len(grpEvents))
 	for _, name := range factEvents {
@@ -641,6 +643,7 @@ func (c *ChainClient) handleGroupLogs(ctx context.Context, grpAddr common.Addres
 	authKeyAddedID := c.grpABI.Events["AuthKeyAdded"].ID
 	authKeyRemovedID := c.grpABI.Events["AuthKeyRemoved"].ID
 	authResolverSetID := c.grpABI.Events["AuthResolverSet"].ID
+	siweDomainsSetID := c.grpABI.Events["SiweDomainsSet"].ID
 	reshareRequestedID := c.grpABI.Events["ReshareRequested"].ID
 
 	hexGrp := strings.ToLower(grpAddr.Hex())
@@ -791,6 +794,28 @@ func (c *ChainClient) handleGroupLogs(ctx context.Context, grpAddr common.Addres
 					zap.String("group", hexGrp),
 					zap.String("resolver", cfg.Resolver.Hex()),
 					zap.Uint64("chainId", cfg.ChainID))
+			}
+
+		case siweDomainsSetID:
+			// The accepted domain list changed (timelocked executeSiweDomains
+			// fired). Re-read the getter rather than decoding the event, for the
+			// same reason as AuthResolverSet above: the getter is authoritative
+			// and the startup path already goes through it, so there is one
+			// decoding of this list rather than two that can disagree.
+			//
+			// Without this case the list was read at startup and never again.
+			// The failure is quiet in the worst way: the change lands on-chain,
+			// every operator sees it applied, and every node goes on enforcing
+			// the list it loaded when it booted — so a domain looks configured
+			// and no session can be minted under it until an unrelated restart.
+			if doms, err := c.callSiweDomains(ctx, grpAddr); err != nil {
+				c.log.Warn("chain: siweDomains on SiweDomainsSet",
+					zap.String("group", hexGrp), zap.Error(err))
+			} else {
+				c.n.auth.SetSiweDomains(hexGrp, doms)
+				c.log.Info("chain: siwe domains set",
+					zap.String("group", hexGrp),
+					zap.Strings("domains", doms))
 			}
 
 		case reshareRequestedID:

@@ -117,7 +117,23 @@ type GroupAuth struct {
 	cache     *jwk.Cache
 	circuitVK []byte // verification key for the jwt_auth circuit (bb format)
 	log       *zap.Logger
+
+	// OIDC discovery retry throttle (see jwksURIFor). Keyed by issuer, and only
+	// ever written for issuers some group trusts, so it is bounded by the trust
+	// lists rather than by what callers send.
+	discMu       sync.Mutex
+	discAttempts map[string]time.Time
+	now          func() time.Time // nil = time.Now; replaced in tests
 }
+
+const (
+	// jwksRediscoverInterval is the minimum gap between OIDC discovery retries
+	// for one issuer whose JWKS URI is unknown.
+	jwksRediscoverInterval = 30 * time.Second
+	// jwksDiscoveryTimeout bounds a single retry. discoverJWKSURI uses
+	// http.DefaultClient, which has no timeout of its own.
+	jwksDiscoveryTimeout = 5 * time.Second
+)
 
 // ResolverConfig is the in-memory copy of a group's on-chain auth resolver
 // binding (the auth lane). A zero Resolver address means no resolver is set.
@@ -653,10 +669,11 @@ func (g *GroupAuth) ValidateJWTForSession(ctx context.Context, groupID string, t
 	}
 
 	// Steps 3–4: signature + expiry verification.
-	if matched.JwksURI == "" {
-		return nil, fmt.Errorf("no JWKS URI for issuer %s", iss)
+	jwksURI, err := g.jwksURIFor(ctx, groupID, iss)
+	if err != nil {
+		return nil, err
 	}
-	keySet, err := g.cache.Get(ctx, matched.JwksURI)
+	keySet, err := g.cache.Get(ctx, jwksURI)
 	if err != nil {
 		return nil, fmt.Errorf("fetch JWKS: %w", err)
 	}
@@ -845,29 +862,107 @@ func discoverJWKSURI(ctx context.Context, issuer string) (string, error) {
 	return doc.JWKSURI, nil
 }
 
+// jwksURIFor returns the JWKS URI for an issuer the group trusts, retrying OIDC
+// discovery when none is known.
+//
+// Discovery otherwise runs only at startup and on IssuerAdded, and a failure
+// there used to be permanent: the issuer was stored with an empty URI and every
+// login for it failed until the node restarted. An issuer added to a group
+// before its site was live stayed broken, surfacing only as a generic 401.
+// Retrying here lets it heal on the next login instead.
+//
+// Retries are throttled per issuer, since the result depends on nothing else,
+// and the slot is claimed before the fetch, so a burst of logins against a
+// broken issuer costs one outbound request per interval rather than one each.
+// /v1/auth is unauthenticated; without that bound this would let any caller
+// make every node fetch from the issuer's site on demand.
+func (g *GroupAuth) jwksURIFor(ctx context.Context, groupID, issuer string) (string, error) {
+	g.mu.RLock()
+	uri, trusted := "", false
+	for _, iss := range g.groups[groupID] {
+		if iss.Issuer == issuer {
+			uri, trusted = iss.JwksURI, true
+			break
+		}
+	}
+	g.mu.RUnlock()
+	if !trusted {
+		return "", fmt.Errorf("untrusted issuer: %s", issuer)
+	}
+	if uri != "" {
+		return uri, nil
+	}
+
+	if !g.claimDiscoveryRetry(issuer) {
+		return "", fmt.Errorf("no JWKS URI for issuer %s (discovery failed; retrying at most every %s)",
+			issuer, jwksRediscoverInterval)
+	}
+
+	// Detached from the caller's cancellation: a success serves every later
+	// login, so a client hanging up should not waste the throttle slot.
+	dctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), jwksDiscoveryTimeout)
+	defer cancel()
+	uri, err := discoverJWKSURI(dctx, issuer)
+	if err != nil {
+		g.log.Warn("auth: OIDC discovery retry failed", zap.String("issuer", issuer), zap.Error(err))
+		return "", fmt.Errorf("no JWKS URI for issuer %s: %w", issuer, err)
+	}
+
+	g.mu.Lock()
+	// Every group trusting this issuer shares the fix. Copy-on-write, because
+	// readers take the slice under RLock and then iterate it unlocked.
+	for gid, issuers := range g.groups {
+		var updated []IssuerInfo
+		for i := range issuers {
+			if issuers[i].Issuer == issuer && issuers[i].JwksURI == "" {
+				if updated == nil {
+					updated = append([]IssuerInfo(nil), issuers...)
+				}
+				updated[i].JwksURI = uri
+			}
+		}
+		if updated != nil {
+			g.groups[gid] = updated
+		}
+	}
+	if err := g.cache.Register(uri, jwk.WithMinRefreshInterval(1*time.Hour)); err != nil {
+		g.log.Warn("auth: register JWKS URI", zap.String("uri", uri), zap.Error(err))
+	}
+	g.mu.Unlock()
+
+	g.log.Info("auth: OIDC discovery recovered", zap.String("issuer", issuer), zap.String("jwks_uri", uri))
+	return uri, nil
+}
+
+// claimDiscoveryRetry reports whether a discovery retry for issuer may run now,
+// and if so records it.
+func (g *GroupAuth) claimDiscoveryRetry(issuer string) bool {
+	now := time.Now()
+	if g.now != nil {
+		now = g.now()
+	}
+	g.discMu.Lock()
+	defer g.discMu.Unlock()
+	if last, ok := g.discAttempts[issuer]; ok && now.Sub(last) < jwksRediscoverInterval {
+		return false
+	}
+	if g.discAttempts == nil {
+		g.discAttempts = make(map[string]time.Time)
+	}
+	g.discAttempts[issuer] = now
+	return true
+}
+
 // verifyJWKSModulus checks that the given RSA modulus (big-endian bytes) matches
 // one of the RSA keys in the cached JWKS for the given issuer. This prevents a
 // client from using a fake RSA key to generate proofs for arbitrary claims.
 func (g *GroupAuth) verifyJWKSModulus(ctx context.Context, groupID, issuer string, modulus []byte) error {
-	g.mu.RLock()
-	issuers := g.groups[groupID]
-	g.mu.RUnlock()
-
-	var matched *IssuerInfo
-	for i := range issuers {
-		if issuers[i].Issuer == issuer {
-			matched = &issuers[i]
-			break
-		}
-	}
-	if matched == nil {
-		return fmt.Errorf("untrusted issuer: %s", issuer)
-	}
-	if matched.JwksURI == "" {
-		return fmt.Errorf("no JWKS URI for issuer %s", issuer)
+	jwksURI, err := g.jwksURIFor(ctx, groupID, issuer)
+	if err != nil {
+		return err
 	}
 
-	keySet, err := g.cache.Get(ctx, matched.JwksURI)
+	keySet, err := g.cache.Get(ctx, jwksURI)
 	if err != nil {
 		return fmt.Errorf("fetch JWKS: %w", err)
 	}

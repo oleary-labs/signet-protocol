@@ -166,6 +166,23 @@ chain_poll_secs: 60
 # and reports a threshold error rather than an auth one. An empty on-chain list
 # leaves the scheme disabled, which is the same fail-closed default as before.
 #
-# Only needed if a group's resolver lives on a chain other than eth_rpc's.
-# chain_rpcs:
-#   8453: "https://base-mainnet.example/v2/KEY"
+# Needed when a group's resolver lives on a chain other than eth_rpc's. Every
+# member node must have reach to that chain: /v1/auth forwards the proof to the
+# whole group and each node calls resolve() itself, so a node without an RPC
+# entry refuses to establish the session. The group then signs or fails
+# depending on which signers get selected, and reports a threshold error rather
+# than an auth one. Add the chain here for ALL operators before the resolver is
+# executed on-chain, not after.
+#
+# 42220 (Celo) serves the auth resolver bound to the 6-node alpha group
+# (0x86fe...ac59), 0x903409cB9248b1f0047c5F967a3db8E03Df3E11a. Without it that
+# group's SIWE logins fail with "no RPC configured for chain 42220".
+#
+# forno is Celo's public endpoint: no key, no account, and shared by every
+# operator — which is the trade being made. It is a single provider that all six
+# nodes depend on for the same answer, so an outage takes SIWE auth for this
+# group down everywhere at once, and a wrong answer is not caught by
+# disagreement. Acceptable while the alpha proves the path; a per-operator
+# endpoint is the fix, and costs nothing but a URL each.
+chain_rpcs:
+  42220: "https://forno.celo.org"

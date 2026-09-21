@@ -22,6 +22,20 @@ const (
 
 	// cleanupInterval is how often expired sessions and stale nonces are pruned.
 	cleanupInterval = 60 * time.Second
+
+	// expiredSessionGrace is how long an expired session is kept past Exp.
+	//
+	// It grants no access: every reader checks Exp, and the two that exist
+	// (validateSessionRequest, the coord session cache) reject an expired entry
+	// before using it. Keeping the row is purely so an expired session can be
+	// reported as expired rather than as one that never existed.
+	//
+	// The distinction is worth a little memory. On the alpha (2026-09-20) a UI
+	// reused a session for 90 minutes after its JWT expired; the reaper had
+	// already dropped it, so every retry answered "session not found; call POST
+	// /v1/auth first", which reads as an auth that never happened. It had
+	// happened — an hour and a half earlier.
+	expiredSessionGrace = 10 * time.Minute
 )
 
 // SessionInfo holds the cached identity claims from a verified auth session.
@@ -106,7 +120,7 @@ func (s *SessionStore) cleanup() {
 	defer s.mu.Unlock()
 	now := time.Now()
 	for k, info := range s.sessions {
-		if now.After(info.Exp) {
+		if now.After(info.Exp.Add(expiredSessionGrace)) {
 			delete(s.sessions, k)
 		}
 	}

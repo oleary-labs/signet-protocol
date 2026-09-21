@@ -344,7 +344,11 @@ func (n *Node) handleCoordStream(s libp2pnet.Stream) {
 		sessionHex := sessionPubToHex(msg.Session.SessionPub)
 		cached, ok := n.sessions.Get(sessionHex)
 		if !ok || time.Now().After(cached.Exp) {
-			n.log.Warn("coord: session not found or expired",
+			reason := "session not found"
+			if ok {
+				reason = "session expired " + time.Since(cached.Exp).Round(time.Second).String() + " ago"
+			}
+			n.log.Warn("coord: "+reason,
 				zap.String("group_id", msg.GroupID),
 				zap.String("session_pub", sessionHex))
 			s.Write([]byte{coordNACK})

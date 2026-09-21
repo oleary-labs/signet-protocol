@@ -1113,9 +1113,14 @@ func (n *Node) validateSessionRequest(
 	if !ok {
 		return nil, "", &httpErr{http.StatusUnauthorized, "session not found; call POST /v1/auth first"}
 	}
-	if time.Now().After(info.Exp) {
-		n.sessions.Delete(pubHex)
-		return nil, "", &httpErr{http.StatusUnauthorized, "session expired; re-authenticate"}
+	if now := time.Now(); now.After(info.Exp) {
+		// Deliberately not deleted here: the entry lives for expiredSessionGrace
+		// so a client retrying keeps getting this answer instead of falling back
+		// to "session not found" on the second attempt, which is the same
+		// misdiagnosis one request later. cleanup() drops it.
+		return nil, "", &httpErr{http.StatusUnauthorized, fmt.Sprintf(
+			"session expired %s ago; re-authenticate",
+			now.Sub(info.Exp).Round(time.Second))}
 	}
 
 	// Delegation token sessions are locked to a specific key. The client

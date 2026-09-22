@@ -124,9 +124,23 @@ func TestVerifySIWE_WrongChainIDRejected(t *testing.T) {
 	msg, sig := buildSignedSIWE(t, priv, map[string]interface{}{
 		"resources": sessionResource(t, sessionPub),
 	})
-	// Resolver expects chain 1, message is chain 8453.
-	if _, err := verifySIWE(msg, sig, testSIWEDomain, 1, sessionPub); err == nil {
+	// The group's home chain is 1, the message claims 8453.
+	_, err := verifySIWE(msg, sig, testSIWEDomain, 1, sessionPub)
+	if err == nil {
 		t.Fatal("expected rejection on chainID mismatch")
+	}
+
+	// The wording is load-bearing. This error used to call the expected value the
+	// "resolver chain id" while being handed the home chain, which told the
+	// reader to sign with the resolver's chain — the very mistake being
+	// reported. SFLuv's SDK copied that inversion into its own guidance, so the
+	// text is the fix, not a nicety: naming the resolver here is a regression
+	// even though the check itself would still pass its test.
+	if strings.Contains(err.Error(), "resolver chain id") {
+		t.Fatalf("error names the resolver's chain as expected value: %v", err)
+	}
+	if !strings.Contains(err.Error(), "group home chain id") {
+		t.Fatalf("error should name the group's home chain: %v", err)
 	}
 }
 

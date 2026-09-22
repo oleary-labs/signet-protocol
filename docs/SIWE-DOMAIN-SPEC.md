@@ -190,9 +190,20 @@ not this one used hopefully.
 ## 6. Chain ID and wildcards
 
 **Decision — decouple the SIWE `Chain ID` from the resolver; pin it to the
-group's home chain.** Today the node passes the resolver's chain
-(`resolver.go:68` hands `cfg.ChainID` to `verifySIWE`), which makes a user-facing
-message describe where an identity contract happens to be deployed.
+group's home chain.** **Implemented:** `resolver.go` hands
+`n.chain.HomeChainID()` to `verifySIWE`. This paragraph used to say the node
+passed the resolver's chain (`cfg.ChainID`) and read as current behaviour long
+after the decision shipped, which is part of how the confusion below survived.
+
+The decision shipped but its *error message* did not. `verifySIWE` reported
+`siwe chain id %d != resolver chain id %d` while passing the home chain, so the
+one artifact a client author actually reads told them to sign with the
+resolver's chain. SFLuv's SDK repeated the same inversion in its
+`chain_id_mismatch` guidance, and because their sanitizer stripped node error
+text, the two wrong descriptions were mutually confirming and the code's own
+comment — which was correct throughout — never got consulted. On 2026-09-22 an
+auth from a throwaway address failed with chainId 42220 instead of reaching
+`resolve()` at all. Fixed in the node; the SDK text is theirs to correct.
 
 That is the wrong axis. ERC-4361's `chainId` describes the *account's* context —
 it is where an ERC-1271 contract account's `isValidSignature` must be called — so

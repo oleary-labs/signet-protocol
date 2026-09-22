@@ -6,6 +6,12 @@ Ethereum mainnet during the alpha's first load test, 2026-08-25.
 This documents the race, the evidence, the fix, and what is deliberately still
 open.
 
+**This is one instance of a class.** The same shape recurred on 2026-09-22 with
+sessions instead of keys, and was diagnosed from scratch because the fix here was
+applied per-instance. [`PROPAGATION-RACES.md`](PROPAGATION-RACES.md) names the
+class, the rule that follows from it, and what is still exposed — including that
+keygen itself still answers before participants acknowledge.
+
 ---
 
 ## Symptom

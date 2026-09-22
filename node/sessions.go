@@ -36,6 +36,17 @@ const (
 	// /v1/auth first", which reads as an auth that never happened. It had
 	// happened — an hour and a half earlier.
 	expiredSessionGrace = 10 * time.Minute
+
+	// sessionSettleTimeout bounds how long a participant waits for a session it
+	// has not seen yet before rejecting an authenticated coord message. See
+	// SessionStore.Await and docs/PROPAGATION-RACES.md.
+	sessionSettleTimeout = 2 * time.Second
+
+	// sessionWaiterMaxAge bounds how long an unfulfilled waiter channel is kept.
+	// A waiter exists for a session that may never arrive (a bogus session_pub,
+	// or an initiator that died mid-broadcast), so without this the map would
+	// grow with every such attempt.
+	sessionWaiterMaxAge = 30 * time.Second
 )
 
 // SessionInfo holds the cached identity claims from a verified auth session.
@@ -70,20 +81,78 @@ type SessionStore struct {
 	mu       sync.RWMutex
 	sessions map[string]*SessionInfo // hex(session_pub) → SessionInfo
 	nonces   map[string]time.Time    // seen nonces → first-seen time
+
+	// waiters lets a participant block briefly for a session that is still in
+	// flight, rather than rejecting the first operation that races ahead of the
+	// msgAuth broadcast. One channel per session_pub, shared by all waiters and
+	// closed by Put.
+	waiters map[string]*sessionWaiter
+}
+
+// sessionWaiter is a broadcast channel for one awaited session, plus when it was
+// created so an unfulfilled waiter can be reaped.
+type sessionWaiter struct {
+	ch      chan struct{}
+	created time.Time
 }
 
 func newSessionStore() *SessionStore {
 	return &SessionStore{
 		sessions: make(map[string]*SessionInfo),
 		nonces:   make(map[string]time.Time),
+		waiters:  make(map[string]*sessionWaiter),
 	}
 }
 
-// Put stores a session binding. Overwrites if the same session_pub exists.
+// Put stores a session binding. Overwrites if the same session_pub exists, and
+// wakes anything waiting in Await for this session.
 func (s *SessionStore) Put(sessionPubHex string, info *SessionInfo) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.sessions[sessionPubHex] = info
+	if w, ok := s.waiters[sessionPubHex]; ok {
+		close(w.ch)
+		delete(s.waiters, sessionPubHex)
+	}
+}
+
+// Await returns the session for sessionPubHex, waiting up to timeout for it to
+// arrive if it is not present yet.
+//
+// This exists for one race: /v1/auth establishes the session on the initiator
+// and forwards it to the other members, and an operation sent to those members
+// can arrive before the forward does. Rejecting immediately costs the whole
+// operation — an excluded signer, and for ECDSA at T=3 of 6 only one exclusion
+// is survivable. Waiting costs milliseconds.
+//
+// A session that genuinely does not exist still returns false, just timeout
+// later. Callers are peers in the group rather than arbitrary clients, so the
+// wait is not an amplification surface.
+func (s *SessionStore) Await(ctx context.Context, sessionPubHex string, timeout time.Duration) (*SessionInfo, bool) {
+	s.mu.Lock()
+	if info, ok := s.sessions[sessionPubHex]; ok {
+		s.mu.Unlock()
+		return info, true
+	}
+	w, ok := s.waiters[sessionPubHex]
+	if !ok {
+		w = &sessionWaiter{ch: make(chan struct{}), created: time.Now()}
+		s.waiters[sessionPubHex] = w
+	}
+	s.mu.Unlock()
+
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case <-w.ch:
+	case <-timer.C:
+	case <-ctx.Done():
+	}
+
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	info, ok := s.sessions[sessionPubHex]
+	return info, ok
 }
 
 // Get looks up a session by compressed public key hex. Returns nil, false if
@@ -124,6 +193,16 @@ func (s *SessionStore) cleanup() {
 			delete(s.sessions, k)
 		}
 	}
+	// Unfulfilled waiters: close them so anything still blocked wakes, re-checks
+	// and reports the session missing, which is the truth once it has not
+	// arrived for this long.
+	for k, w := range s.waiters {
+		if now.Sub(w.created) > sessionWaiterMaxAge {
+			close(w.ch)
+			delete(s.waiters, k)
+		}
+	}
+
 	cutoff := now.Add(-nonceRetention)
 	for k, seen := range s.nonces {
 		if seen.Before(cutoff) {

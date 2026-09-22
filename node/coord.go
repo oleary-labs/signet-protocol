@@ -340,9 +340,19 @@ func (n *Node) handleCoordStream(s libp2pnet.Stream) {
 			return
 		}
 
-		// Look up cached session.
+		// Look up the cached session, waiting briefly if it has not arrived yet.
+		//
+		// /v1/auth establishes the session here via a separate msgAuth
+		// broadcast, and this message can win the race against it — observed on
+		// the alpha 2026-09-22, where two members rejected a sign coord and
+		// then established the very same session 29ms and 45ms later. That cost
+		// the whole signature: exclusions are per-attempt, and ECDSA at T=3 of 6
+		// needs 5 signers, so it survives exactly one. The initiator now waits
+		// for the broadcast before answering the client, which closes the race
+		// at its source; this is the second line of defence, for a member that
+		// acknowledged late or was slow to schedule the handler.
 		sessionHex := sessionPubToHex(msg.Session.SessionPub)
-		cached, ok := n.sessions.Get(sessionHex)
+		cached, ok := n.sessions.Await(n.ctx, sessionHex, sessionSettleTimeout)
 		if !ok || time.Now().After(cached.Exp) {
 			reason := "session not found"
 			if ok {

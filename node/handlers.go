@@ -2,9 +2,11 @@ package node
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math/big"
 	"net/http"
@@ -30,6 +32,15 @@ import (
 // background goroutine with nobody waiting on it; an HTTP caller is holding a
 // connection open, so it gets the tighter bound.
 const keygenSettleTimeout = 2 * time.Second
+
+// authBroadcastTimeout bounds how long /v1/auth waits for the session to reach
+// the rest of the group before answering the client.
+//
+// Auth is rare — once per session — and signing is not, so this is the right
+// place to spend latency. A broadcast to five members across three clouds costs
+// low tens of milliseconds, so this is ample headroom; the worst case is a
+// member that is down, where the wait is the cost of learning so.
+const authBroadcastTimeout = 5 * time.Second
 
 func (n *Node) handleHealth(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
@@ -200,8 +211,9 @@ func (n *Node) handleAuth(w http.ResponseWriter, r *http.Request) {
 			zap.String("session_pub", pubHex))
 
 		// Forward session to participants.
+		established, members := 1, 1
 		n.groupsMu.RLock()
-		grpCert, grpCertOk := n.groups[req.GroupID]
+		_, grpCertOk := n.groups[req.GroupID]
 		n.groupsMu.RUnlock()
 		if grpCertOk {
 			ap := &AuthProof{
@@ -211,23 +223,16 @@ func (n *Node) handleAuth(w http.ResponseWriter, r *http.Request) {
 				AuthKeyPub:    authKeyBytes,
 				CertSignature: sigBytes,
 			}
-			members := tss.NewPartyIDSlice(grpCert.Members)
-			go func() {
-				if err := n.broadcastCoord(n.ctx, members, coordMsg{
-					Type:    msgAuth,
-					GroupID: req.GroupID,
-					Auth:    ap,
-				}); err != nil {
-					n.log.Warn("auth: failed to forward cert session to participants", zap.Error(err))
-				}
-			}()
+			established, members = n.establishSessionGroupWide(req.GroupID, "authkey", ap)
 		}
 
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]any{
-			"status":     "ok",
-			"identity":   identity,
-			"expires_at": int64(cert.Expiry),
+			"status":      "ok",
+			"identity":    identity,
+			"expires_at":  int64(cert.Expiry),
+			"established": established,
+			"members":     members,
 		})
 		return
 	}
@@ -286,8 +291,9 @@ func (n *Node) handleAuth(w http.ResponseWriter, r *http.Request) {
 
 		// Forward session to participants. Delegation token is self-validating
 		// so participants can independently verify it.
+		established, members := 1, 1
 		n.groupsMu.RLock()
-		grpDel, grpDelOk := n.groups[req.GroupID]
+		_, grpDelOk := n.groups[req.GroupID]
 		n.groupsMu.RUnlock()
 		if grpDelOk {
 			ap := &AuthProof{
@@ -297,25 +303,18 @@ func (n *Node) handleAuth(w http.ResponseWriter, r *http.Request) {
 				Iss:             delegateIss,
 				DelegationToken: req.DelegationToken,
 			}
-			members := tss.NewPartyIDSlice(grpDel.Members)
-			go func() {
-				if err := n.broadcastCoord(n.ctx, members, coordMsg{
-					Type:    msgAuth,
-					GroupID: req.GroupID,
-					Auth:    ap,
-				}); err != nil {
-					n.log.Warn("auth: failed to forward delegation session to participants", zap.Error(err))
-				}
-			}()
+			established, members = n.establishSessionGroupWide(req.GroupID, "delegation", ap)
 		}
 
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]any{
-			"status":     "ok",
-			"identity":   delegateIss + ":" + delegateSub,
-			"key_id":     claims.Sub,
-			"parent_key": claims.Kid,
-			"expires_at": claims.Exp,
+			"status":      "ok",
+			"established": established,
+			"members":     members,
+			"identity":    delegateIss + ":" + delegateSub,
+			"key_id":      claims.Sub,
+			"parent_key":  claims.Kid,
+			"expires_at":  claims.Exp,
 		})
 		return
 	}
@@ -363,27 +362,21 @@ func (n *Node) handleAuth(w http.ResponseWriter, r *http.Request) {
 
 		// Forward to participants so each re-runs SIWE recovery + the resolver
 		// read at the same pinned block and establishes the session itself.
+		established, members := 1, 1
 		n.groupsMu.RLock()
-		grpRes, grpResOk := n.groups[req.GroupID]
+		_, grpResOk := n.groups[req.GroupID]
 		n.groupsMu.RUnlock()
 		if grpResOk {
-			members := tss.NewPartyIDSlice(grpRes.Members)
-			go func() {
-				if err := n.broadcastCoord(n.ctx, members, coordMsg{
-					Type:    msgAuth,
-					GroupID: req.GroupID,
-					Auth:    ap,
-				}); err != nil {
-					n.log.Warn("auth: failed to forward resolver session to participants", zap.Error(err))
-				}
-			}()
+			established, members = n.establishSessionGroupWide(req.GroupID, "onchain_resolver", ap)
 		}
 
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]any{
-			"status":     "ok",
-			"identity":   verdict.Subject,
-			"expires_at": verdict.Expiry.Unix(),
+			"status":      "ok",
+			"identity":    verdict.Subject,
+			"expires_at":  verdict.Expiry.Unix(),
+			"established": established,
+			"members":     members,
 		})
 		return
 	}
@@ -443,34 +436,79 @@ func (n *Node) handleAuth(w http.ResponseWriter, r *http.Request) {
 		zap.String("sub", sub),
 		zap.String("session_pub", pubHex))
 
-	// Forward the auth proof to all other group members so they establish
-	// the session too. This is fire-and-forget — if a participant is
-	// temporarily unreachable, the first coord message they receive will
-	// fail and the client can re-auth.
-	n.groupsMu.RLock()
-	grp, grpOk := n.groups[req.GroupID]
-	n.groupsMu.RUnlock()
-	if grpOk {
-		members := tss.NewPartyIDSlice(grp.Members)
-		go func() {
-			if err := n.broadcastCoord(n.ctx, members, coordMsg{
-				Type:    msgAuth,
-				GroupID: req.GroupID,
-				Auth:    ap,
-			}); err != nil {
-				n.log.Warn("auth: failed to forward session to participants",
-					zap.String("group_id", req.GroupID),
-					zap.Error(err))
-			}
-		}()
-	}
+	// Forward the auth proof to the rest of the group and wait for it, so a 200
+	// means the group can act on this session rather than only this node.
+	established, members := n.establishSessionGroupWide(req.GroupID, "zk", ap)
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]any{
-		"status":     "ok",
-		"sub":        sub,
-		"expires_at": int64(req.Exp),
+		"status":      "ok",
+		"sub":         sub,
+		"expires_at":  int64(req.Exp),
+		"established": established,
+		"members":     members,
 	})
+}
+
+// establishSessionGroupWide forwards a verified auth proof to every group member
+// and waits for the result, returning how many members hold the session
+// (including this one) and the group size.
+//
+// It is deliberately synchronous. This used to be fire-and-forget, which made a
+// 200 from /v1/auth a promise the node did not keep: the client would sign
+// immediately and race its own session to the other members. On 2026-09-22 an
+// ECDSA signature failed that way — two members rejected the sign coord and
+// established the same session tens of milliseconds later, and at T=3 of 6,
+// ECDSA needs 5 signers and tolerates one loss.
+//
+// The same shape was fixed for keygen in August (docs/KEYGEN-VISIBILITY-RACE.md)
+// by having the client-facing path wait; that fix was per-instance and did not
+// generalise to sessions. See docs/PROPAGATION-RACES.md.
+//
+// A partial result is reported rather than failed: one unreachable member still
+// leaves a FROST-signable group, and refusing auth outright would turn a
+// degraded group into a dead one. The counts go back to the client so it can
+// decide — an ECDSA caller needs 2T-1 members, which it can now see before it
+// tries instead of discovering it as a 503 mid-transaction.
+func (n *Node) establishSessionGroupWide(groupID, scheme string, ap *AuthProof) (established, total int) {
+	n.groupsMu.RLock()
+	grp, ok := n.groups[groupID]
+	n.groupsMu.RUnlock()
+	if !ok {
+		// Unreachable in practice: handleAuth resolves the group first. The
+		// session exists locally, so report it as the only holder.
+		return 1, 1
+	}
+	total = len(grp.Members)
+
+	ctx, cancel := context.WithTimeout(n.ctx, authBroadcastTimeout)
+	defer cancel()
+
+	err := n.broadcastCoord(ctx, tss.NewPartyIDSlice(grp.Members), coordMsg{
+		Type:    msgAuth,
+		GroupID: groupID,
+		Auth:    ap,
+	})
+	if err == nil {
+		return total, total
+	}
+
+	failed := total - 1 // every peer, if the error carries no party list
+	var bcErr *coordBroadcastError
+	if errors.As(err, &bcErr) {
+		failed = len(bcErr.Failed)
+	}
+	established = total - failed
+	if established < 1 {
+		established = 1 // this node holds it regardless
+	}
+	n.log.Warn("auth: session not established on every member",
+		zap.String("group_id", groupID),
+		zap.String("scheme", scheme),
+		zap.Int("established", established),
+		zap.Int("members", total),
+		zap.Error(err))
+	return established, total
 }
 
 // handleKeygen runs a distributed key generation session.

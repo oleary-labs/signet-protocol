@@ -16,8 +16,8 @@ import (
 	"github.com/ethereum/go-ethereum/ethclient"
 	"go.uber.org/zap"
 
-	"signet/tss"
 	"signet/network"
+	"signet/tss"
 )
 
 const (
@@ -33,6 +33,7 @@ const (
 		{"name":"threshold","type":"function","inputs":[],"outputs":[{"name":"","type":"uint256"}],"stateMutability":"view"},
 		{"name":"getIssuers","type":"function","inputs":[],"outputs":[{"name":"","type":"tuple[]","components":[{"name":"issuer","type":"string"},{"name":"clientIds","type":"string[]"}]}],"stateMutability":"view"},
 		{"name":"getAuthKeys","type":"function","inputs":[],"outputs":[{"name":"","type":"bytes[]"}],"stateMutability":"view"},
+		{"name":"siweDomains","type":"function","inputs":[],"outputs":[{"name":"","type":"string[]"}],"stateMutability":"view"},
 		{"name":"getAuthResolver","type":"function","inputs":[],"outputs":[{"name":"","type":"tuple","components":[{"name":"chainId","type":"uint64"},{"name":"resolver","type":"address"},{"name":"requireCanonicalSubject","type":"bool"}]}],"stateMutability":"view"},
 		{"name":"NodeJoined","type":"event","inputs":[{"name":"node","type":"address","indexed":true}],"anonymous":false},
 		{"name":"NodeRemoved","type":"event","inputs":[{"name":"node","type":"address","indexed":true}],"anonymous":false},
@@ -41,6 +42,7 @@ const (
 		{"name":"AuthKeyAdded","type":"event","inputs":[{"name":"keyHash","type":"bytes32","indexed":true},{"name":"pubkey","type":"bytes","indexed":false}],"anonymous":false},
 		{"name":"AuthKeyRemoved","type":"event","inputs":[{"name":"keyHash","type":"bytes32","indexed":true},{"name":"pubkey","type":"bytes","indexed":false}],"anonymous":false},
 		{"name":"AuthResolverSet","type":"event","inputs":[{"name":"chainId","type":"uint64","indexed":false},{"name":"resolver","type":"address","indexed":true},{"name":"requireCanonicalSubject","type":"bool","indexed":false}],"anonymous":false},
+		{"name":"SiweDomainsSet","type":"event","inputs":[{"name":"domains","type":"string[]","indexed":false}],"anonymous":false},
 		{"name":"ReshareRequested","type":"event","inputs":[{"name":"requestedBy","type":"address","indexed":true}],"anonymous":false}
 	]`
 
@@ -221,7 +223,8 @@ func newChainClient(cfg *Config, h *network.Host, n *Node, log *zap.Logger) (*Ch
 func watchedTopics(factABI, grpABI abi.ABI) []common.Hash {
 	factEvents := []string{"NodeActivatedInGroup", "NodeDeactivatedInGroup"}
 	grpEvents := []string{"NodeJoined", "NodeRemoved", "IssuerAdded", "IssuerRemoved",
-		"AuthKeyAdded", "AuthKeyRemoved", "AuthResolverSet", "ReshareRequested"}
+		"AuthKeyAdded", "AuthKeyRemoved", "AuthResolverSet", "SiweDomainsSet",
+		"ReshareRequested"}
 
 	out := make([]common.Hash, 0, len(factEvents)+len(grpEvents))
 	for _, name := range factEvents {
@@ -355,10 +358,63 @@ func (c *ChainClient) buildGroupInfo(ctx context.Context, grpAddr common.Address
 		c.n.auth.SetAuthResolver(strings.ToLower(grpAddr.Hex()), cfg)
 	}
 
+	// Accepted SIWE domains. Like getAuthResolver this is new, so a group
+	// deployed against an older implementation reverts — treat that as "no
+	// domains", which disables the resolver scheme rather than opening it.
+	if doms, err := c.callSiweDomains(ctx, grpAddr); err != nil {
+		c.log.Debug("chain: siweDomains", zap.String("group", grpAddr.Hex()), zap.Error(err))
+		c.n.auth.SetSiweDomains(strings.ToLower(grpAddr.Hex()), nil)
+	} else {
+		c.n.auth.SetSiweDomains(strings.ToLower(grpAddr.Hex()), doms)
+		// Log at startup as well as on SiweDomainsSet. Only the event handler
+		// logged, so a list loaded at boot left no trace — which is how the
+		// refresh bug (ee85d75) stayed quiet: the chain said one thing, the node
+		// believed another, and nothing on either side said so. A node's
+		// accepted domains are worth being able to read back from the journal
+		// without inferring them from restart timestamps.
+		c.log.Info("chain: siwe domains loaded",
+			zap.String("group", strings.ToLower(grpAddr.Hex())),
+			zap.Strings("domains", doms))
+	}
+
 	return &GroupInfo{
 		Threshold: int(thresh.Int64()),
 		Members:   ids,
 	}, nil
+}
+
+// HomeChainID is the chain the group itself lives on — whatever ETH_RPC_URL
+// points at. Used as the expected ERC-4361 Chain ID, deliberately decoupled
+// from the resolver's chain.
+func (c *ChainClient) HomeChainID() uint64 {
+	if c == nil {
+		return 0
+	}
+	return c.homeChainID
+}
+
+// callSiweDomains reads the group's accepted SIWE domain list.
+func (c *ChainClient) callSiweDomains(ctx context.Context, grpAddr common.Address) ([]string, error) {
+	data, err := c.grpABI.Pack("siweDomains")
+	if err != nil {
+		return nil, err
+	}
+	result, err := c.eth.CallContract(ctx, ethereum.CallMsg{To: &grpAddr, Data: data}, nil)
+	if err != nil {
+		return nil, err
+	}
+	out, err := c.grpABI.Unpack("siweDomains", result)
+	if err != nil {
+		return nil, err
+	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("empty siweDomains result")
+	}
+	doms, ok := out[0].([]string)
+	if !ok {
+		return nil, fmt.Errorf("unexpected type %T for siweDomains result", out[0])
+	}
+	return doms, nil
 }
 
 // resolvePartyID fetches the node's pubkey from the factory and derives its tss.PartyID.
@@ -596,6 +652,7 @@ func (c *ChainClient) handleGroupLogs(ctx context.Context, grpAddr common.Addres
 	authKeyAddedID := c.grpABI.Events["AuthKeyAdded"].ID
 	authKeyRemovedID := c.grpABI.Events["AuthKeyRemoved"].ID
 	authResolverSetID := c.grpABI.Events["AuthResolverSet"].ID
+	siweDomainsSetID := c.grpABI.Events["SiweDomainsSet"].ID
 	reshareRequestedID := c.grpABI.Events["ReshareRequested"].ID
 
 	hexGrp := strings.ToLower(grpAddr.Hex())
@@ -746,6 +803,28 @@ func (c *ChainClient) handleGroupLogs(ctx context.Context, grpAddr common.Addres
 					zap.String("group", hexGrp),
 					zap.String("resolver", cfg.Resolver.Hex()),
 					zap.Uint64("chainId", cfg.ChainID))
+			}
+
+		case siweDomainsSetID:
+			// The accepted domain list changed (timelocked executeSiweDomains
+			// fired). Re-read the getter rather than decoding the event, for the
+			// same reason as AuthResolverSet above: the getter is authoritative
+			// and the startup path already goes through it, so there is one
+			// decoding of this list rather than two that can disagree.
+			//
+			// Without this case the list was read at startup and never again.
+			// The failure is quiet in the worst way: the change lands on-chain,
+			// every operator sees it applied, and every node goes on enforcing
+			// the list it loaded when it booted — so a domain looks configured
+			// and no session can be minted under it until an unrelated restart.
+			if doms, err := c.callSiweDomains(ctx, grpAddr); err != nil {
+				c.log.Warn("chain: siweDomains on SiweDomainsSet",
+					zap.String("group", hexGrp), zap.Error(err))
+			} else {
+				c.n.auth.SetSiweDomains(hexGrp, doms)
+				c.log.Info("chain: siwe domains set",
+					zap.String("group", hexGrp),
+					zap.Strings("domains", doms))
 			}
 
 		case reshareRequestedID:

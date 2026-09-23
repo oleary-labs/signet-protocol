@@ -12,6 +12,17 @@ Group={{ signetd_user }}
 # race in roles/kms-tss/tasks/main.yml). kms-tss clears a genuinely stale socket
 # itself, but only after taking the sled lock, which proves no peer is serving.
 ExecStart={{ kms_bin }} {{ kms_socket }} {{ kms_data_dir }}
+{% if kms_at_rest_encryption | default(false) | bool %}
+# At-rest encryption KEK. Deliberately an EnvironmentFile and NOT Environment=:
+# this unit is mode 0644 and `systemctl show kms-tss` renders Environment= to any
+# user, so an inline KEK would be world-readable on the box. The file is 0600.
+#
+# No leading '-'. A missing file must fail the unit, because kms-tss treats an
+# absent SIGNET_KMS_KEY as "encryption off" (src/main.rs:97) and will silently
+# open a PLAINTEXT store instead. Failing to start is the safe outcome; quietly
+# writing unencrypted shards is not.
+EnvironmentFile={{ kms_env_file }}
+{% endif %}
 Restart=on-failure
 RestartSec=3
 LimitNOFILE=65536

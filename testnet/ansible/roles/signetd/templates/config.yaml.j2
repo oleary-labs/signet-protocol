@@ -1,10 +1,16 @@
 data_dir: {{ signetd_data_dir }}
 listen_addr: /ip4/0.0.0.0/tcp/{{ p2p_port }}
-api_addr: :{{ api_port }}
+api_addr: {{ api_bind }}:{{ api_port }}
 announce_addr: /ip4/{{ ansible_host }}/tcp/{{ p2p_port }}
 bootstrap_peers:
+{# build-inventory.sh writes ansible_host: 0.0.0.0 for a node that is in a
+   manifest but has no entry in .hosts-alpha yet — an operator part-way through
+   provisioning, or another org's nodes that have not been stood up. Rendering
+   those would hand every node a bootstrap address it can never dial, and libp2p
+   would retry them forever. --limit does not help here: it restricts which
+   hosts are targeted, not what groups['signet_nodes'] contains. #}
 {% for host in groups['signet_nodes'] %}
-{% if host != inventory_hostname %}
+{% if host != inventory_hostname and hostvars[host].ansible_host != '0.0.0.0' %}
   - /ip4/{{ hostvars[host].ansible_host }}/tcp/{{ p2p_port }}/p2p/{{ hostvars[host].peer_id }}
 {% endif %}
 {% endfor %}
@@ -12,12 +18,6 @@ node_type: {{ node_type }}
 eth_rpc: {{ eth_rpc }}
 factory_address: {{ factory_address }}
 chain_poll_secs: {{ chain_poll_secs | default(60) }}
-{% if siwe_domain is defined and siwe_domain %}
-# ERC-4361 domain the node requires in SIWE messages for the onchain_resolver
-# auth scheme. Pinning it is what stops a SIWE signature minted for another
-# site from opening a Signet session. Omitted => scheme rejected (fail-closed).
-siwe_domain: "{{ siwe_domain }}"
-{% endif %}
 {% if chain_rpcs is defined and chain_rpcs %}
 # RPC reach for chains OTHER than the home chain, for groups whose auth
 # resolver lives off-chain-of-home. The home chain is registered automatically.

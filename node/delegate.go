@@ -14,7 +14,6 @@ import (
 	"github.com/ethereum/go-ethereum/crypto"
 	"go.uber.org/zap"
 
-	"signet/network"
 	"signet/tss"
 )
 
@@ -48,14 +47,14 @@ type jwtHeader struct {
 
 // jwtClaims are the delegation token claims.
 type jwtClaims struct {
-	Iss            string `json:"iss"`              // group address
-	Sub            string `json:"sub"`              // sub-key ID (the delegated key)
-	Kid            string `json:"kid"`              // parent key ID (the signing key)
-	Scheme         string `json:"scheme"`            // signing scheme: secp256k1, ecdsa_secp256k1, ed25519
-	Grp            string `json:"grp"`              // group address (redundant with iss, for clarity)
-	Exp            int64  `json:"exp"`              // expiry timestamp
-	Iat            int64  `json:"iat"`              // issued-at timestamp
-	ParentKeyPub   string `json:"parent_key_pub"`   // hex-encoded parent key public key
+	Iss          string `json:"iss"`            // group address
+	Sub          string `json:"sub"`            // sub-key ID (the delegated key)
+	Kid          string `json:"kid"`            // parent key ID (the signing key)
+	Scheme       string `json:"scheme"`         // signing scheme: secp256k1, ecdsa_secp256k1, ed25519
+	Grp          string `json:"grp"`            // group address (redundant with iss, for clarity)
+	Exp          int64  `json:"exp"`            // expiry timestamp
+	Iat          int64  `json:"iat"`            // issued-at timestamp
+	ParentKeyPub string `json:"parent_key_pub"` // hex-encoded parent key public key
 }
 
 // handleDelegate mints a delegation token for a sub-key, signed by a parent key.
@@ -67,16 +66,16 @@ type jwtClaims struct {
 //	 "session_pub":"02...","request_sig":"hex64","nonce":"hex","timestamp":123}
 func (n *Node) handleDelegate(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		GroupID      string `json:"group_id"`
-		KeyID        string `json:"key_id"`        // sub-key to delegate
-		KeySuffix    string `json:"key_suffix"`     // alternative to key_id
-		ParentKeyID  string `json:"parent_key_id"`  // parent key for signing
-		ExpiresIn    int64  `json:"expires_in"`     // seconds until expiry
-		Curve        string `json:"curve"`          // curve of the parent key
-		SessionPub   string `json:"session_pub"`
-		RequestSig   string `json:"request_sig"`
-		Nonce        string `json:"nonce"`
-		Timestamp    uint64 `json:"timestamp"`
+		GroupID     string `json:"group_id"`
+		KeyID       string `json:"key_id"`        // sub-key to delegate
+		KeySuffix   string `json:"key_suffix"`    // alternative to key_id
+		ParentKeyID string `json:"parent_key_id"` // parent key for signing
+		ExpiresIn   int64  `json:"expires_in"`    // seconds until expiry
+		Curve       string `json:"curve"`         // curve of the parent key
+		SessionPub  string `json:"session_pub"`
+		RequestSig  string `json:"request_sig"`
+		Nonce       string `json:"nonce"`
+		Timestamp   uint64 `json:"timestamp"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		n.httpError(w, http.StatusBadRequest, "decode body: "+err.Error())
@@ -229,61 +228,22 @@ func (n *Node) handleDelegate(w http.ResponseWriter, r *http.Request) {
 		zap.String("parent_key", parentKeyID),
 	)
 
-	sortedSigners := tss.NewPartyIDSlice(grp.Members)
-	nonce, err := randomNonce()
-	if err != nil {
-		n.httpError(w, http.StatusInternalServerError, "generate nonce: "+err.Error())
-		return
-	}
-	sessID := signSessionID(req.GroupID, parentKeyID, nonce)
-
-	sn, err := network.NewSessionNetwork(r.Context(), n.host, sessID, sortedSigners)
-	if err != nil {
-		n.httpError(w, http.StatusInternalServerError, "session network: "+err.Error())
-		return
-	}
-	defer sn.Close()
-
-	// For ECDSA, ensure self is coordinator.
-	signersForCoord := sortedSigners
-	if parentCurve == CurveEcdsaSecp256k1 {
-		self := tss.PartyID(n.host.Self())
-		signersForCoord = make([]tss.PartyID, 0, len(sortedSigners))
-		signersForCoord = append(signersForCoord, self)
-		for _, s := range sortedSigners {
-			if s != self {
-				signersForCoord = append(signersForCoord, s)
+	sig, err := n.runThresholdSign(r.Context(), grp, parentCurve, req.GroupID, parentKeyID, msgHash[:],
+		func(nonce string, signersForCoord []tss.PartyID) coordMsg {
+			return coordMsg{
+				Type:           msgDelegateSign,
+				GroupID:        req.GroupID,
+				KeyID:          parentKeyID,
+				SignNonce:      nonce,
+				Signers:        signersForCoord,
+				MessageHash:    msgHash[:],
+				Curve:          string(parentCurve),
+				Session:        authProof,
+				DelegateSubKey: subKeyID,
 			}
-		}
-	}
-
-	if err := n.broadcastCoord(r.Context(), sortedSigners, coordMsg{
-		Type:           msgDelegateSign,
-		GroupID:        req.GroupID,
-		KeyID:          parentKeyID,
-		SignNonce:      nonce,
-		Signers:        signersForCoord,
-		MessageHash:    msgHash[:],
-		Curve:          string(parentCurve),
-		Session:        authProof,
-		DelegateSubKey: subKeyID,
-	}); err != nil {
-		n.httpError(w, http.StatusInternalServerError, "coordinate: "+err.Error())
-		return
-	}
-
-	sig, err := n.km.RunSign(r.Context(), SignParams{
-		Host:        n.host,
-		SN:          sn,
-		SessionID:   sessID,
-		GroupID:     req.GroupID,
-		KeyID:       parentKeyID,
-		Signers:     signersForCoord,
-		MessageHash: msgHash[:],
-		Curve:       parentCurve,
-	})
+		})
 	if err != nil {
-		n.httpError(w, http.StatusInternalServerError, "sign JWT: "+err.Error())
+		n.writeSignError(w, req.GroupID, parentKeyID, err)
 		return
 	}
 

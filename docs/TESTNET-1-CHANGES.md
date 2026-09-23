@@ -20,11 +20,28 @@ infrastructure.
 
 ### Threshold ECDSA (DJNPO20)
 
-4-round robust protocol (3 presign + 1 sign). Requires N >= 2t+1.
-Produces standard ECDSA signatures compatible with on-chain ecrecover.
+4-round robust protocol (3 presign + 1 sign). Produces standard ECDSA
+signatures compatible with on-chain ecrecover.
 
-- Degree-t polynomials for nonce (k) and blinding (a)
-- Degree-2t zero-secret polynomials for masking (b, d, e)
+Two different parameters are in play, and conflating them is the easy mistake:
+
+- `T` — the key's threshold, fixed at DKG time. Shares lie on a degree-`T-1`
+  polynomial.
+- `t` — the protocol's corruption parameter, derived per session from the
+  number of signers actually invited: `t = (n-1)/2`. The protocol's own
+  `n >= 2t+1` is therefore satisfied by construction and is not a constraint
+  you can violate.
+
+The constraint that *can* be violated relates the two: signing needs
+**`n >= 2T-1` signers in the session**, because the signature share is a
+product of a degree-`t` value and the degree-`T-1` share, and `n` points
+interpolate exactly only to degree `n-1`. Below the bound the protocol
+completes and returns a well-formed signature that does not verify. Enforced in
+`node/signers.go`, `node/coord.go` and `kms-tss/src/ecdsa_session.rs`; derived
+in full in `docs/DESIGN-SIGNER-SELECTION.md`.
+
+- Degree-`t` polynomials for nonce (k) and blinding (a)
+- Degree-`2t` zero-secret polynomials for masking (b, d, e)
 - Coordinator (initiating node) aggregates signature shares
 - ECDSA signatures include recovery byte v for ecrecover
 - s-value normalized to lower half of curve order (EIP-2)

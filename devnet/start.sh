@@ -9,8 +9,10 @@
 # Usage:
 #   devnet/start.sh                  # default: nodes use external Rust KMS, no auth
 #   devnet/start.sh --no-kms         # nodes use in-process Go TSS (no KMS)
-#   devnet/start.sh --auth           # seed Google OAuth issuer (ZK auth required)
-#   devnet/start.sh --no-kms --auth  # Go TSS + ZK auth
+#   GOOGLE_CLIENT_IDS=<id>[,<id>] devnet/start.sh --auth
+#                                    # seed Google OAuth issuer (ZK auth required)
+#   GOOGLE_CLIENT_IDS=<id> devnet/start.sh --no-kms --auth
+#                                    # Go TSS + ZK auth
 
 set -euo pipefail
 
@@ -227,14 +229,25 @@ info "Creating signing group..."
 # OAuth issuer configuration — when --auth is passed, seed the group with Google
 # as a trusted issuer so ZK auth is required. Without --auth, the group has no
 # auth policy and requests are unauthenticated (the existing devnet behavior).
+#
+# The client IDs are NOT baked in. The testnet ones that used to live here
+# belonged to a Google Cloud project that was deleted along with the testnet, so
+# a hardcoded default would only ever produce a group trusting a client that no
+# longer exists — an auth failure three steps later, with nothing pointing back
+# here. Supply your own instead (Web application client, any redirect URI; the
+# devnet never performs the OAuth exchange, it only registers the azp values the
+# nodes will accept).
 if $USE_AUTH; then
     GOOGLE_ISS="https://accounts.google.com"
-    CID1="203385367894-0uhir5bt81bsg1gcflfg6tdt1m3eeo0s.apps.googleusercontent.com"
-    CID2="203385367894-30dkghcu30d4sjacullkc1q49epnvnrt.apps.googleusercontent.com"
-    ISSUERS="[(${GOOGLE_ISS},[${CID1},${CID2}])]"
+    [[ -n "${GOOGLE_CLIENT_IDS:-}" ]] || die "--auth requires GOOGLE_CLIENT_IDS (comma-separated OAuth client IDs, i.e. the 'azp' claim your tokens carry)"
+
+    # Comma-separated -> the (string,string[]) tuple cast expects for createGroup.
+    CID_LIST="$(echo "$GOOGLE_CLIENT_IDS" | tr -d '[:space:]')"
+    ISSUERS="[(${GOOGLE_ISS},[${CID_LIST}])]"
     echo "    issuer: ${GOOGLE_ISS}"
-    echo "      client_id: ${CID1}"
-    echo "      client_id: ${CID2}"
+    echo "$CID_LIST" | tr ',' '\n' | while read -r cid; do
+        [[ -n "$cid" ]] && echo "      client_id: ${cid}"
+    done
 else
     ISSUERS="[]"
 fi

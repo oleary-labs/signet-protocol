@@ -30,6 +30,18 @@ type Env struct {
 	FactoryAddress string
 	GroupAddress   string
 	Nodes          []Node
+
+	// AuthKey/AuthIdentity come from the env file, which is where
+	// alpha-contracts.sh write-env puts them. They were previously read only
+	// from the process environment, so the documented invocation
+	//
+	//	./build/harness -env testnet/.env-alpha correctness
+	//
+	// picked up neither: every request went out unauthenticated and a group
+	// with an auth policy answered 401 to all of them. The process
+	// environment still wins, so exporting either continues to override.
+	AuthKey      string
+	AuthIdentity string
 }
 
 // LoadEnv parses a devnet/.env or testnet/.env file.
@@ -61,6 +73,8 @@ func LoadEnv(path string) (*Env, error) {
 		RPCURL:         vals["RPC_URL"],
 		FactoryAddress: vals["FACTORY_ADDRESS"],
 		GroupAddress:   vals["GROUP_ADDRESS"],
+		AuthKey:        vals["HARNESS_AUTH_KEY"],
+		AuthIdentity:   vals["HARNESS_AUTH_IDENTITY"],
 	}
 
 	if env.GroupAddress == "" {

@@ -28,7 +28,7 @@ const (
 // siweResult is the verified outcome of an onchain_resolver SIWE message.
 type siweResult struct {
 	Address common.Address // SIWE-recovered signer; the resolver's input
-	ChainID uint64         // SIWE Chain ID (must equal the resolver's chainId)
+	ChainID uint64         // SIWE Chain ID (must equal the group's home chainId)
 	Nonce   string         // SIWE nonce, routed through the replay cache by the caller
 	Expiry  time.Time      // bounds the session (R-4)
 }
@@ -37,14 +37,16 @@ type siweResult struct {
 // scheme, enforcing the §10 R-4 bindings:
 //   - the signature recovers to the message's address,
 //   - domain equals expectedDomain (vacuous-check guard: empty config is rejected),
-//   - Chain ID equals expectedChainID (the resolver's chain),
+//   - Chain ID equals homeChainID (the group's HOME chain, not the resolver's —
+//     ERC-4361's chainId is the account's context, i.e. where an ERC-1271
+//     contract account resolves, not where the identity contract lives),
 //   - the message commits to sessionPub via a fixed Resources URI,
 //   - an expiration time is present (used to bound the session TTL).
 //
 // It does NOT check the nonce for replay; the caller routes result.Nonce
 // through the session nonce cache so the scheme reuses the existing replay
 // protection.
-func verifySIWE(message, signature, expectedDomain string, expectedChainID uint64, sessionPub []byte) (*siweResult, error) {
+func verifySIWE(message, signature, expectedDomain string, homeChainID uint64, sessionPub []byte) (*siweResult, error) {
 	if expectedDomain == "" {
 		return nil, fmt.Errorf("siwe domain not configured; onchain_resolver disabled")
 	}
@@ -61,8 +63,18 @@ func verifySIWE(message, signature, expectedDomain string, expectedChainID uint6
 		return nil, fmt.Errorf("verify siwe: %w", err)
 	}
 
-	if uint64(msg.GetChainID()) != expectedChainID {
-		return nil, fmt.Errorf("siwe chain id %d != resolver chain id %d", msg.GetChainID(), expectedChainID)
+	// The label matters as much as the check. This error used to call the
+	// expected value the "resolver chain id" while passing the group's home
+	// chain, so it told the reader to sign with the resolver's chain — the exact
+	// mistake it was reporting. SFLuv's SDK then copied the wording into its own
+	// chain_id_mismatch guidance, and their sanitizer stripped the text before
+	// anyone read it, so the two descriptions agreed with each other and not
+	// with the code for as long as nobody could see either.
+	if uint64(msg.GetChainID()) != homeChainID {
+		return nil, fmt.Errorf(
+			"siwe chain id %d != group home chain id %d "+
+				"(ERC-4361 chainId is the signing account's chain, not the resolver's)",
+			msg.GetChainID(), homeChainID)
 	}
 
 	// The message MUST commit to the session public key via a fixed Resources

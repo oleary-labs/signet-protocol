@@ -341,15 +341,11 @@ impl EcdsaSession {
             return Err("ECDSA requires at least 3 signers".to_string());
         }
         // t = max malicious. For n signers, t = (n-1)/2 gives the maximum
-        // malicious tolerance. The protocol requires n ≥ 2t+1.
-        // With n > 2t+1, we get availability (more signers than minimum)
-        // while maintaining the same security guarantee.
+        // malicious tolerance, so the protocol's own n >= 2t+1 requirement is
+        // satisfied by construction — there is nothing to check here. The
+        // constraint that *can* be violated involves the key's threshold, and
+        // is enforced below once the KeyPackage has been loaded.
         let max_malicious = (n - 1) / 2;
-        if n < 2 * max_malicious + 1 {
-            return Err(format!(
-                "ECDSA requires n >= 2t+1 signers, got {n} (t={max_malicious})"
-            ));
-        }
 
         let parties = PartyScalars::new(&params.signer_ids)?;
         let self_idx = parties.index_of(&params.party_id)?;
@@ -366,6 +362,36 @@ impl EcdsaSession {
             .map_err(|e| format!("deserialize key package: {e}"))?;
         let share_bytes = kp.signing_share().serialize();
         let secret_share = bytes_to_scalar(share_bytes.as_ref())?;
+        // Reject signer sets too small for this key's threshold.
+        //
+        // `max_malicious` above is derived from the signer set and says nothing
+        // about the key. The signature share carries
+        // `beta_me = c_me * secret_share` (see the sign round), whose degree in
+        // the party index is t + (T-1): t from the nonce polynomial fa, and
+        // T-1 from the DKG polynomial the stored share lies on. The coordinator
+        // reconstructs by Lagrange interpolation over the n participating
+        // points, which is exact only up to degree n-1. Hence
+        //
+        //     (n-1)/2 + T - 1 <= n - 1   =>   n >= 2T - 1
+        //
+        // Below that bound the protocol still completes and emits a well-formed
+        // signature — it simply is not a signature under the group key, so it
+        // fails ecrecover/verify at the far end (a reverted EIP-3009 transfer,
+        // say) rather than here. Failing the request is the whole point.
+        //
+        // Note this is NOT the same as the group's "T-of-N can sign" property:
+        // FROST honours that directly, but this ECDSA construction needs a
+        // wider signer set than T. A T-of-N group has ECDSA slack only when
+        // N > 2T-1.
+        let min_signers = *kp.min_signers() as usize;
+        let required = 2 * min_signers.max(1) - 1;
+        if n < required {
+            return Err(format!(
+                "ECDSA with a {min_signers}-of-N key requires at least {required} \
+                 signers (n >= 2T-1), got {n}"
+            ));
+        }
+
 
         // Group public key.
         let public_key = bytes_to_point(&stored.group_key)?;

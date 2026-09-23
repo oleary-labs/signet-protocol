@@ -4,13 +4,147 @@
 # after running devnet-init and the deploy script.
 
 node_type: public
-log_level: debug
+
+# Drives BOTH services: signetd's -log-level (signetd.service.j2:21) and
+# kms-tss's RUST_LOG (kms-tss.service.j2:29).
+#
+# `debug` is not free at these rates. During the first mainnet load test the
+# nodes wrote ~1,200 journal lines/sec — 30k DEBUG entries a minute — which put
+# systemd-journald at 9-18% CPU and ~195MB resident on a 2-vCPU box, competing
+# with signetd and kms-tss for the same two cores. Every figure in that run is
+# therefore a floor rather than a measurement, worst for the 4-round ECDSA
+# scenarios that are most sensitive to CPU contention.
+#
+# It is also the wrong default for nodes holding real key shards: DEBUG records
+# per-peer protocol detail and session internals to disk indefinitely, and
+# journald only stops it by rotating.
+#
+# Override per run when actually debugging — `-e log_level=debug` — rather than
+# leaving the fleet verbose by default.
+log_level: info
+
+# --- Host layout ---
+#
+# These were previously defined only in inventory.yml, which is gitignored for
+# its IPs — so they were lost with it and nothing in the repo could rebuild a
+# working deploy. None of them are secret. The inventory now carries hosts and
+# IPs and nothing else.
+#
+# Values match the deployed testnet layout: REDEPLOY.md §4 backs up
+# /opt/signet/data and /opt/signet/kms-data, the unit sets HOME=/opt/signet,
+# and the security groups open 9000 (libp2p) and 8080 (HTTP API).
+signetd_user: signet
+signetd_bin: /usr/local/bin/signetd
+signetd_config_dir: /etc/signet
+signetd_data_dir: /opt/signet/data
+signetd_log_dir: /var/log/signet
+p2p_port: 9000
+api_port: 8080
+
+# --- TLS on the HTTP API ---
+#
+# The /v1 API carries session credentials, EIP-712 payloads and returned
+# signatures. Most sharply, a delegation token is a bearer credential: /v1/auth
+# binds the session to whatever session_pub the caller supplies, so a token seen
+# in flight can be replayed by anyone. Caddy terminates TLS on 443 and proxies
+# to signetd on loopback.
+#
+# The inter-node path on p2p_port needs nothing — libp2p already uses TLS 1.3 /
+# Noise with peer-ID authentication.
+use_tls: true
+
+# ACME account contact. Required when use_tls is true.
+#
+# Deliberately EMPTY here and set per operator in group_vars/org_<name>.yml.
+# This file applies to every node in the fleet, so a value here puts one
+# operator's address on the other's certificates: Caddy creates the ACME
+# account per contact, so it decides who owns the account and who receives
+# expiry warnings for hosts they do not run. Each operator owns its own, the
+# same way it owns its own domain and its own SSH keys.
+#
+# org_<name> is a child of signet_nodes in the generated inventory, and a child
+# group's vars beat the parent's, so the per-operator file wins. Left empty,
+# the caddy role asserts and the deploy fails closed rather than quietly
+# issuing under someone else's account.
+tls_email: ""
+
+# Staging endpoint while testing. Let's Encrypt production rate limits are per
+# registered domain and easy to exhaust across six nodes and repeated
+# wipe-and-redeploy cycles. Unset for production certificates.
+# acme_ca: "https://acme-staging-v02.api.letsencrypt.org/directory"
+
+# Who may reach /debug/*. It is unauthenticated and reports group membership
+# and per-peer health, so it is loopback-only unless you widen this.
+debug_allow_cidrs:
+  - 127.0.0.1/32
+
+# Bind address for signetd's own listener. With TLS on it MUST be loopback:
+# left on all interfaces, port 8080 stays directly reachable and the TLS
+# termination is simply bypassable.
+api_bind: "{{ '127.0.0.1' if use_tls | bool else '' }}"
+
+# --- Rate limiting (audit M2 / R-6) ---
+#
+# Needs a Caddy built with github.com/mholt/caddy-ratelimit — stock Caddy does
+# not know the directive. Build once per release:
+#   GOOS=linux GOARCH=amd64 xcaddy build \
+#     --with github.com/mholt/caddy-ratelimit --output build/caddy-linux-amd64
+use_rate_limit: true
+local_caddy_binary_path: "../../../../build/caddy-linux-amd64"
+
+# Per client IP, per window. /v1/auth is tightest because it shells out to
+# `bb verify` and then broadcasts to every member — the most expensive thing an
+# unauthenticated caller can trigger. /v1/sign is the payment hot path and stays
+# generous. /v1/health and /v1/info are not limited at all.
+rate_limit_window: "1m"
+rate_limit_auth_events: 10
+rate_limit_keygen_events: 10
+rate_limit_sign_events: 120
+rate_limit_delegate_events: 30
+rate_limit_keys_events: 30
+rate_limit_admin_events: 60
+
+# Addresses exempt from every zone. The perf harness drives sustained load from
+# a single source and WILL trip the limits above — put the runner's address here
+# rather than loosening the limits for the whole internet.
+rate_limit_exempt_cidrs: []
+
+# Secrets dir, kept separate from signetd_config_dir so its 0750 root:signet
+# perms do not fight the 0755 signet:signet the config dir wants.
+signet_secrets_dir: /etc/signet/secrets
+
+# --- Chain connection ---
+#
+# Read from the environment, which is how ALPHA-RUNBOOK.md and deploy.yml's own
+# fail message say to supply them. They were previously defined nowhere in the
+# repo at all — they lived only in the gitignored inventory.yml, so the
+# documented deploy command failed the assert in deploy.yml on a fresh clone.
+#
+# ETH_RPC_URL is the current name; SEPOLIA_RPC_URL is honoured as a deprecated
+# alias so a stand-up already underway keeps working. Override either with
+# -e eth_rpc=... if you prefer not to use the environment.
+eth_rpc: "{{ lookup('env', 'ETH_RPC_URL') or lookup('env', 'SEPOLIA_RPC_URL') }}"
+factory_address: "{{ lookup('env', 'FACTORY_ADDRESS') }}"
+signetd_env_file: "{{ signet_secrets_dir }}/signetd.env"
 
 # KMS configuration
 use_kms: true
 kms_bin: /usr/local/bin/kms-tss
 kms_socket: /run/signet/kms.sock
 kms_data_dir: /opt/signet/kms-data
+
+# --- KMS at-rest encryption ---
+#
+# kms-tss encrypts the sled store when SIGNET_KMS_KEY is present in its
+# environment, and runs plaintext when it is absent (src/main.rs:97). There is
+# NO migration path in either direction — flipping this on or off against a
+# populated store makes the existing shards unreadable. Decide before the first
+# keygen; changing it later means a wipe.
+#
+# The per-node KEK itself lives in host_vars as `kms_kek` (64 hex chars) and is
+# generated by testnet/scripts/init-alpha.sh. Keep host_vars ansible-vaulted.
+kms_at_rest_encryption: true
+kms_env_file: "{{ signet_secrets_dir }}/kms.env"
 
 # Barretenberg version — read from signet-circuits/toolchain.json at deploy time.
 # See roles/bb/tasks/main.yml for how this is resolved.
@@ -22,12 +156,33 @@ chain_poll_secs: 60
 
 # --- On-chain auth resolver (onchain_resolver scheme) ---
 #
-# Both are unset by default, which leaves the scheme disabled. The node rejects
-# onchain_resolver outright when siwe_domain is empty, so enabling the scheme
-# means setting this to the exact ERC-4361 domain clients sign against.
+# The accepted ERC-4361 domains are NOT set here. They live on the group
+# contract (SignetGroup.siweDomains, manager-only and timelocked) and the node
+# reads them from chain.
 #
-# siwe_domain: "testnet.signet.example"
+# siwe_domain was removed rather than deprecated. The domain check gates session
+# creation and is consensus-relevant, so a per-node value can drift into some
+# nodes accepting a session while others reject it — which fails intermittently
+# and reports a threshold error rather than an auth one. An empty on-chain list
+# leaves the scheme disabled, which is the same fail-closed default as before.
 #
-# Only needed if a group's resolver lives on a chain other than eth_rpc's.
-# chain_rpcs:
-#   8453: "https://base-mainnet.example/v2/KEY"
+# Needed when a group's resolver lives on a chain other than eth_rpc's. Every
+# member node must have reach to that chain: /v1/auth forwards the proof to the
+# whole group and each node calls resolve() itself, so a node without an RPC
+# entry refuses to establish the session. The group then signs or fails
+# depending on which signers get selected, and reports a threshold error rather
+# than an auth one. Add the chain here for ALL operators before the resolver is
+# executed on-chain, not after.
+#
+# 42220 (Celo) serves the auth resolver bound to the 6-node alpha group
+# (0x86fe...ac59), 0x903409cB9248b1f0047c5F967a3db8E03Df3E11a. Without it that
+# group's SIWE logins fail with "no RPC configured for chain 42220".
+#
+# forno is Celo's public endpoint: no key, no account, and shared by every
+# operator — which is the trade being made. It is a single provider that all six
+# nodes depend on for the same answer, so an outage takes SIWE auth for this
+# group down everywhere at once, and a wrong answer is not caught by
+# disagreement. Acceptable while the alpha proves the path; a per-operator
+# endpoint is the fix, and costs nothing but a URL each.
+chain_rpcs:
+  42220: "https://forno.celo.org"

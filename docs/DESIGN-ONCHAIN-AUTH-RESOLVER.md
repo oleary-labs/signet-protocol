@@ -15,6 +15,10 @@ not a special case.
   protocol-constant resolver version accept-list (R-2). Concrete provider
   adapters (ACE/CCID, allowlist) live in a separate repo (license); this repo
   ships the interface + a mock.
+- Under revision: the block pin moves from the client to the initiating node
+  (R-3a) and its freshness bound becomes a duration rather than 30 blocks
+  (R-3b). Prompted by a Celo-bound resolver on the alpha, where 1s blocks make
+  the shipped bound a 30-second window.
 - Deferred: rate limiting on `/v1/auth` (R-6, tracked under audit M2 — a
   prerequisite for production use; a TODO marks the call site); resolver-upgrade
   key migration mechanics (R-1 leaves keys created under an old resolver
@@ -136,6 +140,11 @@ New `/v1/auth` branch, `scheme: "onchain_resolver"`:
   "block_hash": "0x..."                        // canonical hash at that height — reorg-safe pin
 }
 ```
+
+> **Under revision.** R-3a moves the block choice from the client to the
+> initiating node, which removes both fields from this request body. R-3b
+> replaces the block-count freshness bound with a timestamp one. Both are
+> pending implementation; the shape above is what ships today.
 
 Each node, independently:
 
@@ -354,10 +363,12 @@ block, so all honest nodes read identical state.
   with a fresher block. Committing to the number alone would let a reorg
   silently change the read.
 - **Freshness window bounds client choice.** The node requires
-  `head - maxLag ≤ block_number ≤ head` against *its own* head. The client
-  cannot replay an old block where a since-revoked credential was still valid;
-  worst-case staleness is `maxLag`, which is precisely the revocation latency
-  at the auth instant (ties R-5). Resolves Q3.
+  `head - maxLag ≤ block_number ≤ head` against *its own* head. Worst-case
+  staleness is `maxLag`, which is precisely the revocation latency at the auth
+  instant (ties R-5). Resolves Q3. *(This bullet used to open by claiming the
+  client "cannot replay an old block where a since-revoked credential was still
+  valid". It can, up to `maxLag` — see R-3a. The bound is real; the immunity
+  was overstated.)*
 - **Not a §3 violation.** The trust target (resolver addr + chain) still comes
   from group config; the block is only a freshness/consistency parameter, and
   each node independently bounds it to its own head — a malicious initiator can
@@ -370,6 +381,82 @@ block, so all honest nodes read identical state.
 - For chains exposing a `finalized` tag, a node MAY additionally require
   `block_number ≤ finalized` to sidestep reorgs entirely, trading latency for
   safety. Per-group policy (folds into Q7).
+
+### R-3a — The client does not need to choose the block (revision to R-3)
+
+Field evidence, 2026-09-21. A resolver was bound to the 6-node alpha group on
+Celo (chainId 42220). Nodes had no `chain_rpcs` entry for it, so every SIWE login
+failed cleanly with `no RPC configured for chain 42220` — §6 working as intended.
+Fixing that surfaced the real problem: **Celo blocks are 1.00s** (measured over
+100 blocks), so `maxResolverLag = 30` is a **30-second** window there, against
+**6 minutes** on Ethereum mainnet. The client pins a block, the user then signs
+in a wallet, and the request arrives — on a fast chain that round trip routinely
+exceeds the window, producing intermittent `pinned block too stale` that looks
+like flaky auth rather than a bound being hit.
+
+That prompted re-examining what client-pinning buys. Less than R-3 claims:
+
+- **It buys inter-node agreement, and only that.** All nodes read one block, so
+  the session lands on every member or none. That is worth keeping: with `T=3`
+  of 6, a session on a subset lets FROST sign while ECDSA (needing `2T-1 = 5`)
+  fails, surfacing as a threshold error rather than an auth one.
+- **It buys nothing against a revoked account, and costs a little.** Reading
+  `latest` is strictly fresher than any pinned block. The pin *permits* up to
+  `maxLag` of staleness, and the party choosing inside that window is the
+  client — the least-trusted participant. The hash check prevents *fabricating*
+  a block; nothing prevents deliberately picking the oldest allowed one.
+- **It does not bind the initiator either.** R-4 leaves the SIWE commitment to
+  `(block_number, block_hash)` optional "given R-3's per-node verification", but
+  that verification only bounds freshness — it does not tie the request to the
+  block the signer saw. So a malicious initiator can swap the block, bounded by
+  the same `maxLag`. Client commitment adds no bound beyond `maxLag` itself.
+
+Both attacks therefore reduce to "read up to `maxLag` stale", which is the
+window, not the pinning party.
+
+**Requirement:** the **initiating node** selects `(block_number, block_hash)` and
+carries it in the coord `AuthProof` — where the fields already live
+(`node/auth.go:598-599`, CBOR keys 20/21). Participants validate exactly as they
+do now: canonical hash at that height in their own view, inside the freshness
+bound, fail closed otherwise. Security is unchanged (a malicious initiator picks
+within the window, exactly as a malicious client can today), and two costs
+disappear:
+
+- **The client no longer needs RPC reach to the resolver's chain.** This retires
+  R-3's "Cost" bullet, which extended §6's reach requirement to the client side.
+  Nodes still need their own RPC; nothing about that changes.
+- **The wallet-latency window disappears**, because the block is chosen when the
+  request is served rather than before the user is prompted.
+
+**Interim, no code:** a client can pin *after* the wallet returns the signature.
+The SIWE message does not commit to the block, so this is already legal and it
+closes the Celo timing gap today.
+
+**Rejected alternative:** drop the pin and have each node read `latest`. It is
+simpler and makes revocation strictly tighter, but trades a clean all-or-none
+outcome for partial sessions whenever `resolve()`'s answer changes mid-auth. The
+confusing failure is worse than the sub-second staleness it removes. Note this is
+the *only* option that actually eliminates stale selection — R-3a relocates the
+choice, it does not remove the window.
+
+### R-3b — Bound freshness in time, not blocks
+
+`maxResolverLag = 30` (`node/chain.go:85`) is a block count, so it silently
+encodes a block-time assumption: 6 minutes on mainnet, 30 seconds on Celo, and
+something else again on the next chain a group points at. A group's auth window
+should not change by an order of magnitude because of where its resolver is
+deployed.
+
+**Requirement:** bound staleness as a duration. The node already fetches the
+pinned header to check its hash, so its timestamp is in hand — compare
+`now - header.Time` against a single constant (90s is the right order) and drop
+the block arithmetic. No per-chain configuration, no block-time table, and the
+bound means the same thing on every chain.
+
+Header timestamps are proposer-chosen within consensus limits, which is
+acceptable for a freshness bound: a proposer able to skew it meaningfully is
+already able to influence the state being read. Keep the `block_number ≤ head`
+check, which is what catches a node whose own view lags.
 
 ### R-4 — SIWE replay hardening: the `session_pub` binding is the whole boundary
 

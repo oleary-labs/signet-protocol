@@ -7,6 +7,7 @@ import (
 	"io"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/fxamacker/cbor/v2"
 	"google.golang.org/grpc"
@@ -73,6 +74,47 @@ func (rkm *RemoteKeyManager) runSession(
 	if err != nil {
 		return nil, fmt.Errorf("start %s session: %w", label, err)
 	}
+
+	// StartSession has now put a session in the KMS's map, and the KMS removes
+	// it only when a ProcessMessage stream opens and later exits, or on an
+	// explicit AbortSession. It has no TTL of its own on older builds, and none
+	// of our code used to call AbortSession at all — so every path that returns
+	// between here and a successfully opened bridge orphaned a session
+	// permanently. Verified against a live kms-tss: orphans were still resolving
+	// 60s later with no reaper activity.
+	//
+	// The window is not theoretical, and it is widest exactly when it hurts. The
+	// sends below open libp2p streams to every peer; under load, or while a peer
+	// is unreachable, they are slow enough for the session context (15s for
+	// reshare) to expire before bridgeSession ever opens a stream. So the
+	// condition that makes sessions fail is the same one that used to prevent
+	// their cleanup — a node recovering into a stressed group would accumulate
+	// orphans fastest.
+	//
+	// Abort on every failure path rather than trying to detect which ones leaked.
+	// AbortSession is a map remove that succeeds whether or not the entry is
+	// still there, so aborting a session the KMS already cleaned up is a no-op,
+	// and guessing wrong in the other direction leaks forever.
+	handedOff := false
+	defer func() {
+		if handedOff {
+			return
+		}
+		// Deliberately not the caller's ctx: it is usually already cancelled —
+		// that is typically why we are here — and an abort on a dead context
+		// would be dropped, which is the whole failure being fixed.
+		abortCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if _, aerr := rkm.client.AbortSession(abortCtx, &kmspb.AbortSessionRequest{
+			SessionId: sessionID,
+		}); aerr != nil {
+			rkm.log.Warn("kms: abort orphaned session failed",
+				zap.String("label", label),
+				zap.String("session_id", sessionID),
+				zap.Error(aerr))
+		}
+	}()
+
 	for _, out := range resp.Outgoing {
 		sn.Send(protoToTSSMessage(out))
 	}
@@ -83,6 +125,7 @@ func (rkm *RemoteKeyManager) runSession(
 	if result == nil {
 		return nil, fmt.Errorf("%s session: no result returned", label)
 	}
+	handedOff = true
 	return result, nil
 }
 

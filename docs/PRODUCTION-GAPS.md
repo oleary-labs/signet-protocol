@@ -25,8 +25,31 @@ Go or at the reverse proxy.
 ### Backup / Recovery
 No mechanism to backup or restore key shards beyond copying the sled
 database file. Node data loss = permanent key loss (below threshold).
-Needs a documented backup procedure and ideally a threshold-restore
-protocol (reshare from remaining shares to a replacement node).
+
+Designed in `docs/DESIGN-BACKUP-RECOVERY.md`; not implemented. Two tiers:
+reshare to a replacement node for any loss up to `N-T` (the common case,
+needs no backup and already works), and sealed-shard export/restore for
+correlated loss beyond that. Online backup is safe because each record is
+independently sealed, so no atomic snapshot is required.
+
+One thing blocks it now:
+- `ExportShards` KMS RPC (streams records still encrypted; never touches
+  the KEK). Not built.
+
+**KEK escrow was the other blocker and is done**, arranged per operator and out
+of band. See `testnet/ALPHA-RUNBOOK.md` §"Identity escrow" for the custody
+requirement; locations are deliberately not recorded in this repo.
+
+That closes the custody half and none of the durability half. Escrow covers
+identity — enough that a rebuilt node keeps its peer ID and on-chain
+registration — and **no shards at all**. Restoring from it gives the right node
+with an empty key store, so read it as identity escrow, not as backup. The gap
+above is unchanged in substance; what changed is that the key which would unwrap
+a shard export now has custody, and the export does not exist to be unwrapped.
+
+Note the constraint that shapes the design: `T` operators' backups
+reconstruct every key, so backups must never be aggregated across
+operators. A centralised backup store undoes the threshold scheme.
 
 ### Key Import
 No ability to import an existing private key into threshold custody.
@@ -60,9 +83,111 @@ storage for incident response and compliance.
 reshare. Breaks version tracking on multiple reshares. Needs to parse
 the actual generation from the KMS result.
 
+### Liveness False-Negatives Under Sustained Load
+**Observed on mainnet, 2026-08-25, not yet diagnosed.** During a sustained
+ECDSA keygen run SFLuv saw seven 30-second timeouts across five nodes. It
+recovered unattended, and neither shorter run reproduced it — it appears to
+need sustained load.
+
+Two symptoms were originally filed together here and have since been separated
+(`3f30ef7`). **The 503s reporting peer health at 1–2 of 6 are not part of this
+finding.** A parallel deploy across OLL's four-node batch takes four nodes down
+at once and leaves exactly the two that were reported, and a deploy overlapping
+a load run reproduces the figure precisely; `serial: 1` (`9b9de30`) now prevents
+it. Only the 30-second timeouts remain unexplained.
+
+Keeping them apart matters because their implications are opposite: a tracker
+false-negative under load is a design problem on the payments path, while
+concurrent restarts were a procedure that has since been fixed. Filed as one
+finding, it would have sent the next person hunting a load bug that a deploy
+caused.
+
+### ~~Leading hypothesis — probe starvation~~ (withdrawn, 2026-09-01)
+
+The original reading was that `probeInterval = 15s` × `unhealthyAfter = 2` = the
+observed 30 seconds, with `probeTimeout = 3s` starved under 4-round ECDSA load.
+Recorded here rather than deleted, because the reasoning was seductive and
+someone will reconstruct it from the same constants.
+
+It fails on two independent counts, either sufficient:
+
+1. **The 30s was the observer's own clock.** `cmd/harness/main.go` defaulted
+   `-timeout` to 30s, and the run that produced the finding did not override it.
+   A "client-side 30s timeout" measured the client's patience, not anything about
+   the nodes. The agreement with 15 × 2 is a coincidence between unrelated
+   constants.
+
+2. **The tracker cannot deny a signature.** `selectSigners` filters candidates by
+   `exclude` — peers that failed a real session — and never by health
+   (`node/signers.go`). `rank()` sorts unhealthy peers last but leaves them
+   eligible, deliberately: *"Liveness is a hint, not an oracle."* Marking every
+   peer unhealthy would not reduce the candidate set or trip the capacity check.
+   So a tracker false-negative costs preference ordering, not signing capacity,
+   and the premise that it "directly removes capacity from the payments path" was
+   wrong.
+
+Corollary worth keeping: `insufficient available signers` can *only* arise from
+`exclude`, which independently confirms the deploy attribution above.
+
+**Current hypothesis — the client's deadline equalled the node's.** Three 30s
+values were in play and two of them collide:
+
+| Source | Value |
+|---|---|
+| harness `-timeout` default (`cmd/harness/main.go`) | 30s, now 90s |
+| participant session context (`node/coord.go`) | 30s |
+| `probeInterval` × `unhealthyAfter` | 30s — coincidence |
+
+Participants bound each session at 30s. `runThresholdSign` (`node/signers.go`)
+retries with a fresh signer set on failure, carrying the failed peer forward in
+`excluded`, and each attempt costs a full round of latency. With the client
+timing out at 30s as well, there was no time in which a retry could run: the
+client gave up at the instant the first attempt failed. The fault tolerance
+existed and could not engage.
+
+The client default is now 90s, which is the cheap half of the fix and enough to
+tell whether the timeouts were retryable failures all along. The remaining
+question is whether the 30s participant bound is itself right for a saturated
+4-round ECDSA session; lowering it would surface failures earlier and leave more
+room to retry, at the cost of abandoning sessions that would have completed.
+
+**General rule this is an instance of:** a client deadline must exceed the
+server's internal attempt bound by at least one retry, or the retry is
+decorative. That relationship was accidental here rather than chosen.
+
+To confirm next time, capture `/debug/stats` during the event: `consecutive_fails`
+and `rtt_ms` per peer distinguish "probes were starved" from "the peer was
+genuinely unreachable". Correlate against whether TSS sessions to that same peer
+were succeeding at the time. That evidence is still worth having — it is now
+diagnosis of a secondary effect rather than of the cause.
+
+Two observations from reading `node/liveness.go`, neither load-bearing for the
+above:
+
+- Liveness probes dial their own streams, while TSS traffic goes over
+  `MuxNetwork` — which exists specifically because long-lived streams hit yamux
+  flow-control limits. The probe path does not share that treatment.
+- `record()` returns early on failure without updating `rtt`, so a timed-out
+  probe contributes nothing to the ranking and a slow peer retains its old fast
+  round-trip. Minor, given ranking is all health affects.
+
+Still worth doing on its own merits: **fold session success into the liveness
+tracker.** A peer we are exchanging TSS messages with right now is provably
+alive, and that evidence is currently discarded in favour of a dedicated ping.
+It is also most abundant exactly when load makes pings least reliable.
+
 ---
 
 ## Medium — before mainnet / full production
+
+### Key Lifecycle Endpoints During Keygen
+`handleSetKeyStatus` and `handleDeleteKey` return a bare 404 for a key whose
+keygen is still settling on that node, so disable/delete inherit the visibility
+race that sign no longer has. Sign was fixed (409 + `Retry-After`, see
+`docs/KEYGEN-VISIBILITY-RACE.md`); these were left because the correct
+behaviour differs — waiting for a keygen in order to delete the result is
+defensible, and so is refusing. Needs a decision, not a copied fix, before
+either endpoint is driven programmatically at rate.
 
 ### Keygen Attestation
 No verification that keygen ran the threshold protocol. A malicious

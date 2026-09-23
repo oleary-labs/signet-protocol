@@ -45,27 +45,39 @@ func TestCheckKeygenParams(t *testing.T) {
 }
 
 // TestCheckSignerSet covers the H1 sign validation: every signer must be a
-// member and the distinct count must meet the group threshold.
+// member and the distinct count must meet the scheme's minimum — T for FROST,
+// 2T-1 for ECDSA.
 func TestCheckSignerSet(t *testing.T) {
-	members := memberSet("a", "b", "c")
+	members := memberSet("a", "b", "c", "d", "e")
 
 	tests := []struct {
 		name      string
 		threshold int
+		curve     Curve
 		signers   []tss.PartyID
 		wantErr   bool
 	}{
-		{"full set", 2, []tss.PartyID{"a", "b", "c"}, false},
-		{"exactly threshold", 2, []tss.PartyID{"a", "b"}, false},
-		{"below threshold rejected", 2, []tss.PartyID{"a"}, true},
-		{"non-member signer rejected", 2, []tss.PartyID{"a", "evil"}, true},
-		{"duplicates do not inflate count", 2, []tss.PartyID{"a", "a", "a"}, true},
-		{"empty signer set rejected", 1, nil, true},
+		// FROST: T-of-N.
+		{"frost full set", 2, CurveSecp256k1, []tss.PartyID{"a", "b", "c"}, false},
+		{"frost exactly threshold", 2, CurveSecp256k1, []tss.PartyID{"a", "b"}, false},
+		{"frost below threshold rejected", 2, CurveSecp256k1, []tss.PartyID{"a"}, true},
+		{"frost non-member rejected", 2, CurveSecp256k1, []tss.PartyID{"a", "evil"}, true},
+		{"frost duplicates do not inflate", 2, CurveSecp256k1, []tss.PartyID{"a", "a", "a"}, true},
+		{"frost empty rejected", 1, CurveSecp256k1, nil, true},
+		{"ed25519 follows frost rule", 2, CurveEd25519, []tss.PartyID{"a", "b"}, false},
+
+		// ECDSA: needs 2T-1, and never fewer than 3.
+		{"ecdsa T=2 accepts 3", 2, CurveEcdsaSecp256k1, []tss.PartyID{"a", "b", "c"}, false},
+		{"ecdsa T=2 rejects 2", 2, CurveEcdsaSecp256k1, []tss.PartyID{"a", "b"}, true},
+		{"ecdsa T=3 accepts 5", 3, CurveEcdsaSecp256k1, []tss.PartyID{"a", "b", "c", "d", "e"}, false},
+		{"ecdsa T=3 rejects 3", 3, CurveEcdsaSecp256k1, []tss.PartyID{"a", "b", "c"}, true},
+		{"ecdsa T=3 rejects 4", 3, CurveEcdsaSecp256k1, []tss.PartyID{"a", "b", "c", "d"}, true},
+		{"ecdsa T=1 still needs 3", 1, CurveEcdsaSecp256k1, []tss.PartyID{"a", "b"}, true},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			err := checkSignerSet(members, tc.threshold, tc.signers)
+			err := checkSignerSet(members, tc.threshold, tc.curve, tc.signers)
 			if (err != nil) != tc.wantErr {
 				t.Fatalf("err=%v, wantErr=%v", err, tc.wantErr)
 			}

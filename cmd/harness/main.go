@@ -24,7 +24,24 @@ func run() error {
 	var (
 		envFile   = flag.String("env", "devnet/.env", "path to environment file")
 		outFile   = flag.String("out", "", "path to write JSON lines output (optional)")
-		timeout   = flag.Duration("timeout", 30*time.Second, "per-request timeout")
+		// 90s, not 30s: the client's patience has to exceed the node's own
+		// attempt bound by at least one retry, or the node's fault tolerance
+		// cannot engage.
+		//
+		// Participants bound each session at 30s (node/coord.go), and
+		// runThresholdSign retries with a fresh signer set on failure, carrying
+		// the failed peer forward in `excluded` (node/signers.go). At a 30s
+		// client timeout those two deadlines were equal, so the client gave up
+		// at the exact moment the first attempt failed — the retry existed but
+		// could never be observed to run. 3x leaves room for two full attempts
+		// and margin.
+		//
+		// This is why the earlier reading of the alpha's 30s timeouts as a
+		// liveness-tracker fault did not hold: 15s x 2 also happens to be 30s,
+		// but the tracker only reorders signer preference and never removes a
+		// candidate (node/signers.go), so it cannot deny a signature. The 30s
+		// in the logs was this flag's old default measuring itself.
+		timeout   = flag.Duration("timeout", 90*time.Second, "per-request timeout")
 		stopAfter = flag.Bool("stop-after", false, "stop testnet nodes via ansible after run completes")
 		authTTL   = flag.Duration("auth-ttl", time.Hour, "session lifetime for HARNESS_AUTH_KEY auth")
 	)
@@ -34,7 +51,7 @@ func run() error {
 
 	perfFlags := flag.NewFlagSet("perf", flag.ExitOnError)
 	perfConc := perfFlags.Int("concurrency", 5, "number of concurrent workers")
-	perfDur := perfFlags.Duration("duration", 30*time.Second, "test duration")
+	perfDur := perfFlags.Duration("duration", 30*time.Second, "duration PER SCENARIO — perf runs 7, so the run takes at least 7x this, plus unmetered key-pool setup before the sign scenarios")
 	perfPool := perfFlags.Int("pool", 10, "key pool size for sign scenarios")
 
 	scaleFlags := flag.NewFlagSet("scale", flag.ExitOnError)
@@ -90,8 +107,23 @@ func run() error {
 	// Attach session auth when an authorization key is configured. Groups with
 	// any auth policy (issuers, auth keys, or a resolver) reject unauthenticated
 	// keygen/sign with 401, so this is required for anything but a bare group.
-	if authKey := os.Getenv("HARNESS_AUTH_KEY"); authKey != "" {
+	authKey := os.Getenv("HARNESS_AUTH_KEY")
+	if authKey == "" {
+		authKey = env.AuthKey
+	}
+	if authKey == "" {
+		// Say so rather than proceeding quietly. An unauthenticated run against
+		// a group with any auth policy fails every request with a bare 401, and
+		// the only signal that auth was never configured is the ABSENCE of the
+		// line below — which is exactly what makes it cost an hour to spot.
+		fmt.Println("auth: NONE configured — set HARNESS_AUTH_KEY, or run write-env " +
+			"to put it in the env file. A group with an auth policy will 401 every request.")
+	}
+	if authKey != "" {
 		identity := os.Getenv("HARNESS_AUTH_IDENTITY")
+		if identity == "" {
+			identity = env.AuthIdentity
+		}
 		if identity == "" {
 			identity = "harness"
 		}

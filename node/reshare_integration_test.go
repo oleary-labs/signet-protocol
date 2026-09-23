@@ -81,6 +81,7 @@ func newTestNodeCluster(t *testing.T, ctx context.Context, numNodes int) ([]*tes
 			keygenReady: make(map[shardKey]chan struct{}),
 		}
 		n.initReshareState(rs)
+		n.liveness = newLiveness(n, tss.PartyID(h.Self()), log)
 		n.registerCoordHandler()
 
 		cluster[i] = &testNode{n: n, host: h, km: km}

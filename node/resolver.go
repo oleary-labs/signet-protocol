@@ -3,6 +3,7 @@ package node
 import (
 	"context"
 	"fmt"
+	siwe "github.com/spruceid/siwe-go"
 	"strings"
 	"time"
 
@@ -63,9 +64,42 @@ func (n *Node) validateResolverProof(ctx context.Context, groupID string, proof 
 		return nil, fmt.Errorf("unsupported resolver version %q", tv)
 	}
 
+	// Which domains this group accepts, read from the group contract. Node
+	// config no longer participates: the check gates session creation, so it is
+	// consensus-relevant, and any per-node value can drift into some nodes
+	// accepting a session while others reject it — a threshold failure wearing a
+	// confusing error rather than a clean denial.
+	allowed := n.auth.SiweDomains(groupID)
+
+	// siwe-go's Verify takes exactly one expected domain, so parse first, do the
+	// membership test here, and hand the matched entry to Verify. That makes
+	// Verify's own domain check tautological — the membership comparison below
+	// IS the real check, which is why canonicalSiweDomain has to agree with
+	// SignetGroup._isCanonicalDomain byte-for-byte.
+	parsed, err := siwe.ParseMessage(proof.SiweMessage)
+	if err != nil {
+		return nil, fmt.Errorf("siwe: parse siwe message: %w", err)
+	}
+	matched, ok := siweDomainAllowed(allowed, parsed.GetDomain())
+	if !ok {
+		// Deliberately not echoing the presented domain or the accept-list:
+		// this is an unauthenticated path and the list is already public
+		// on-chain, but the error should not become an enumeration oracle for
+		// callers who have not looked.
+		return nil, fmt.Errorf("siwe: domain not accepted for this group")
+	}
+
 	// Verify the SIWE message: signature recovery, domain, chainId, session_pub
 	// binding, expiry (R-4).
-	siweRes, err := verifySIWE(proof.SiweMessage, proof.SiweSignature, n.cfg.SIWEDomain, cfg.ChainID, proof.SessionPub)
+	//
+	// Chain ID is the group's HOME chain, not the resolver's. ERC-4361's chainId
+	// describes the account's context — it is where an ERC-1271 contract account
+	// must be resolved — not where the identity contract happens to be deployed.
+	// Pinning it to the resolver would mean a smart-account signature is verified
+	// against the wrong chain the moment the resolver is not co-located with the
+	// user's wallet, and for plain EOAs the field is advisory, so it would sit
+	// unnoticed until the first contract account.
+	siweRes, err := verifySIWE(proof.SiweMessage, proof.SiweSignature, matched, n.chain.HomeChainID(), proof.SessionPub)
 	if err != nil {
 		return nil, fmt.Errorf("siwe: %w", err)
 	}

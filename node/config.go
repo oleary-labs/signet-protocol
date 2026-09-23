@@ -27,11 +27,14 @@ type Config struct {
 	// time), so it need not appear here.
 	ChainRPCs map[uint64]string `yaml:"chain_rpcs"`
 
-	// SIWEDomain is the expected ERC-4361 `domain` field for onchain_resolver
-	// auth. It MUST be set for that scheme to be usable: pinning the domain is
-	// what stops a SIWE signature minted for another site from opening a Signet
-	// session (R-4). If empty, the onchain_resolver scheme is rejected.
-	SIWEDomain string `yaml:"siwe_domain"`
+	// NOTE: siwe_domain was removed. The accepted ERC-4361 domains are read from
+	// the group contract (SignetGroup.siweDomains) rather than node config.
+	//
+	// Not deprecated with a fallback — deleted. The check gates session creation
+	// and is therefore consensus-relevant, so a per-node value can drift into
+	// some nodes accepting a session while others reject it, which fails
+	// intermittently and points nowhere. A fallback would be worse than the old
+	// behaviour because it would fail only sometimes.
 }
 
 // LoadConfig reads a YAML config file and applies defaults for missing fields.

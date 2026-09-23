@@ -1274,4 +1274,181 @@ mod tests {
         verify_ecdsa_signature(&group_key, &msg_hash, &sig_r, &sig_s);
         println!("ECDSA 5-of-5 sign: OK");
     }
+
+    /// Keygen `n` parties at `threshold`, returning the group public key.
+    fn run_ecdsa_keygen_n(
+        parties: &[&str],
+        threshold: u16,
+        owned: &mut HashMap<String, (Storage, tempfile::TempDir)>,
+    ) -> Vec<u8> {
+        let party_ids: Vec<String> = parties.iter().map(|s| s.to_string()).collect();
+        let mut sessions: HashMap<String, (Session, Storage)> = HashMap::new();
+        let mut initial_messages = Vec::new();
+        for pid in &party_ids {
+            let params = KeygenParams {
+                group_id: GROUP_ID.to_string(),
+                key_id: KEY_ID.to_string(),
+                party_id: pid.clone(),
+                party_ids: party_ids.clone(),
+                threshold,
+                curve: Curve::EcdsaSecp256k1,
+                scope: vec![],
+            };
+            let (storage, _) = owned.remove(pid).unwrap();
+            let (session, output) =
+                Session::start_keygen(&format!("keygen-{pid}"), params).expect("start_keygen");
+            initial_messages.extend(output.messages);
+            sessions.insert(pid.clone(), (session, storage));
+        }
+        let results = route(initial_messages, &mut sessions);
+        assert_eq!(results.len(), parties.len());
+        let group_key = results[0].group_key.clone().unwrap();
+        for (pid, (_, storage)) in sessions {
+            let dir = tempfile::tempdir().unwrap();
+            owned.insert(pid, (storage, dir));
+        }
+        group_key
+    }
+
+    /// A 3-of-5 group signing with all five. Control for the subset test below.
+    #[test]
+    fn test_ecdsa_t3_n5_sign_with_all_five() {
+        init_tracing();
+        const P5: [&str; 5] = ["peer-A", "peer-B", "peer-C", "peer-D", "peer-E"];
+        let mut owned = make_storages(&P5);
+        let group_key = run_ecdsa_keygen_n(&P5, 3, &mut owned);
+
+        let msg_hash = sha2::Sha256::digest(b"t3 n5 all five");
+        let (r, s) = run_ecdsa_sign(&P5, &msg_hash, &mut owned);
+        verify_ecdsa_signature(&group_key, &msg_hash, &r, &s);
+        println!("ECDSA threshold=3, signed by all 5: OK");
+    }
+
+    /// A 3-of-5 group signing with a 3-party subset — the case an operator
+    /// would expect to work from the group's advertised "3 of 5".
+    ///
+    /// ecdsa_session.rs derives its own t = (n-1)/2 from the SIGNER SET, not
+    /// from the group threshold T. The signature share carries
+    /// `beta_me = c_me * secret_share`, whose degree in the party index is
+    /// (t from the nonce polynomial) + (T-1 from the DKG polynomial). The
+    /// coordinator reconstructs by Lagrange over the n participating points,
+    /// which is only exact for degree <= n-1. So a subset sign needs
+    ///
+    ///     t + T - 1 <= n - 1,  with t = (n-1)/2   =>   n >= 2T - 1
+    ///
+    /// T=3 therefore needs n >= 5: every member of a 3-of-5 group.
+    ///
+    /// Before the guard in EcdsaSession::start this ran to completion and
+    /// returned a well-formed signature that failed verification against the
+    /// group key — a silent wrong answer that only surfaced downstream at
+    /// ecrecover. It must now be refused up front.
+    #[test]
+    fn test_ecdsa_t3_n5_subset_of_three_is_rejected() {
+        init_tracing();
+        const P5: [&str; 5] = ["peer-A", "peer-B", "peer-C", "peer-D", "peer-E"];
+        let mut owned = make_storages(&P5);
+        let _group_key = run_ecdsa_keygen_n(&P5, 3, &mut owned);
+
+        let subset: Vec<String> = ["peer-A", "peer-B", "peer-C"]
+            .iter().map(|s| s.to_string()).collect();
+        let msg_hash = sha2::Sha256::digest(b"t3 n5 subset of three");
+
+        let (storage, _dir) = owned.get("peer-A").unwrap();
+        let params = SignParams {
+            group_id: GROUP_ID.to_string(),
+            key_id: KEY_ID.to_string(),
+            party_id: "peer-A".to_string(),
+            signer_ids: subset,
+            message: msg_hash.to_vec(),
+            curve: Curve::EcdsaSecp256k1,
+        };
+        let err = Session::start_sign("ecdsa-subset-reject", params, storage)
+            .err()
+            .expect("3 signers against a 3-of-N ECDSA key must be rejected");
+
+        assert!(
+            err.contains("requires at least 5"),
+            "expected the n >= 2T-1 bound in the error, got: {err}"
+        );
+        println!("ECDSA threshold=3, 3 of 5 signers: rejected — {err}");
+    }
+
+    /// A 2-of-5 group signing ECDSA with a 3-party subset.
+    ///
+    /// The bound is n >= 2T-1, so T=2 needs only 3 signers regardless of group
+    /// size. Five nodes at T=2 therefore DO get ECDSA availability: any 3 of
+    /// the 5 can sign and two may be offline. The cost is the lower
+    /// reconstruction threshold — any 2 colluding shareholders hold the key.
+    #[test]
+    fn test_ecdsa_t2_n5_subset_of_three_signs() {
+        init_tracing();
+        const P5: [&str; 5] = ["peer-A", "peer-B", "peer-C", "peer-D", "peer-E"];
+        let mut owned = make_storages(&P5);
+        let group_key = run_ecdsa_keygen_n(&P5, 2, &mut owned);
+
+        // Three different subsets, to show it is not one lucky choice.
+        for subset in [
+            ["peer-A", "peer-B", "peer-C"],
+            ["peer-C", "peer-D", "peer-E"],
+            ["peer-A", "peer-C", "peer-E"],
+        ] {
+            let msg_hash = sha2::Sha256::digest(
+                format!("t2 n5 subset {}", subset.join("-")).as_bytes(),
+            );
+            let (r, sig_s) = run_ecdsa_sign(&subset, &msg_hash, &mut owned);
+            verify_ecdsa_signature(&group_key, &msg_hash, &r, &sig_s);
+            println!("ECDSA threshold=2, signed by {subset:?}: OK");
+        }
+    }
+
+    /// An 8-node, T=4 group: the smallest shape that tolerates exactly ONE
+    /// node being down while keeping ECDSA usable.
+    ///
+    /// ECDSA spare capacity is N - (2T-1), so odd N always yields an even
+    /// number of spares (at N=7 it steps 2 -> 0 as T goes 3 -> 4). Getting
+    /// exactly one spare needs even N with T = N/2:  8 - (2*4-1) = 1.
+    ///
+    /// Governance consequence: with two orgs split 5/3, the 5-node org clears
+    /// T=4 and can act alone while the 3-node org cannot — so the key owner
+    /// keeps unilateral control and the service provider is provably blocked.
+    #[test]
+    fn test_ecdsa_t4_n8_tolerates_exactly_one_node_down() {
+        init_tracing();
+        const P8: [&str; 8] = [
+            "peer-A", "peer-B", "peer-C", "peer-D",
+            "peer-E", "peer-F", "peer-G", "peer-H",
+        ];
+        let mut owned = make_storages(&P8);
+        let group_key = run_ecdsa_keygen_n(&P8, 4, &mut owned);
+
+        // All 8 present.
+        let msg = sha2::Sha256::digest(b"t4 n8 all eight");
+        let (r, sig_s) = run_ecdsa_sign(&P8, &msg, &mut owned);
+        verify_ecdsa_signature(&group_key, &msg, &r, &sig_s);
+        println!("ECDSA T=4 N=8, all 8 signers: OK");
+
+        // One node down — 7 signers is exactly the 2T-1 bound.
+        let seven: Vec<&str> = P8.iter().copied().filter(|p| *p != "peer-H").collect();
+        let msg = sha2::Sha256::digest(b"t4 n8 one down");
+        let (r, sig_s) = run_ecdsa_sign(&seven, &msg, &mut owned);
+        verify_ecdsa_signature(&group_key, &msg, &r, &sig_s);
+        println!("ECDSA T=4 N=8, 7 signers (1 down): OK");
+
+        // Two nodes down — below the bound, must be refused outright.
+        let six: Vec<String> = P8.iter().take(6).map(|s| s.to_string()).collect();
+        let (storage, _dir) = owned.get("peer-A").unwrap();
+        let params = SignParams {
+            group_id: GROUP_ID.to_string(),
+            key_id: KEY_ID.to_string(),
+            party_id: "peer-A".to_string(),
+            signer_ids: six,
+            message: sha2::Sha256::digest(b"t4 n8 two down").to_vec(),
+            curve: Curve::EcdsaSecp256k1,
+        };
+        let err = Session::start_sign("ecdsa-n8-six", params, storage)
+            .err()
+            .expect("6 signers against a 4-of-N ECDSA key must be rejected");
+        assert!(err.contains("requires at least 7"), "unexpected error: {err}");
+        println!("ECDSA T=4 N=8, 6 signers (2 down): rejected — {err}");
+    }
 }
